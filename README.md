@@ -185,3 +185,94 @@ After first login:
 - Argon2id password hashing
 - Session cookie + CSRF protections for state-changing requests
 - Audit trail for security-relevant actions
+
+## API Overview (Technical)
+
+Base path: `/api/v1`
+
+### Authentication Modes
+
+- Session auth (Web UI style):
+  - `GET /api/v1/csrf`
+  - `POST /api/v1/login`
+  - include `X-CSRF-Token` for state-changing requests when using cookie sessions
+- Bearer token auth (automation):
+  - `Authorization: Bearer <token>`
+  - no CSRF token required for token-based requests
+  - tokens are created in the Web UI under `API Mgmt` (admin role)
+  - generated token values are shown once at creation time
+
+Example:
+
+```bash
+BASE="https://admin.example.com"
+TOKEN="dnx_xxx"
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/me"
+```
+
+### Core Endpoint Groups
+
+- Auth/session:
+  - `GET /csrf`
+  - `POST /login`
+  - `POST /logout`
+  - `GET /me`
+- Domains:
+  - `GET /domains`
+  - `POST /domains/preflight`
+  - `POST /domains`
+  - `GET /domains/{id}/live-check`
+  - `DELETE /domains/{id}`
+- Hosts/Subdomains:
+  - `GET /hosts`
+  - `GET /hosts/diagnostics`
+  - `POST /hosts/preflight`
+  - `POST /hosts`
+  - `PUT /hosts/{id}`
+  - `PUT /hosts/{id}/auth`
+  - `POST /hosts/{id}/retry`
+  - `DELETE /hosts/{id}`
+- Settings/system:
+  - `GET /settings`
+  - `POST /settings`
+  - `POST /reload`
+  - `GET /audit`
+- Tokens/users:
+  - `GET /tokens`
+  - `POST /tokens`
+  - `DELETE /tokens/{id}`
+  - `GET /users`
+  - `POST /users`
+  - `PUT /users/{id}/domains`
+  - `DELETE /users/{id}`
+
+### In-App API Documentation
+
+DomNexDomain includes an internal API reference page in the Web UI (`API Docs` menu).  
+Use it for endpoint descriptions, permission context, and ready-to-run request examples.
+
+### Role + Scope Model
+
+- Roles: `admin`, `domain-admin`, `operator`, `read-only`
+- Tokens can be constrained by:
+  - scope strings (e.g. `hosts:write`, `domains:write`, `users:write`)
+  - optional domain scoping (`domainIds`)
+- Principle of use:
+  - prefer least privilege for automation tokens
+  - reserve global write scopes for tightly controlled CI/CD paths
+
+### HA Payload Example
+
+```json
+{
+  "domain": "example.com",
+  "subdomain": "app-ha",
+  "insecureTls": true,
+  "haEnabled": true,
+  "haMode": "failover",
+  "haBackends": [
+    { "name": "Server1", "url": "http://127.0.0.1:18081" },
+    { "name": "Server2", "url": "http://127.0.0.1:18082" }
+  ]
+}
+```
