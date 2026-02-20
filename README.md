@@ -264,6 +264,9 @@ Use it for endpoint descriptions, permission context, and ready-to-run request e
 
 - User roles (Web UI accounts): `admin`, `domain-admin`
 - API token roles: `admin`, `operator`, `read-only`
+- Current UI behavior:
+  - User creation in the Web UI currently offers `admin` and `domain-admin`.
+  - `operator` and `read-only` are currently available through API token role selection.
 - Tokens can be constrained by:
   - scope strings (e.g. `hosts:write`, `domains:write`, `users:write`)
   - optional domain scoping (`domainIds`)
