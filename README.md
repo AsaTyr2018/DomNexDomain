@@ -61,6 +61,9 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
     - Protects state-changing UI/API operations against common browser-side attack vectors.
   - Audit event logging (including failed auth events)
     - Captures login failures and high-impact configuration actions for forensic traceability.
+  - Smart Edge Error Pages with Trace ID
+    - DomNexDomain serves branded error pages for policy/origin/routing failures with a trace ID shown to the user.
+    - The same trace ID is written into audit events (`proxy.error.*`) so operators can search and correlate quickly in the Logs UI.
   - Prometheus metrics endpoint
     - Exposes operational telemetry for alerting and dashboard integration.
   - MetricCenter traffic analytics
@@ -189,6 +192,7 @@ After first login:
 
 - JSON logs on stdout (optional file logs in runtime log dir)
 - Prometheus metrics endpoint via `DOMNEX_METRICS_ADDR` (default `127.0.0.1:9108`) at `/metrics`
+- Logs UI supports direct trace-ID search for edge error events (`proxy.error.*`)
 
 ## Security Baseline
 
