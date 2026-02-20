@@ -1,0 +1,9 @@
+/var/log/domnexdomain/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    create 0640 domnexdomain domnexdomain
+    copytruncate
+}

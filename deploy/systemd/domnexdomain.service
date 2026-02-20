@@ -1,0 +1,24 @@
+[Unit]
+Description=DomNexDomain Edge Control Plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=domnexdomain
+Group=domnexdomain
+EnvironmentFile=/etc/domnexdomain/domnexdomain.env
+ExecStart=/usr/bin/domnexdomain
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/domnexdomain /var/log/domnexdomain
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1883 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+
+type Identity = { username: string; role: string; type: string };
+type Domain = { id: number; name: string; dnsMode?: string; provider?: string; zoneId?: string };
+type HABackend = { name: string; url: string };
+type Host = { id: number; fqdn: string; upstreamUrl: string; insecureTls?: boolean; haEnabled?: boolean; haMode?: string; haBackends?: HABackend[]; authEnabled?: boolean; authUser?: string; state: string; errorReason?: string };
+type HostDiagnostic = { fqdn: string; dnsRecords: string[]; httpStatus: number; httpsStatus: number; tlsOk: boolean; certSubject: string; certIssuer: string; certNotAfter: string; certDaysLeft: number; haEnabled?: boolean; haMode?: string; haOnline?: number; haTotal?: number; haOffline?: string[]; error?: string };
+type HostLiveCheck = { fqdn: string; dnsOk: boolean; dnsPointsToServer: boolean; httpReachable: boolean; httpsReachable: boolean; tlsOk: boolean; certDaysLeft: number; cloudflareRecordFound: boolean; error?: string };
+type DomainLiveCheck = { domain: string; dnsMode: string; provider: string; serverIpv4?: string; apexDnsOk: boolean; apexPointsToServer: boolean; cloudflareApiOk: boolean; cloudflareZoneId?: string; cloudflareError?: string; hosts: HostLiveCheck[]; warnings?: string[]; overallOk: boolean };
+type Audit = { id: number; actor: string; action: string; target: string; createdAt: string };
+type APIToken = { id: number; name: string; tokenPrefix: string; scopes: string; role: string; expiresAt: string; lastUsedAt?: string };
+type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string };
+type ManagedUser = { id: number; username: string; role: string; domainIds: number[]; createdAt: string; updatedAt: string };
+type DomainPreflightCheck = { name: string; ok: boolean; detail?: string };
+type DomainPreflight = { domain: string; dnsMode: string; provider: string; zoneId?: string; resolvedZone?: string; publicIpv4?: string; checks: DomainPreflightCheck[]; ready: boolean };
+type HostPreflightCheck = { name: string; ok: boolean; detail?: string };
+type HostPreflight = { domain: string; fqdn?: string; upstream: string; insecureTls?: boolean; dnsMode?: string; provider?: string; zoneId?: string; checks: HostPreflightCheck[]; ready: boolean };
+
+type Tab = 'dashboard' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'audit';
+type DomainProvider = 'cloudflare' | 'strato' | 'manual';
+
+async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(path, {
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(init.headers || {}),
+    },
+    ...init,
+  });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) {
+    const err = new Error(data.error || `${res.status} ${res.statusText}`) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
+  }
+  return data as T;
+}
+
+function getCookie(name: string): string {
+  const item = document.cookie.split('; ').find((v) => v.startsWith(`${name}=`));
+  return item ? decodeURIComponent(item.split('=')[1]) : '';
+}
+
+function App() {
+  const [tab, setTab] = useState<Tab>('dashboard');
+  const [identity, setIdentity] = useState<Identity | null>(null);
+  const [domains, setDomains] = useState<Domain[]>([]);
+  const [hosts, setHosts] = useState<Host[]>([]);
+  const [hostDiagnostics, setHostDiagnostics] = useState<Record<string, HostDiagnostic>>({});
+  const [audit, setAudit] = useState<Audit[]>([]);
+  const [tokens, setTokens] = useState<APIToken[]>([]);
+  const [users, setUsers] = useState<ManagedUser[]>([]);
+  const [domainChecks, setDomainChecks] = useState<Record<number, DomainLiveCheck>>({});
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const [loginUser, setLoginUser] = useState('admin');
+  const [loginPass, setLoginPass] = useState('');
+  const [domainName, setDomainName] = useState('');
+  const [domainProvider, setDomainProvider] = useState<DomainProvider>('cloudflare');
+  const [domainZoneID, setDomainZoneID] = useState('');
+  const [domainWizardStep, setDomainWizardStep] = useState(1);
+  const [domainPreflight, setDomainPreflight] = useState<DomainPreflight | null>(null);
+  const [domainPreflightRunning, setDomainPreflightRunning] = useState(false);
+  const [hostDomain, setHostDomain] = useState('');
+  const [hostSub, setHostSub] = useState('');
+  const [hostUpstream, setHostUpstream] = useState('http://127.0.0.1:3000');
+  const [hostInsecureTLS, setHostInsecureTLS] = useState(false);
+  const [hostHAEnabled, setHostHAEnabled] = useState(false);
+  const [hostHAMode, setHostHAMode] = useState<'failover' | 'round_robin'>('failover');
+  const [hostHABackends, setHostHABackends] = useState<HABackend[]>([{ name: 'server1', url: '' }, { name: 'server2', url: '' }]);
+  const [hostWizardStep, setHostWizardStep] = useState(1);
+  const [hostPreflight, setHostPreflight] = useState<HostPreflight | null>(null);
+  const [hostPreflightRunning, setHostPreflightRunning] = useState(false);
+  const [selectedHostID, setSelectedHostID] = useState<number | null>(null);
+  const [detailUpstream, setDetailUpstream] = useState('');
+  const [detailInsecureTLS, setDetailInsecureTLS] = useState(false);
+  const [detailHAEnabled, setDetailHAEnabled] = useState(false);
+  const [detailHAMode, setDetailHAMode] = useState<'failover' | 'round_robin'>('failover');
+  const [detailHABackends, setDetailHABackends] = useState<HABackend[]>([]);
+  const [detailAuthEnabled, setDetailAuthEnabled] = useState(false);
+  const [detailAuthUser, setDetailAuthUser] = useState('');
+  const [detailAuthPass, setDetailAuthPass] = useState('');
+  const [detailSavingGeneral, setDetailSavingGeneral] = useState(false);
+  const [detailSavingAuth, setDetailSavingAuth] = useState(false);
+  const [newTokenName, setNewTokenName] = useState('automation');
+  const [newTokenRole, setNewTokenRole] = useState('operator');
+  const [newTokenScopes, setNewTokenScopes] = useState('');
+  const [newTokenGlobalRead, setNewTokenGlobalRead] = useState(false);
+  const [newTokenGlobalWrite, setNewTokenGlobalWrite] = useState(false);
+  const [newTokenDomainRead, setNewTokenDomainRead] = useState(true);
+  const [newTokenDomainWrite, setNewTokenDomainWrite] = useState(true);
+  const [newTokenSystemRead, setNewTokenSystemRead] = useState(false);
+  const [newTokenSystemWrite, setNewTokenSystemWrite] = useState(false);
+  const [newTokenDomainIDs, setNewTokenDomainIDs] = useState<number[]>([]);
+  const [newTokenTTL, setNewTokenTTL] = useState('720h');
+  const [createdToken, setCreatedToken] = useState('');
+  const [resetUser, setResetUser] = useState('admin');
+  const [resetTTL, setResetTTL] = useState('30m');
+  const [resetToken, setResetToken] = useState('');
+  const [resetNewPassword, setResetNewPassword] = useState('');
+  const [logQuery, setLogQuery] = useState('');
+  const [logActionFilter, setLogActionFilter] = useState('all');
+  const [logActorFilter, setLogActorFilter] = useState('all');
+  const [settings, setSettings] = useState<RuntimeSettings | null>(null);
+  const [settingsAcmeEmail, setSettingsAcmeEmail] = useState('');
+  const [settingsAcmeStaging, setSettingsAcmeStaging] = useState(false);
+  const [settingsCFToken, setSettingsCFToken] = useState('');
+  const [settingsPublicIPv4, setSettingsPublicIPv4] = useState('');
+  const [settingsBaseDomain, setSettingsBaseDomain] = useState('');
+  const [settingsMessage, setSettingsMessage] = useState('');
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [newUserRole, setNewUserRole] = useState<'admin' | 'domain-admin'>('domain-admin');
+  const [newUserDomainIDs, setNewUserDomainIDs] = useState<number[]>([]);
+
+  const csrf = useMemo(() => getCookie('domnex_csrf'), [identity, loading]);
+
+  const refresh = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/csrf');
+      const me = await api<{ identity: Identity }>('/api/v1/me');
+      setIdentity(me.identity);
+      const [d, h, a] = await Promise.all([
+        api<{ items: Domain[] }>('/api/v1/domains'),
+        api<{ items: Host[] }>('/api/v1/hosts'),
+        api<{ items: Audit[] }>('/api/v1/audit'),
+      ]);
+      setDomains(d.items || []);
+      setHosts(h.items || []);
+      setAudit(a.items || []);
+      try {
+        const hd = await api<{ items: HostDiagnostic[] }>('/api/v1/hosts/diagnostics');
+        const byFqdn: Record<string, HostDiagnostic> = {};
+        (hd.items || []).forEach((it) => { byFqdn[it.fqdn] = it; });
+        setHostDiagnostics(byFqdn);
+      } catch {
+        setHostDiagnostics({});
+      }
+      try {
+        const t = await api<{ items: APIToken[] }>('/api/v1/tokens');
+        setTokens(t.items || []);
+      } catch {
+        setTokens([]);
+      }
+      try {
+        const u = await api<{ items: ManagedUser[] }>('/api/v1/users');
+        setUsers(u.items || []);
+      } catch {
+        setUsers([]);
+      }
+      try {
+        const s = await api<RuntimeSettings>('/api/v1/settings');
+        setSettings(s);
+        setSettingsAcmeEmail(s.acmeEmail || '');
+        setSettingsAcmeStaging(!!s.acmeStaging);
+        setSettingsPublicIPv4(s.publicIpv4 || '');
+        setSettingsBaseDomain(s.baseDomain || '');
+      } catch {
+        setSettings(null);
+        setSettingsPublicIPv4('');
+        setSettingsBaseDomain('');
+      }
+    } catch (e) {
+      const err = e as Error & { status?: number };
+      if (err.status === 401 || /unauthorized/i.test(err.message)) {
+        setIdentity(null);
+        setDomains([]);
+        setHosts([]);
+        setAudit([]);
+      } else {
+        setError(err.message);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  useEffect(() => {
+    if (domains.length === 0) {
+      setHostDomain('');
+      return;
+    }
+    if (!hostDomain || !domains.some((d) => d.name === hostDomain)) {
+      setHostDomain(domains[0].name);
+    }
+  }, [domains, hostDomain]);
+
+  useEffect(() => {
+    if (tab !== 'domains' || domainWizardStep !== 3 || !domainName) return;
+    void checkDomainPreflight();
+    const t = window.setInterval(() => { void checkDomainPreflight(); }, 4000);
+    return () => window.clearInterval(t);
+  }, [tab, domainWizardStep, domainName, domainProvider, domainZoneID]);
+
+  useEffect(() => {
+    if (tab !== 'hosts' || hostWizardStep !== 2 || !hostDomain || !hostSub || (!hostHAEnabled && !hostUpstream)) return;
+    void checkHostPreflight();
+    const t = window.setInterval(() => { void checkHostPreflight(); }, 4000);
+    return () => window.clearInterval(t);
+  }, [tab, hostWizardStep, hostDomain, hostSub, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends]);
+
+  const login = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/login', {
+        method: 'POST',
+        body: JSON.stringify({ username: loginUser, password: loginPass }),
+      });
+      setLoginPass('');
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const logout = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/logout', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      setIdentity(null);
+      setDomains([]);
+      setHosts([]);
+      setHostDiagnostics({});
+      setAudit([]);
+      setTokens([]);
+      setUsers([]);
+      setDomainChecks({});
+      setSettings(null);
+      setSettingsPublicIPv4('');
+      setSettingsBaseDomain('');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveDomain = async () => {
+    if (!domainName) return;
+    setLoading(true);
+    setError('');
+    try {
+      const provider = domainProvider === 'strato' ? 'manual' : domainProvider;
+      const dnsMode = domainProvider === 'cloudflare' ? 'cloudflare' : 'manual';
+      await api('/api/v1/domains', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ name: domainName, dnsMode, certMode: 'letsencrypt', provider, zoneId: domainZoneID }),
+      });
+      setDomainName('');
+      setDomainZoneID('');
+      setDomainWizardStep(1);
+      setDomainPreflight(null);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addHost = async () => {
+    if (!hostDomain || !hostSub || (!hostHAEnabled && !hostUpstream)) return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/hosts', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          domain: hostDomain,
+          subdomain: hostSub,
+          upstream: hostUpstream,
+          insecureTls: hostInsecureTLS,
+          haEnabled: hostHAEnabled,
+          haMode: hostHAMode,
+          haBackends: normalizeBackends(hostHABackends),
+        }),
+      });
+      setHostSub('');
+      setHostHAEnabled(false);
+      setHostHAMode('failover');
+      setHostHABackends([{ name: 'server1', url: '' }, { name: 'server2', url: '' }]);
+      setHostInsecureTLS(false);
+      setHostWizardStep(1);
+      setHostPreflight(null);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const checkDomainPreflight = async () => {
+    if (!domainName) {
+      setDomainPreflight(null);
+      return;
+    }
+    try {
+      setDomainPreflightRunning(true);
+      const provider = domainProvider === 'strato' ? 'manual' : domainProvider;
+      const dnsMode = domainProvider === 'cloudflare' ? 'cloudflare' : 'manual';
+      const out = await api<DomainPreflight>('/api/v1/domains/preflight', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ name: domainName, dnsMode, provider, zoneId: domainZoneID }),
+      });
+      setDomainPreflight(out);
+    } catch (e) {
+      setDomainPreflight(null);
+      setError((e as Error).message);
+    } finally {
+      setDomainPreflightRunning(false);
+    }
+  };
+
+  const checkHostPreflight = async () => {
+    if (!hostDomain || !hostSub || (!hostHAEnabled && !hostUpstream)) {
+      setHostPreflight(null);
+      return;
+    }
+    try {
+      setHostPreflightRunning(true);
+      const out = await api<HostPreflight>('/api/v1/hosts/preflight', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          domain: hostDomain,
+          subdomain: hostSub,
+          upstream: hostUpstream,
+          insecureTls: hostInsecureTLS,
+          haEnabled: hostHAEnabled,
+          haMode: hostHAMode,
+          haBackends: normalizeBackends(hostHABackends),
+        }),
+      });
+      setHostPreflight(out);
+    } catch (e) {
+      setHostPreflight(null);
+      setError((e as Error).message);
+    } finally {
+      setHostPreflightRunning(false);
+    }
+  };
+
+  const retryHost = async (id: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/hosts/${id}/retry`, { method: 'POST', headers: { 'X-CSRF-Token': csrf } });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const openHostDetail = (h: Host) => {
+    setSelectedHostID(h.id);
+    setDetailUpstream(h.upstreamUrl || '');
+    setDetailInsecureTLS(!!h.insecureTls);
+    setDetailHAEnabled(!!h.haEnabled);
+    setDetailHAMode((h.haMode === 'round_robin' ? 'round_robin' : 'failover'));
+    setDetailHABackends((h.haBackends && h.haBackends.length > 0) ? h.haBackends : [{ name: 'server1', url: '' }, { name: 'server2', url: '' }]);
+    setDetailAuthEnabled(!!h.authEnabled);
+    setDetailAuthUser(h.authUser || '');
+    setDetailAuthPass('');
+  };
+
+  const saveHostGeneral = async () => {
+    if (!selectedHostID) return;
+    setDetailSavingGeneral(true);
+    setError('');
+    try {
+      await api(`/api/v1/hosts/${selectedHostID}`, {
+        method: 'PUT',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          upstream: detailUpstream,
+          insecureTls: detailInsecureTLS,
+          haEnabled: detailHAEnabled,
+          haMode: detailHAMode,
+          haBackends: normalizeBackends(detailHABackends),
+        }),
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setDetailSavingGeneral(false);
+    }
+  };
+
+  const saveHostAuth = async () => {
+    if (!selectedHostID) return;
+    setError('');
+    setDetailSavingAuth(true);
+    try {
+      await api(`/api/v1/hosts/${selectedHostID}/auth`, {
+        method: 'PUT',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          enabled: detailAuthEnabled,
+          username: detailAuthUser.trim(),
+          password: detailAuthPass,
+        }),
+      });
+      setDetailAuthPass('');
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setDetailSavingAuth(false);
+    }
+  };
+
+  const activeHosts = hosts.filter((h) => h.state === 'active').length;
+  const errorHosts = hosts.filter((h) => h.state === 'error').length;
+  const diagnostics = Object.values(hostDiagnostics);
+  const monitoredHosts = diagnostics.length;
+  const safeBase = monitoredHosts > 0 ? monitoredHosts : 1;
+  const dnsHealthy = diagnostics.filter((d) => (d.dnsRecords || []).length > 0).length;
+  const tlsHealthy = diagnostics.filter((d) => d.tlsOk).length;
+  const httpHealthy = diagnostics.filter((d) => d.httpStatus >= 200 && d.httpStatus < 400).length;
+  const httpsHealthy = diagnostics.filter((d) => d.httpsStatus >= 200 && d.httpsStatus < 500).length;
+  const certKnown = diagnostics.filter((d) => d.certDaysLeft > 0);
+  const certExpiringSoon = certKnown.filter((d) => d.certDaysLeft <= 14).length;
+  const avgCertDays = certKnown.length > 0
+    ? Math.round(certKnown.reduce((sum, d) => sum + d.certDaysLeft, 0) / certKnown.length)
+    : 0;
+  const avgHTTPSStatus = diagnostics.filter((d) => d.httpsStatus > 0).length > 0
+    ? Math.round(
+      diagnostics.filter((d) => d.httpsStatus > 0).reduce((sum, d) => sum + d.httpsStatus, 0)
+      / diagnostics.filter((d) => d.httpsStatus > 0).length,
+    )
+    : 0;
+  const dnsHealthPct = Math.round((dnsHealthy / safeBase) * 100);
+  const tlsHealthPct = Math.round((tlsHealthy / safeBase) * 100);
+  const httpHealthPct = Math.round((httpHealthy / safeBase) * 100);
+  const httpsHealthPct = Math.round((httpsHealthy / safeBase) * 100);
+  const certWindowPct = certKnown.length > 0 ? Math.max(0, Math.min(100, Math.round((1 - (certExpiringSoon / certKnown.length)) * 100))) : 0;
+  const logActions = Array.from(new Set(audit.map((e) => e.action))).sort();
+  const logActors = Array.from(new Set(audit.map((e) => e.actor))).sort();
+  const filteredAudit = audit.filter((e) => {
+    if (logActionFilter !== 'all' && e.action !== logActionFilter) return false;
+    if (logActorFilter !== 'all' && e.actor !== logActorFilter) return false;
+    if (!logQuery.trim()) return true;
+    const q = logQuery.trim().toLowerCase();
+    return `${e.action} ${e.actor} ${e.target}`.toLowerCase().includes(q);
+  });
+  const criticalLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'critical').length;
+  const warningLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'warn').length;
+  const infoLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'info').length;
+  const cloudflareDomains = domains.filter((d) => (d.dnsMode || '') === 'cloudflare').length;
+  const manualDomains = Math.max(0, domains.length - cloudflareDomains);
+  const domainsChecked = Object.keys(domainChecks).length;
+  const domainsWithIssues = Object.values(domainChecks).filter((c) => !c.overallOk).length;
+  const hostsWithDiagnostics = hosts.filter((h) => !!hostDiagnostics[h.fqdn]).length;
+  const hostsHealthy = hosts.filter((h) => {
+    const d = hostDiagnostics[h.fqdn];
+    if (!d) return false;
+    return (d.dnsRecords || []).length > 0 && d.tlsOk && d.httpsStatus >= 200 && d.httpsStatus < 500;
+  }).length;
+  const globalAdmins = users.filter((u) => u.role === 'admin').length;
+  const domainAdmins = users.filter((u) => u.role === 'domain-admin').length;
+  const usersWithoutDomainScope = users.filter((u) => u.role === 'domain-admin' && (!u.domainIds || u.domainIds.length === 0)).length;
+  const configuredAdminFQDN = settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '');
+  const fqdnPreview = hostSub && hostDomain ? `${hostSub}.${hostDomain}` : '';
+  const selectedHost = selectedHostID ? (hosts.find((h) => h.id === selectedHostID) || null) : null;
+  const haHostsMonitored = hosts.filter((h) => h.haEnabled && (hostDiagnostics[h.fqdn]?.haTotal || 0) > 0).length;
+  const haHostsDegraded = hosts.filter((h) => {
+    const d = hostDiagnostics[h.fqdn];
+    if (!h.haEnabled || !d || !d.haTotal) return false;
+    return (d.haOnline || 0) < d.haTotal;
+  }).length;
+  const haDegradedDetails = hosts
+    .map((h) => {
+      const d = hostDiagnostics[h.fqdn];
+      if (!h.haEnabled || !d || !d.haTotal) return null;
+      if ((d.haOnline || 0) >= d.haTotal) return null;
+      const offline = (d.haOffline || []).filter(Boolean);
+      return {
+        fqdn: h.fqdn,
+        online: d.haOnline || 0,
+        total: d.haTotal || 0,
+        offline,
+      };
+    })
+    .filter((it): it is { fqdn: string; online: number; total: number; offline: string[] } => !!it);
+  const domainApexPreview = domainName || 'example.com';
+  const adminPreview = `admin.${domainApexPreview}`;
+  const publicIPPreview = settingsPublicIPv4 || settings?.publicIpv4 || '<your-public-ip>';
+
+  const domainProviderGuide: Record<DomainProvider, { title: string; steps: string[]; records: string[] }> = {
+    cloudflare: {
+      title: 'Cloudflare (API automated)',
+      steps: [
+        'Create a Cloudflare API token with zone DNS permissions (least privilege).',
+        'Store the Cloudflare token in the Settings tab.',
+        'Enter the Zone ID per domain in the wizard.',
+        'Set the domain nameservers to Cloudflare.',
+        'After saving, Domnex can automatically create/update DNS records.',
+      ],
+      records: [
+        `@  A      ${publicIPPreview}   TTL 120`,
+        'admin  CNAME  @              TTL Auto',
+        '*.optional CNAME @           TTL Auto',
+      ],
+    },
+    strato: {
+      title: 'Strato (manual DNS setup)',
+      steps: [
+        'Open DNS settings for your domain in the Strato dashboard.',
+        'Create the root record (@) as an A record pointing to your WAN IP.',
+        'Create admin as CNAME to root (@) or as A record to the same WAN IP.',
+        'Wait for DNS propagation, then verify reachability of admin.<domain>.',
+      ],
+      records: [
+        `@  A      ${publicIPPreview}   TTL 300`,
+        'admin  CNAME  @              TTL 300',
+        'app    CNAME  @              TTL 300',
+      ],
+    },
+    manual: {
+      title: 'Other provider (manual)',
+      steps: [
+        'Create the required DNS records in your provider panel.',
+        'Root domain must point to your WAN IP (A, optional AAAA).',
+        'admin subdomain must point to the same target address (CNAME or A).',
+        'After DNS propagation, Domnex issues certificates via HTTP-01.',
+      ],
+      records: [
+        `@  A      ${publicIPPreview}`,
+        `admin  CNAME  ${domainApexPreview}`,
+      ],
+    },
+  };
+
+  const createToken = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<{ token: string }>('/api/v1/tokens', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          name: newTokenName,
+          role: newTokenRole,
+          scopes: newTokenScopes.split(',').map((v) => v.trim()).filter(Boolean),
+          domainIds: (newTokenGlobalRead || newTokenGlobalWrite) ? [] : newTokenDomainIDs,
+          permissions: {
+            globalRead: newTokenGlobalRead,
+            globalWrite: newTokenGlobalWrite,
+            domainRead: newTokenDomainRead,
+            domainWrite: newTokenDomainWrite,
+            systemRead: newTokenSystemRead,
+            systemWrite: newTokenSystemWrite,
+          },
+          expiresIn: newTokenTTL,
+        }),
+      });
+      setCreatedToken(out.token || '');
+      setNewTokenDomainIDs([]);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const revokeToken = async (id: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/tokens/${id}`, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const createResetToken = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<{ token: string }>('/api/v1/password-reset/create', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ username: resetUser, expiresIn: resetTTL }),
+      });
+      setResetToken(out.token || '');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const consumeResetToken = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/password-reset/consume', {
+        method: 'POST',
+        body: JSON.stringify({ token: resetToken, newPassword: resetNewPassword }),
+      });
+      setResetNewPassword('');
+      setResetToken('');
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveSettings = async () => {
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      const out = await api<{ message?: string; restartNeeded?: boolean }>('/api/v1/settings', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          acmeEmail: settingsAcmeEmail,
+          acmeStaging: settingsAcmeStaging,
+          cfToken: settingsCFToken,
+          publicIpv4: settingsPublicIPv4,
+          baseDomain: settingsBaseDomain,
+        }),
+      });
+      setSettingsCFToken('');
+      setSettingsMessage(out.message || 'Settings saved.');
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runDomainLiveCheck = async (domainId: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<DomainLiveCheck>(`/api/v1/domains/${domainId}/live-check`);
+      setDomainChecks((prev) => ({ ...prev, [domainId]: out }));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteDomain = async (id: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/domains/${id}`, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteHost = async (id: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/hosts/${id}`, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const reloadService = async () => {
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      await api('/api/v1/reload', { method: 'POST', headers: { 'X-CSRF-Token': csrf } });
+      setSettingsMessage('Reload triggered. Service is restarting. Wait 3-5 seconds, then refresh.');
+      setTimeout(() => { window.location.reload(); }, 5000);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const createUser = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/users', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          username: newUserName,
+          password: newUserPassword,
+          role: newUserRole,
+          domainIds: newUserRole === 'domain-admin' ? newUserDomainIDs : [],
+        }),
+      });
+      setNewUserName('');
+      setNewUserPassword('');
+      setNewUserRole('domain-admin');
+      setNewUserDomainIDs([]);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteUser = async (id: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/users/${id}`, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveUserDomains = async (id: number, domainIds: number[]) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/users/${id}/domains`, {
+        method: 'PUT',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ domainIds }),
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleNewUserDomain = (id: number) => {
+    setNewUserDomainIDs((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
+  };
+
+  const toggleNewTokenDomain = (id: number) => {
+    setNewTokenDomainIDs((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
+  };
+
+  const updateHostBackend = (idx: number, patch: Partial<HABackend>) => {
+    setHostHABackends((prev) => prev.map((b, i) => (i === idx ? { ...b, ...patch } : b)));
+  };
+
+  const addHostBackend = () => {
+    setHostHABackends((prev) => [...prev, { name: `server${prev.length + 1}`, url: '' }]);
+  };
+
+  const removeHostBackend = (idx: number) => {
+    setHostHABackends((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const updateDetailBackend = (idx: number, patch: Partial<HABackend>) => {
+    setDetailHABackends((prev) => prev.map((b, i) => (i === idx ? { ...b, ...patch } : b)));
+  };
+
+  const addDetailBackend = () => {
+    setDetailHABackends((prev) => [...prev, { name: `server${prev.length + 1}`, url: '' }]);
+  };
+
+  const removeDetailBackend = (idx: number) => {
+    setDetailHABackends((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  return (
+    <>
+      <div className="app-shell">
+        <aside className="sidebar">
+          <div className="logo">DomNexDomain</div>
+          <nav className="menu">
+            <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
+            <button className={tab === 'domains' ? 'active' : ''} onClick={() => setTab('domains')}>Domains</button>
+            <button className={tab === 'hosts' ? 'active' : ''} onClick={() => setTab('hosts')}>Subdomains</button>
+            {identity?.role === 'admin' ? <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button> : null}
+            {identity?.role === 'admin' ? <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Settings</button> : null}
+            {identity?.role === 'admin' ? <button className={tab === 'api' ? 'active' : ''} onClick={() => setTab('api')}>API Mgmt</button> : null}
+            {identity?.role === 'admin' ? <button className={tab === 'apiDocs' ? 'active' : ''} onClick={() => setTab('apiDocs')}>API Docs</button> : null}
+            <button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Logs</button>
+          </nav>
+        </aside>
+
+        <main className="main">
+          <header className="top">
+            <div>
+              <h1>Overview</h1>
+              <p className="subtitle">{domains.length} Domains · {hosts.length} Subdomains</p>
+            </div>
+            <div className="top-actions">
+              <button className="btn" onClick={refresh} disabled={loading}>Refresh</button>
+              {identity ? <button className="btn" onClick={logout}>Logout</button> : null}
+            </div>
+          </header>
+
+          {error ? <div className="error">{error}</div> : null}
+
+          {tab === 'dashboard' ? (
+            <section className="dashboard">
+              {haHostsDegraded > 0 ? (
+                <div className="error">
+                  HA Alert: {haHostsDegraded}/{haHostsMonitored || haHostsDegraded} HA subdomains have offline backends.
+                  <div className="muted" style={{ marginTop: '.35rem' }}>
+                    {haDegradedDetails.map((it) => (
+                      <div key={`ha-alert-${it.fqdn}`}>
+                        {it.fqdn}: {it.online}/{it.total} online{it.offline.length > 0 ? ` · offline: ${it.offline.join(', ')}` : ''}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              <div className="kpi-row">
+                <Card title="Domains" value={String(domains.length)} status="ok" />
+                <Card title="Active Hosts" value={String(activeHosts)} status="ok" />
+                <Card title="Host Errors" value={String(errorHosts)} status={errorHosts > 0 ? 'err' : 'ok'} />
+                <Card title="Monitored Hosts" value={String(monitoredHosts)} status={monitoredHosts > 0 ? 'ok' : 'err'} />
+              </div>
+              <div className="dashboard-layout">
+                <div className="dashboard-main">
+                  <div className="card">
+                    <div className="card-head"><h3>Health Gauges</h3></div>
+                    <div className="gauge-grid">
+                      <Gauge title="DNS Health" value={dnsHealthPct} subtitle={`${dnsHealthy}/${safeBase} hosts`} />
+                      <Gauge title="HTTP Reachability" value={httpHealthPct} subtitle={`${httpHealthy}/${safeBase} hosts`} />
+                      <Gauge title="HTTPS Reachability" value={httpsHealthPct} subtitle={`${httpsHealthy}/${safeBase} hosts`} />
+                      <Gauge title="TLS Health" value={tlsHealthPct} subtitle={`${tlsHealthy}/${safeBase} hosts`} />
+                      <Gauge title="Cert Window" value={certWindowPct} subtitle={certKnown.length > 0 ? `${certExpiringSoon} expiring <=14d` : 'no cert data'} />
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="card-head"><h3>Performance Snapshot</h3></div>
+                    <div className="metric-grid">
+                      <MetricTile label="Avg HTTPS Status" value={avgHTTPSStatus > 0 ? String(avgHTTPSStatus) : '-'} hint="Target: < 400" />
+                      <MetricTile label="Avg Cert Days Left" value={avgCertDays > 0 ? `${avgCertDays}d` : '-'} hint="Target: > 30d" />
+                      <MetricTile label="TLS Failure Count" value={String(Math.max(0, monitoredHosts - tlsHealthy))} hint="Should trend to 0" />
+                      <MetricTile label="DNS Failure Count" value={String(Math.max(0, monitoredHosts - dnsHealthy))} hint="Should trend to 0" />
+                    </div>
+                  </div>
+                </div>
+                <div className="card">
+                  <div className="card-head"><h3>Recent Events</h3></div>
+                  <div className="event-list">
+                    {audit.length === 0 ? (
+                      <div className="muted">No events yet.</div>
+                    ) : (
+                      audit.slice(0, 10).map((e) => (
+                        <div className="event-item" key={e.id}>
+                          <div className="event-top">
+                            <strong>{e.action}</strong>
+                            <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
+                          </div>
+                          <div className="muted">{e.actor} {'->'} {e.target}</div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            </section>
+          ) : null}
+
+          {tab === 'domains' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>Domain Wizard</h3></div>
+                  <div className="wizard-steps">
+                    <button className={domainWizardStep === 1 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(1)}>1. Basics</button>
+                    <button className={domainWizardStep === 2 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(2)}>2. DNS Guide</button>
+                    <button className={domainWizardStep === 3 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(3)}>3. Auto Checks</button>
+                  </div>
+
+                  {domainWizardStep === 1 ? (
+                    <div className="card" style={{ marginBottom: '.8rem' }}>
+                      <div className="row">
+                        <input value={domainName} onChange={(e) => setDomainName(e.target.value.toLowerCase().trim())} placeholder="example.com" />
+                        <select value={domainProvider} onChange={(e) => setDomainProvider(e.target.value as DomainProvider)}>
+                          <option value="cloudflare">Cloudflare (automatic)</option>
+                          <option value="strato">Strato (manual)</option>
+                          <option value="manual">Other provider (manual)</option>
+                        </select>
+                        {domainProvider === 'cloudflare' ? (
+                          <input value={domainZoneID} onChange={(e) => setDomainZoneID(e.target.value.trim())} placeholder="Cloudflare Zone ID (optional, Auto-Resolve per Domain)" />
+                        ) : null}
+                        <button className="btn" onClick={() => setDomainWizardStep(2)} disabled={!domainName}>Next</button>
+                      </div>
+                      <div className="muted">Admin endpoint will be: <strong>{adminPreview}</strong></div>
+                    </div>
+                  ) : null}
+
+                  {domainWizardStep === 2 ? (
+                    <div className="card" style={{ marginBottom: '.8rem' }}>
+                      <h4 style={{ marginTop: 0 }}>{domainProviderGuide[domainProvider].title}</h4>
+                      <ol>
+                        {domainProviderGuide[domainProvider].steps.map((step, idx) => <li key={idx}>{step}</li>)}
+                      </ol>
+                      <div className="muted">Recommended DNS records:</div>
+                      <pre>{domainProviderGuide[domainProvider].records.join('\n')}</pre>
+                      <div className="row">
+                        <button className="btn" onClick={() => setDomainWizardStep(1)}>Back</button>
+                        <button className="btn" onClick={() => { setDomainPreflight(null); setDomainWizardStep(3); }} disabled={!domainName}>Next</button>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {domainWizardStep === 3 ? (
+                    <div className="card" style={{ marginBottom: '.8rem' }}>
+                      <h4 style={{ marginTop: 0 }}>Automatic preflight checks</h4>
+                      <div className="muted" style={{ marginBottom: '.5rem' }}>
+                        Checks run automatically every 4 seconds. You can create the domain only when all required checks are green.
+                      </div>
+                      {domainPreflight ? (
+                        <div className="diag" style={{ marginBottom: '.5rem' }}>
+                          {domainPreflight.checks.map((c) => (
+                            <span key={c.name} className={`badge ${c.ok ? 'ok' : 'err'}`}>
+                              {c.name}: {c.ok ? 'ok' : 'fail'}{c.detail ? ` (${c.detail})` : ''}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="muted">Initializing preflight...</div>
+                      )}
+                      <div className="row">
+                        <button className="btn" onClick={() => setDomainWizardStep(2)}>Back</button>
+                        <button className="btn" onClick={saveDomain} disabled={loading || domainPreflightRunning || !domainPreflight?.ready}>Create Domain</button>
+                      </div>
+                    </div>
+                  ) : null}
+                </section>
+
+                <section className="card">
+                  <div className="card-head"><h3>Configured Domains</h3></div>
+                  {domains.map((d) => (
+                    <div className="card" key={d.id} style={{ marginBottom: '.6rem' }}>
+                      <div className="host" style={{ borderTop: 'none', paddingTop: 0 }}>
+                        <div>
+                          <strong>{d.name}</strong> <span className="muted">({d.dnsMode || '-'} / {d.provider || '-'})</span>
+                          {d.zoneId ? <div className="muted">zone: {d.zoneId}</div> : null}
+                        </div>
+                        <div className="row" style={{ marginBottom: 0 }}>
+                          <button className="btn" onClick={() => runDomainLiveCheck(d.id)} disabled={loading}>Live Check</button>
+                          <button className="btn danger" onClick={() => deleteDomain(d.id)} disabled={loading}>Delete</button>
+                        </div>
+                      </div>
+                      {domainChecks[d.id] ? (
+                        <div className="diag-block">
+                          <div className="diag">
+                            <span className={`badge ${domainChecks[d.id].overallOk ? 'ok' : 'warn'}`}>Overall {domainChecks[d.id].overallOk ? 'OK' : 'Issues'}</span>
+                            <span className={`badge ${domainChecks[d.id].apexDnsOk ? 'ok' : 'err'}`}>Apex DNS {domainChecks[d.id].apexDnsOk ? 'ok' : 'fail'}</span>
+                            <span className={`badge ${domainChecks[d.id].apexPointsToServer ? 'ok' : 'warn'}`}>Points to server {domainChecks[d.id].apexPointsToServer ? 'yes' : 'no'}</span>
+                            {d.dnsMode === 'cloudflare' ? (
+                              <span className={`badge ${domainChecks[d.id].cloudflareApiOk ? 'ok' : 'err'}`}>Cloudflare API {domainChecks[d.id].cloudflareApiOk ? 'ok' : 'fail'}</span>
+                            ) : null}
+                          </div>
+                          {domainChecks[d.id].serverIpv4 ? <div className="muted">Detected Server IPv4: {domainChecks[d.id].serverIpv4}</div> : null}
+                          {domainChecks[d.id].warnings?.length ? <div className="muted">{domainChecks[d.id].warnings?.join(' | ')}</div> : null}
+                          {domainChecks[d.id].cloudflareError ? <div className="errtxt">{domainChecks[d.id].cloudflareError}</div> : null}
+                          <pre>{JSON.stringify(domainChecks[d.id].hosts, null, 2)}</pre>
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </section>
+              </div>
+              <aside className="entity-side">
+                <section className="card">
+                  <div className="card-head"><h3>Domain Stats</h3></div>
+                  <div className="metric-grid">
+                    <MetricTile label="Total Domains" value={String(domains.length)} hint="Configured zones" />
+                    <MetricTile label="Cloudflare" value={String(cloudflareDomains)} hint="API-managed DNS" />
+                    <MetricTile label="Manual DNS" value={String(manualDomains)} hint="Provider-side records" />
+                    <MetricTile label="Checked Domains" value={String(domainsChecked)} hint="Live-check executed" />
+                    <MetricTile label="Check Issues" value={String(domainsWithIssues)} hint="From latest checks" />
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Quick Guidance</h3></div>
+                  <div className="muted">Provider: <strong>{domainProviderGuide[domainProvider].title}</strong></div>
+                  <div className="muted" style={{ marginTop: '.45rem' }}>Configured admin endpoint:</div>
+                  <pre>{configuredAdminFQDN || '<not configured in Settings>'}</pre>
+                  <div className="muted" style={{ marginTop: '.45rem' }}>Tip: run a live check after DNS changes to update health badges.</div>
+                </section>
+              </aside>
+            </section>
+          ) : null}
+
+          {tab === 'hosts' ? (
+            selectedHost ? (
+              <section className="entity-page">
+                <div className="entity-main">
+                  <section className="card">
+                    <div className="card-head">
+                      <h3>Subdomain Settings</h3>
+                      <button className="btn" onClick={() => setSelectedHostID(null)}>Back To List</button>
+                    </div>
+                    <div className="muted" style={{ marginBottom: '.6rem' }}>
+                      Host: <strong>{selectedHost.fqdn}</strong> <span className={`badge ${hostStateBadge(selectedHost.state).cls}`} style={{ marginLeft: '.45rem' }}>{hostStateBadge(selectedHost.state).label}</span>
+                    </div>
+                    <div className="row">
+                      <label className="check"><input type="checkbox" checked={detailHAEnabled} onChange={(e) => setDetailHAEnabled(e.target.checked)} /> Enable HA</label>
+                    </div>
+                    {detailHAEnabled ? (
+                      <>
+                        <div className="row">
+                          <select value={detailHAMode} onChange={(e) => setDetailHAMode(e.target.value as 'failover' | 'round_robin')}>
+                            <option value="failover">Failover</option>
+                            <option value="round_robin">Load Balance (Round Robin)</option>
+                          </select>
+                          <button className="btn" type="button" onClick={addDetailBackend}>Add Backend</button>
+                        </div>
+                        {detailHABackends.map((b, idx) => (
+                          <div className="row" key={`detail-ha-${idx}`}>
+                            <input value={b.name} onChange={(e) => updateDetailBackend(idx, { name: e.target.value })} placeholder="Server name" />
+                            <input value={b.url} onChange={(e) => updateDetailBackend(idx, { url: e.target.value })} placeholder="https://10.0.0.11:8443" />
+                            <button className="btn danger" type="button" onClick={() => removeDetailBackend(idx)} disabled={detailHABackends.length <= 1}>Remove</button>
+                          </div>
+                        ))}
+                        <div className="muted">Define backend name + address. Minimum 2 backends for HA.</div>
+                      </>
+                    ) : (
+                      <div className="row">
+                        <input value={detailUpstream} onChange={(e) => setDetailUpstream(e.target.value)} placeholder="https://127.0.0.1:3000" />
+                      </div>
+                    )}
+                    <div className="row">
+                      <label className="check"><input type="checkbox" checked={detailInsecureTLS} onChange={(e) => setDetailInsecureTLS(e.target.checked)} /> No TLS Verify</label>
+                      <button className="btn" onClick={saveHostGeneral} disabled={detailSavingGeneral}>{detailSavingGeneral ? 'Saving...' : 'Save General'}</button>
+                    </div>
+                    <div className="muted">Use this section to adjust upstream routing for this specific subdomain.</div>
+                  </section>
+
+                  <section className="card">
+                    <div className="card-head"><h3>Auth Page Settings</h3></div>
+                    <div className="row">
+                      <label className="check"><input type="checkbox" checked={detailAuthEnabled} onChange={(e) => setDetailAuthEnabled(e.target.checked)} /> Enable Auth Page</label>
+                    </div>
+                    <div className="row">
+                      <input value={detailAuthUser} onChange={(e) => setDetailAuthUser(e.target.value)} placeholder="Auth username (this host only)" />
+                      <input type="password" value={detailAuthPass} onChange={(e) => setDetailAuthPass(e.target.value)} placeholder={selectedHost.authEnabled ? 'New password (leave empty = keep current)' : 'Auth password'} />
+                      <button className="btn" onClick={saveHostAuth} disabled={detailSavingAuth}>{detailSavingAuth ? 'Saving...' : 'Save Auth'}</button>
+                    </div>
+                    <div className="muted">Credentials are dedicated to this single subdomain and are not shared with others.</div>
+                  </section>
+
+                  <section className="card">
+                    <div className="card-head"><h3>Host Diagnostics</h3></div>
+                    {hostDiagnostics[selectedHost.fqdn] ? (
+                      <div className="diag">
+                        <span className={`badge ${hostDiagnostics[selectedHost.fqdn].dnsRecords?.length ? 'ok' : 'err'}`}>DNS {hostDiagnostics[selectedHost.fqdn].dnsRecords?.length ? 'ok' : 'fail'}</span>
+                        <span className={`badge ${hostDiagnostics[selectedHost.fqdn].httpStatus >= 200 && hostDiagnostics[selectedHost.fqdn].httpStatus < 400 ? 'ok' : 'warn'}`}>HTTP {hostDiagnostics[selectedHost.fqdn].httpStatus || '-'}</span>
+                        <span className={`badge ${hostDiagnostics[selectedHost.fqdn].httpsStatus >= 200 && hostDiagnostics[selectedHost.fqdn].httpsStatus < 500 ? 'ok' : 'warn'}`}>HTTPS {hostDiagnostics[selectedHost.fqdn].httpsStatus || '-'}</span>
+                        <span className={`badge ${hostDiagnostics[selectedHost.fqdn].tlsOk ? 'ok' : 'err'}`}>TLS {hostDiagnostics[selectedHost.fqdn].tlsOk ? 'ok' : 'fail'}</span>
+                      </div>
+                    ) : <div className="muted">No diagnostics available yet.</div>}
+                  </section>
+                </div>
+                <aside className="entity-side">
+                  <section className="card">
+                    <div className="card-head"><h3>Subdomain Summary</h3></div>
+                    <div className="metric-grid">
+                      <MetricTile label="State" value={hostStateBadge(selectedHost.state).label} hint="Current lifecycle state" />
+                      <MetricTile label="Auth Page" value={selectedHost.authEnabled ? 'enabled' : 'disabled'} hint="Per-host access gate" />
+                      <MetricTile label="TLS Verify" value={selectedHost.insecureTls ? 'disabled' : 'enabled'} hint="Upstream certificate policy" />
+                      <MetricTile label="Routing" value={selectedHost.haEnabled ? `HA (${selectedHost.haMode || 'failover'})` : 'Single Upstream'} hint="Proxy mode" />
+                    </div>
+                  </section>
+                  <section className="card">
+                    <div className="card-head"><h3>Danger Zone</h3></div>
+                    <div className="row">
+                      {selectedHost.state === 'error' ? <button className="btn" onClick={() => retryHost(selectedHost.id)}>Retry</button> : null}
+                      <button className="btn danger" onClick={() => deleteHost(selectedHost.id)} disabled={loading}>Delete Subdomain</button>
+                    </div>
+                  </section>
+                </aside>
+              </section>
+            ) : (
+              <section className="entity-page">
+                <div className="entity-main">
+                  <section className="card">
+                    <div className="card-head"><h3>Subdomain Wizard</h3></div>
+                    <div className="wizard-steps">
+                      <button className={hostWizardStep === 1 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(1)}>1. Basics</button>
+                      <button className={hostWizardStep === 2 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(2)}>2. Auto-Checks</button>
+                      <button className={hostWizardStep === 3 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(3)}>3. Create</button>
+                    </div>
+                    {hostWizardStep === 1 ? (
+                      <div className="card" style={{ marginBottom: '.8rem' }}>
+                        <div className="row">
+                          <select value={hostDomain} onChange={(e) => setHostDomain(e.target.value)}>
+                            {domains.length === 0 ? <option value="">No domains available</option> : null}
+                            {domains.map((d) => (
+                              <option key={d.id} value={d.name}>{d.name}</option>
+                            ))}
+                          </select>
+                          <input value={hostSub} onChange={(e) => setHostSub(e.target.value.toLowerCase().trim())} placeholder="app" />
+                          <label className="check"><input type="checkbox" checked={hostHAEnabled} onChange={(e) => setHostHAEnabled(e.target.checked)} /> Enable HA</label>
+                          {!hostHAEnabled ? <input value={hostUpstream} onChange={(e) => setHostUpstream(e.target.value)} placeholder="http://127.0.0.1:3000" /> : null}
+                          {hostHAEnabled ? (
+                            <select value={hostHAMode} onChange={(e) => setHostHAMode(e.target.value as 'failover' | 'round_robin')}>
+                              <option value="failover">Failover</option>
+                              <option value="round_robin">Load Balance (Round Robin)</option>
+                            </select>
+                          ) : null}
+                          <label className="check"><input type="checkbox" checked={hostInsecureTLS} onChange={(e) => setHostInsecureTLS(e.target.checked)} /> No TLS Verify</label>
+                          <button className="btn" onClick={() => { setHostPreflight(null); setHostWizardStep(2); }} disabled={!hostDomain || !hostSub || (!hostHAEnabled && !hostUpstream)}>Next</button>
+                        </div>
+                        {hostHAEnabled ? (
+                          <>
+                            <div className="row">
+                              <button className="btn" type="button" onClick={addHostBackend}>Add Backend</button>
+                            </div>
+                            {hostHABackends.map((b, idx) => (
+                              <div className="row" key={`host-ha-${idx}`}>
+                                <input value={b.name} onChange={(e) => updateHostBackend(idx, { name: e.target.value })} placeholder="Server name" />
+                                <input value={b.url} onChange={(e) => updateHostBackend(idx, { url: e.target.value })} placeholder="https://10.0.0.11:8443" />
+                                <button className="btn danger" type="button" onClick={() => removeHostBackend(idx)} disabled={hostHABackends.length <= 1}>Remove</button>
+                              </div>
+                            ))}
+                          </>
+                        ) : null}
+                        {hostHAEnabled ? (
+                          <div className="muted">HA enabled. Configure named backend servers (minimum 2).</div>
+                        ) : null}
+                        <div className="muted">
+                          {fqdnPreview ? `Will be created as: ${fqdnPreview}` : 'Enter a subdomain name, choose a domain, and set the upstream.'}
+                        </div>
+                      </div>
+                    ) : null}
+                    {hostWizardStep === 2 ? (
+                      <div className="card" style={{ marginBottom: '.8rem' }}>
+                        <div className="muted" style={{ marginBottom: '.5rem' }}>
+                          Checks run automatically every 4 seconds. Continue only when all checks are green.
+                        </div>
+                        <div className="muted" style={{ marginBottom: '.5rem' }}>
+                          Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled (self-signed accepted)' : 'enabled (strict verify)'}</strong> · Routing: <strong>{hostHAEnabled ? `HA (${hostHAMode})` : 'Single Upstream'}</strong>
+                        </div>
+                        {hostPreflight ? (
+                          <div className="diag" style={{ marginBottom: '.5rem' }}>
+                            {hostPreflight.checks.map((c) => (
+                              <span key={c.name} className={`badge ${c.ok ? 'ok' : 'err'}`}>
+                                {c.name}: {c.ok ? 'ok' : 'fail'}{c.detail ? ` (${c.detail})` : ''}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="muted">Initializing preflight...</div>
+                        )}
+                        <div className="row">
+                          <button className="btn" onClick={() => setHostWizardStep(1)}>Back</button>
+                          <button className="btn" onClick={() => setHostWizardStep(3)} disabled={hostPreflightRunning || !hostPreflight?.ready}>Next</button>
+                        </div>
+                      </div>
+                    ) : null}
+                    {hostWizardStep === 3 ? (
+                      <div className="card" style={{ marginBottom: '.8rem' }}>
+                        <div className="muted" style={{ marginBottom: '.5rem' }}>
+                          Ready to create: <strong>{hostPreflight?.fqdn || fqdnPreview}</strong>
+                        </div>
+                        <div className="muted" style={{ marginBottom: '.5rem' }}>
+                          Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled' : 'enabled'}</strong>
+                        </div>
+                        <div className="row">
+                          <button className="btn" onClick={() => setHostWizardStep(2)}>Back</button>
+                          <button className="btn" onClick={addHost} disabled={loading || !hostPreflight?.ready}>Create Subdomain</button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </section>
+                  <section className="card">
+                    <div className="card-head"><h3>Configured Subdomains</h3></div>
+                    {hosts.map((h) => (
+                      <div className="host" key={h.id}>
+                        <div>
+                          <strong>{h.fqdn}</strong> {' -> '} {h.upstreamUrl}
+                          {h.haEnabled ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>HA {h.haMode || 'failover'}</span> : null}
+                          {h.insecureTls ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>insecure TLS</span> : null}
+                          {h.authEnabled ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>auth page enabled</span> : null}
+                          {h.haEnabled && hostDiagnostics[h.fqdn]?.haTotal ? (
+                            <span className={`badge ${(hostDiagnostics[h.fqdn].haOnline || 0) === hostDiagnostics[h.fqdn].haTotal ? 'ok' : (hostDiagnostics[h.fqdn].haOnline || 0) > 0 ? 'warn' : 'err'}`} style={{ marginLeft: '.45rem' }}>
+                              Hosts Online {hostDiagnostics[h.fqdn].haOnline || 0}/{hostDiagnostics[h.fqdn].haTotal || 0}
+                            </span>
+                          ) : null}
+                          {h.haEnabled && (hostDiagnostics[h.fqdn]?.haOffline?.length || 0) > 0 ? (
+                            <span className="badge err" style={{ marginLeft: '.45rem' }}>
+                              Offline: {hostDiagnostics[h.fqdn].haOffline?.join(', ')}
+                            </span>
+                          ) : null}
+                          {h.state === 'error' && h.errorReason ? <div className="errtxt">{h.errorReason}</div> : null}
+                          {hostDiagnostics[h.fqdn] ? (
+                            <div className="diag">
+                              <span className={`badge ${hostDiagnostics[h.fqdn].dnsRecords?.length ? 'ok' : 'err'}`}>DNS {hostDiagnostics[h.fqdn].dnsRecords?.length ? 'ok' : 'fail'}</span>
+                              <span className={`badge ${hostDiagnostics[h.fqdn].httpStatus >= 200 && hostDiagnostics[h.fqdn].httpStatus < 400 ? 'ok' : 'warn'}`}>HTTP {hostDiagnostics[h.fqdn].httpStatus || '-'}</span>
+                              <span className={`badge ${hostDiagnostics[h.fqdn].httpsStatus >= 200 && hostDiagnostics[h.fqdn].httpsStatus < 500 ? 'ok' : 'warn'}`}>HTTPS {hostDiagnostics[h.fqdn].httpsStatus || '-'}</span>
+                              <span className={`badge ${hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'err'}`}>TLS {hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'fail'}</span>
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="row" style={{ marginBottom: 0 }}>
+                          <button className="btn" onClick={() => openHostDetail(h)}>Edit</button>
+                          {h.state === 'error' ? <button className="btn" onClick={() => retryHost(h.id)}>Retry</button> : null}
+                          <button className="btn danger" onClick={() => deleteHost(h.id)} disabled={loading}>Delete</button>
+                        </div>
+                      </div>
+                    ))}
+                  </section>
+                </div>
+                <aside className="entity-side">
+                  <section className="card">
+                    <div className="card-head"><h3>Subdomain Stats</h3></div>
+                    <div className="metric-grid">
+                      <MetricTile label="Total Hosts" value={String(hosts.length)} hint="Configured subdomains" />
+                      <MetricTile label="Active" value={String(activeHosts)} hint="Proxy routes online" />
+                      <MetricTile label="Errors" value={String(errorHosts)} hint="Needs attention" />
+                      <MetricTile label="Diagnostics" value={String(hostsWithDiagnostics)} hint="Hosts with checks" />
+                      <MetricTile label="Healthy" value={String(hostsHealthy)} hint="DNS+TLS+HTTPS good" />
+                    </div>
+                  </section>
+                  <section className="card">
+                    <div className="card-head"><h3>Routing Note</h3></div>
+                    <div className="muted">Use `Edit` to open a dedicated settings page for each subdomain.</div>
+                    <div className="muted" style={{ marginTop: '.45rem' }}>There you can manage upstream, TLS behavior and auth page credentials.</div>
+                  </section>
+                </aside>
+              </section>
+            )
+          ) : null}
+
+          {identity?.role === 'admin' && tab === 'settings' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>Runtime Settings</h3></div>
+                  <div className="row">
+                    <input value={settingsAcmeEmail} onChange={(e) => setSettingsAcmeEmail(e.target.value)} placeholder="ACME Email (e.g. admin@jigcinema.com)" />
+                    <label className="check"><input type="checkbox" checked={settingsAcmeStaging} onChange={(e) => setSettingsAcmeStaging(e.target.checked)} /> ACME Staging</label>
+                  </div>
+                  <div className="row">
+                    <select value={settingsBaseDomain} onChange={(e) => setSettingsBaseDomain(e.target.value)}>
+                      <option value="">No base domain selected</option>
+                      {domains.map((d) => (
+                        <option key={d.id} value={d.name}>{d.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="muted" style={{ marginBottom: '.6rem' }}>
+                    Selecting a base domain provisions `admin.&lt;domain&gt;` automatically. For Cloudflare domains, DNS records are provisioned automatically.
+                  </div>
+                  <div className="row">
+                    <input value={settingsCFToken} onChange={(e) => setSettingsCFToken(e.target.value)} placeholder={settings?.hasCloudflareToken ? 'Cloudflare API Token (leave empty = unchanged)' : 'Cloudflare API Token'} />
+                  </div>
+                  <div className="row">
+                    <input value={settingsPublicIPv4} onChange={(e) => setSettingsPublicIPv4(e.target.value)} placeholder="Preferred Public IPv4 (e.g. 203.0.113.10)" />
+                  </div>
+                  <div className="muted" style={{ marginBottom: '.6rem' }}>
+                    Detected automatically on first start via external IP check and stored here. For multi-WAN setups, you can override the target IP manually.
+                  </div>
+                  <div className="row">
+                    <button className="btn" onClick={saveSettings} disabled={loading}>Save Settings</button>
+                    <button className="btn" onClick={reloadService} disabled={loading}>Reload Service</button>
+                  </div>
+                  {settingsMessage ? <div className="muted">{settingsMessage}</div> : null}
+                </section>
+              </div>
+              <aside className="entity-side">
+                <section className="card">
+                  <div className="card-head"><h3>Environment Snapshot</h3></div>
+                  <div className="metric-grid">
+                    <MetricTile label="Cloudflare Token" value={settings?.hasCloudflareToken ? 'set' : 'missing'} hint="Global API token state" />
+                    <MetricTile label="ACME Mode" value={settingsAcmeStaging ? 'staging' : 'production'} hint="Certificate endpoint" />
+                    <MetricTile label="Public IPv4" value={settingsPublicIPv4 || settings?.publicIpv4 || '-'} hint="Preferred outbound target" />
+                    <MetricTile label="Base Domain" value={settingsBaseDomain || settings?.baseDomain || '-'} hint="Used for admin endpoint" />
+                    <MetricTile label="Admin Endpoint" value={settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '-')} hint="Control plane hostname" />
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Raw Settings</h3></div>
+                  <pre>{JSON.stringify(settings, null, 2)}</pre>
+                </section>
+              </aside>
+            </section>
+          ) : null}
+
+          {identity?.role === 'admin' && tab === 'users' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>User Management</h3></div>
+                  <div className="row">
+                    <input value={newUserName} onChange={(e) => setNewUserName(e.target.value.toLowerCase().trim())} placeholder="username" />
+                    <input type="password" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} placeholder="password (min 10)" />
+                    <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as 'admin' | 'domain-admin')}>
+                      <option value="domain-admin">Sub Admin (domain-admin)</option>
+                      <option value="admin">Global Admin</option>
+                    </select>
+                  </div>
+                  {newUserRole === 'domain-admin' ? (
+                    <div className="domain-pills">
+                      {domains.map((d) => (
+                        <label key={d.id} className="pill">
+                          <input type="checkbox" checked={newUserDomainIDs.includes(d.id)} onChange={() => toggleNewUserDomain(d.id)} />
+                          {d.name}
+                        </label>
+                      ))}
+                    </div>
+                  ) : null}
+                  <div className="row">
+                    <button className="btn" onClick={createUser} disabled={loading || !newUserName || !newUserPassword || (newUserRole === 'domain-admin' && newUserDomainIDs.length === 0)}>Create User</button>
+                  </div>
+                </section>
+
+                <section className="card">
+                  <div className="card-head"><h3>Managed Users</h3></div>
+                  {users.map((u) => (
+                    <UserRow
+                      key={u.id}
+                      user={u}
+                      domains={domains}
+                      loading={loading}
+                      onDelete={deleteUser}
+                      onSaveDomains={saveUserDomains}
+                    />
+                  ))}
+                </section>
+              </div>
+              <aside className="entity-side">
+                <section className="card">
+                  <div className="card-head"><h3>User Stats</h3></div>
+                  <div className="metric-grid">
+                    <MetricTile label="Total Users" value={String(users.length)} hint="Managed accounts" />
+                    <MetricTile label="Global Admins" value={String(globalAdmins)} hint="Full control users" />
+                    <MetricTile label="Domain Admins" value={String(domainAdmins)} hint="Scoped admins" />
+                    <MetricTile label="Missing Scope" value={String(usersWithoutDomainScope)} hint="Domain-admin without domains" />
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Role Guide</h3></div>
+                  <div className="muted">`admin`: global access across domains, users, settings.</div>
+                  <div className="muted" style={{ marginTop: '.45rem' }}>`domain-admin`: limited to assigned domains and hosts.</div>
+                  <div className="muted" style={{ marginTop: '.45rem' }}>Use domain scope assignment right after user creation.</div>
+                </section>
+              </aside>
+            </section>
+          ) : null}
+
+          {identity?.role === 'admin' && tab === 'api' ? (
+            <section className="card">
+              <div className="card-head"><h3>API Management</h3></div>
+              <div className="row">
+                <input value={newTokenName} onChange={(e) => setNewTokenName(e.target.value)} placeholder="token name" />
+                <select value={newTokenRole} onChange={(e) => setNewTokenRole(e.target.value)}>
+                  <option value="operator">operator</option>
+                  <option value="admin">admin</option>
+                  <option value="read-only">read-only</option>
+                </select>
+                <input value={newTokenTTL} onChange={(e) => setNewTokenTTL(e.target.value)} placeholder="720h" />
+              </div>
+              <div className="domain-pills">
+                <label className="pill"><input type="checkbox" checked={newTokenGlobalRead} onChange={(e) => setNewTokenGlobalRead(e.target.checked)} /> global read</label>
+                <label className="pill"><input type="checkbox" checked={newTokenGlobalWrite} onChange={(e) => setNewTokenGlobalWrite(e.target.checked)} /> global write</label>
+                <label className="pill"><input type="checkbox" checked={newTokenDomainRead} onChange={(e) => setNewTokenDomainRead(e.target.checked)} /> domain read</label>
+                <label className="pill"><input type="checkbox" checked={newTokenDomainWrite} onChange={(e) => setNewTokenDomainWrite(e.target.checked)} /> domain write</label>
+                <label className="pill"><input type="checkbox" checked={newTokenSystemRead} onChange={(e) => setNewTokenSystemRead(e.target.checked)} /> system read</label>
+                <label className="pill"><input type="checkbox" checked={newTokenSystemWrite} onChange={(e) => setNewTokenSystemWrite(e.target.checked)} /> system write</label>
+              </div>
+              <div className="muted" style={{ marginBottom: '.3rem' }}>Domain scope (only when not global):</div>
+              <div className="domain-pills">
+                {domains.map((d) => (
+                  <label key={d.id} className="pill">
+                    <input type="checkbox" checked={newTokenDomainIDs.includes(d.id)} onChange={() => toggleNewTokenDomain(d.id)} disabled={newTokenGlobalRead || newTokenGlobalWrite} />
+                    {d.name}
+                  </label>
+                ))}
+              </div>
+              <div className="row">
+                <input value={newTokenScopes} onChange={(e) => setNewTokenScopes(e.target.value)} placeholder="additional scopes comma-separated (optional)" />
+                <button className="btn" onClick={createToken} disabled={loading || !newTokenName}>Create Token</button>
+              </div>
+              {createdToken ? (
+                <div className="card" style={{ marginBottom: '.8rem' }}>
+                  <div className="muted">Generated token (shown once):</div>
+                  <pre>{createdToken}</pre>
+                </div>
+              ) : null}
+              <pre>{JSON.stringify(tokens, null, 2)}</pre>
+              <div className="row">
+                {tokens.map((t) => (
+                  <button key={t.id} className="btn" onClick={() => revokeToken(t.id)}>Revoke {t.name} ({t.tokenPrefix})</button>
+                ))}
+              </div>
+            </section>
+          ) : null}
+
+          {identity?.role === 'admin' && tab === 'apiDocs' ? (
+            <section className="card">
+              <div className="card-head"><h3>API Documentation</h3></div>
+              <div className="card" style={{ marginBottom: '.8rem' }}>
+                <h4 style={{ marginTop: 0 }}>Authentication</h4>
+                <div className="muted">All mutating endpoints require authentication. No unauthenticated write API.</div>
+                <pre style={{ marginTop: '.5rem' }}>{`# Session (WebUI)
+GET  /api/v1/csrf
+POST /api/v1/login
+
+# Token (Automation)
+Authorization: Bearer dnx_xxx`}</pre>
+              </div>
+
+              <div className="card" style={{ marginBottom: '.8rem' }}>
+                <h4 style={{ marginTop: 0 }}>Token Permission Model</h4>
+                <pre>{`global:read / global:write
+domains:read / domains:write
+hosts:read / hosts:write
+settings:read / settings:write
+users:read / users:write
+tokens:read / tokens:write
+audit:read
+reload:write
+dns:write / cert:write
+
+If no global scope is set:
+domainIds limit access to these domains/hosts.`}</pre>
+              </div>
+
+              <div className="card" style={{ marginBottom: '.8rem' }}>
+                <h4 style={{ marginTop: 0 }}>API Base</h4>
+                <pre>{`BASE=http://<domnex>:8443
+TOKEN=dnx_xxx
+
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/me"`}</pre>
+              </div>
+
+              <div className="card" style={{ marginBottom: '.8rem' }}>
+                <h4 style={{ marginTop: 0 }}>Domain Actions</h4>
+                <pre>{`# List domains
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/domains"
+
+# Domain preflight
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"name":"example.com","dnsMode":"cloudflare","provider":"cloudflare","zoneId":""}' \\
+  "$BASE/api/v1/domains/preflight"
+
+# Create/Update domain
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"name":"example.com","dnsMode":"cloudflare","certMode":"letsencrypt","provider":"cloudflare","zoneId":""}' \\
+  "$BASE/api/v1/domains"
+
+# Domain Live Check
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/domains/24/live-check"
+
+# Delete domain
+curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/domains/24"`}</pre>
+              </div>
+
+              <div className="card" style={{ marginBottom: '.8rem' }}>
+                <h4 style={{ marginTop: 0 }}>Subdomain / Host Actions</h4>
+                <pre>{`# List hosts
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/hosts"
+
+# Host preflight
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"domain":"example.com","subdomain":"app","upstream":"https://127.0.0.1:3000","insecureTls":true,"haEnabled":false}' \\
+  "$BASE/api/v1/hosts/preflight"
+
+# Create host
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"domain":"example.com","subdomain":"app","upstream":"https://127.0.0.1:3000","insecureTls":true,"haEnabled":false}' \\
+  "$BASE/api/v1/hosts"
+
+# Create HA host (explicit HA mode)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{
+    "domain":"example.com",
+    "subdomain":"app-ha",
+    "insecureTls":true,
+    "haEnabled":true,
+    "haMode":"failover",
+    "haBackends":[
+      {"name":"server1","url":"https://10.0.0.11:8443"},
+      {"name":"server2","url":"https://10.0.0.12:8443"}
+    ]
+  }' "$BASE/api/v1/hosts"
+
+# Update host routing settings
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"upstream":"https://127.0.0.1:3001","insecureTls":false,"haEnabled":false}' \\
+  "$BASE/api/v1/hosts/5"
+
+# Host diagnostics
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/hosts/diagnostics"
+
+# Host retry
+curl -X POST -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/hosts/5/retry"
+
+# Update host auth page settings
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"enabled":true,"username":"musicuser","password":"StrongPass123"}' \\
+  "$BASE/api/v1/hosts/5/auth"
+
+# Delete host
+curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/hosts/5"`}</pre>
+              </div>
+
+              <div className="card" style={{ marginBottom: '.8rem' }}>
+                <h4 style={{ marginTop: 0 }}>System Actions</h4>
+                <pre>{`# Read settings
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/settings"
+
+# Update settings
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"acmeEmail":"admin@example.com","acmeStaging":false,"publicIpv4":"203.0.113.10"}' \\
+  "$BASE/api/v1/settings"
+
+# Service reload
+curl -X POST -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/reload"
+
+# Audit logs
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/audit"`}</pre>
+              </div>
+
+              <div className="card" style={{ marginBottom: '.8rem' }}>
+                <h4 style={{ marginTop: 0 }}>User & Token Management</h4>
+                <pre>{`# User list
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/users"
+
+# Create user
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"username":"ops1","password":"SuperSecret123","role":"domain-admin","domainIds":[24]}' \\
+  "$BASE/api/v1/users"
+
+# Token list
+curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens"
+
+# Create token (domain scoped)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{
+    "name":"ci-token",
+    "role":"operator",
+    "domainIds":[24],
+    "permissions":{"domainRead":true,"domainWrite":true,"globalRead":false,"globalWrite":false,"systemRead":false,"systemWrite":false},
+    "scopes":[],
+    "expiresIn":"720h"
+  }' "$BASE/api/v1/tokens"
+
+# Token revoke
+curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
+              </div>
+            </section>
+          ) : null}
+
+          {tab === 'audit' ? (
+            <section className="logs-page">
+              <div className="card">
+                <div className="card-head"><h3>Audit Stream</h3></div>
+                <div className="row">
+                  <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="Search actor, action, target..." />
+                  <select value={logActionFilter} onChange={(e) => setLogActionFilter(e.target.value)}>
+                    <option value="all">All actions</option>
+                    {logActions.map((a) => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                  <select value={logActorFilter} onChange={(e) => setLogActorFilter(e.target.value)}>
+                    <option value="all">All actors</option>
+                    {logActors.map((a) => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                </div>
+                <div className="muted" style={{ marginBottom: '.6rem' }}>
+                  Showing {filteredAudit.length} of {audit.length} events.
+                </div>
+                <div className="event-list logs-list">
+                  {filteredAudit.length === 0 ? (
+                    <div className="muted">No events match your filter.</div>
+                  ) : (
+                    filteredAudit.map((e) => {
+                      const level = classifyAuditLevel(e.action, e.target);
+                      return (
+                        <div className="event-item" key={e.id}>
+                          <div className="event-top">
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
+                              <span className={`badge ${level === 'critical' ? 'err' : level === 'warn' ? 'warn' : 'ok'}`}>{level.toUpperCase()}</span>
+                              <strong>{e.action}</strong>
+                            </div>
+                            <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
+                          </div>
+                          <div className="muted">{e.actor} {'->'} {e.target}</div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+              <div className="logs-side">
+                <div className="card">
+                  <div className="card-head"><h3>Event Stats</h3></div>
+                  <div className="metric-grid">
+                    <MetricTile label="Critical" value={String(criticalLogs)} hint="Deletes, resets, revokes" />
+                    <MetricTile label="Warnings" value={String(warningLogs)} hint="Updates, retries, reloads" />
+                    <MetricTile label="Info" value={String(infoLogs)} hint="List/read/login events" />
+                    <MetricTile label="Unique Actors" value={String(logActors.length)} hint="From current filter set" />
+                  </div>
+                </div>
+                <div className="card">
+                  <div className="card-head"><h3>Security Actions</h3></div>
+                  <div className="row">
+                    <input value={resetUser} onChange={(e) => setResetUser(e.target.value)} placeholder="username" />
+                    <input value={resetTTL} onChange={(e) => setResetTTL(e.target.value)} placeholder="30m" />
+                    <button className="btn" onClick={createResetToken} disabled={loading}>Create Reset Token</button>
+                  </div>
+                  {resetToken ? (
+                    <div className="card" style={{ marginBottom: 0 }}>
+                      <div className="muted">Password reset token (time-limited):</div>
+                      <pre>{resetToken}</pre>
+                      <div className="row" style={{ marginTop: '.55rem', marginBottom: 0 }}>
+                        <input value={resetNewPassword} onChange={(e) => setResetNewPassword(e.target.value)} placeholder="new password" />
+                        <button className="btn" onClick={consumeResetToken} disabled={!resetNewPassword || loading}>Consume Token</button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </section>
+          ) : null}
+        </main>
+      </div>
+
+      {!identity ? (
+        <div className="overlay">
+          <div className="login-card">
+            <h3>Admin Login</h3>
+            <p className="muted">Sign in to use the control plane.</p>
+            <div className="col">
+              <input value={loginUser} onChange={(e) => setLoginUser(e.target.value)} placeholder="Username" />
+              <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Password" />
+              <button className="btn" onClick={login} disabled={loading}>Login</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <style>{`
+        :root { --bg:#0f0f11; --surface:#16161a; --border:#222229; --text:#e0e0e5; --text-dim:#9ca3af; --accent:#6366f1; --accent-dark:#4f46e5; --green:#10b981; --red:#ef4444; --radius:12px; }
+        * { box-sizing: border-box; }
+        body { margin:0; font-family:'Inter', system-ui, sans-serif; background:var(--bg); color:var(--text); }
+        .app-shell { display:grid; grid-template-columns:240px 1fr; min-height:100vh; }
+        .sidebar { background:var(--surface); border-right:1px solid var(--border); padding:1.5rem 0; }
+        .logo { padding:0 1.5rem 2rem; font-size:1.6rem; font-weight:700; background:linear-gradient(90deg,#a5b4fc,#c084fc); -webkit-background-clip:text; background-clip:text; color:transparent; }
+        .menu { display:grid; gap:.25rem; padding:0 .5rem; }
+        .menu button { text-align:left; background:transparent; border:1px solid transparent; color:var(--text-dim); padding:.85rem 1rem; border-radius:10px; cursor:pointer; }
+        .menu button:hover, .menu button.active { background:rgba(99,102,241,.12); color:var(--accent); }
+        .main { padding:2.5rem 3rem; }
+        .top { display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1.25rem; }
+        h1 { margin:0; font-size:2.2rem; letter-spacing:-.6px; }
+        .subtitle { margin:.25rem 0 0; color:var(--text-dim); }
+        .top-actions { display:flex; gap:.5rem; }
+        .dashboard { display:grid; gap:1rem; }
+        .kpi-row { display:grid; gap:1rem; grid-template-columns:repeat(4,minmax(0,1fr)); }
+        .dashboard-layout { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
+        .dashboard-main { display:grid; gap:1rem; }
+        .entity-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
+        .entity-main { display:grid; gap:1rem; }
+        .entity-side { display:grid; gap:1rem; }
+        .gauge-grid { display:grid; gap:.8rem; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
+        .gauge-card { background:#121219; border:1px solid var(--border); border-radius:11px; padding:.75rem; display:grid; justify-items:center; gap:.45rem; }
+        .gauge-ring { width:92px; height:92px; border-radius:999px; display:grid; place-items:center; }
+        .gauge-inner { width:68px; height:68px; border-radius:999px; background:#111118; border:1px solid #2a2a36; display:grid; place-items:center; font-weight:700; }
+        .gauge-title { font-size:.82rem; text-align:center; }
+        .gauge-sub { font-size:.74rem; color:var(--text-dim); text-align:center; }
+        .metric-grid { display:grid; gap:.8rem; grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .metric-tile { background:#121219; border:1px solid var(--border); border-radius:11px; padding:.75rem; }
+        .metric-label { color:var(--text-dim); font-size:.78rem; margin-bottom:.35rem; }
+        .metric-value { font-size:1.4rem; font-weight:700; line-height:1; margin-bottom:.25rem; }
+        .metric-hint { color:var(--text-dim); font-size:.75rem; }
+        .event-list { display:grid; gap:.55rem; max-height:360px; overflow:auto; }
+        .event-item { padding:.55rem .6rem; border:1px solid var(--border); border-radius:9px; background:#121219; }
+        .event-top { display:flex; justify-content:space-between; align-items:center; gap:.6rem; margin-bottom:.2rem; }
+        .logs-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.75fr) minmax(300px,1fr); align-items:start; }
+        .logs-side { display:grid; gap:1rem; }
+        .logs-list { max-height:620px; }
+        .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:1rem; }
+        .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:1rem; }
+        .card.wide { grid-column:span 2; }
+        .card-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:.8rem; }
+        .card-head h3 { margin:0; }
+        .value { font-size:2rem; font-weight:700; }
+        .status { width:10px; height:10px; border-radius:999px; }
+        .status.ok { background:var(--green); }
+        .status.err { background:var(--red); }
+        .btn { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:.65rem 1rem; cursor:pointer; }
+        .btn:hover { background:var(--accent-dark); }
+        .btn.danger { background:#b91c1c; }
+        .btn.danger:hover { background:#991b1b; }
+        .btn:disabled { opacity:.6; cursor:not-allowed; }
+        .row { display:flex; gap:.6rem; flex-wrap:wrap; margin-bottom:.8rem; }
+        input, select, textarea { background:#0f0f14; border:1px solid var(--border); color:var(--text); border-radius:9px; padding:.6rem .75rem; }
+        textarea { min-height:6rem; width:100%; }
+        .wizard-steps { display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap; }
+        .wiz { background:#111118; color:var(--text-dim); border:1px solid var(--border); border-radius:10px; padding:.5rem .75rem; cursor:pointer; }
+        .wiz.active { color:var(--text); border-color:var(--accent); background:rgba(99,102,241,.15); }
+        .check { display:flex; align-items:center; gap:.5rem; margin-bottom:.5rem; color:var(--text-dim); }
+        .domain-pills { display:flex; flex-wrap:wrap; gap:.45rem; margin:.4rem 0 .8rem; }
+        .pill { display:flex; align-items:center; gap:.35rem; background:#111118; border:1px solid var(--border); border-radius:999px; padding:.3rem .6rem; color:var(--text-dim); }
+        ol { margin-top:.2rem; margin-bottom:.8rem; padding-left:1.2rem; }
+        pre { margin:0; background:#101015; border:1px solid var(--border); border-radius:10px; padding:.75rem; overflow:auto; }
+        .host { display:flex; justify-content:space-between; align-items:flex-start; gap:.6rem; border-top:1px solid var(--border); padding:.6rem 0; }
+        .diag { display:flex; gap:.35rem; flex-wrap:wrap; margin-top:.35rem; }
+        .diag-block { margin-top:.4rem; }
+        .badge { font-size:.74rem; padding:.15rem .45rem; border-radius:999px; border:1px solid transparent; }
+        .badge.ok { background:#103227; border-color:#1d5a45; color:#9df3cb; }
+        .badge.warn { background:#3a2a0f; border-color:#6b4d19; color:#ffd89a; }
+        .badge.err { background:#3a1717; border-color:#6b2222; color:#ffb3b3; }
+        .muted { color:var(--text-dim); }
+        .errtxt { color:#fca5a5; }
+        .error { margin-bottom:1rem; background:#3a1a1a; border:1px solid #7f1d1d; color:#fecaca; padding:.7rem .9rem; border-radius:10px; }
+        .overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); display:grid; place-items:center; padding:1rem; }
+        .login-card { width:min(420px,100%); background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1rem; }
+        .login-card h3 { margin-top:0; }
+        .col { display:grid; gap:.6rem; }
+        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} }
+        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} }
+      `}</style>
+    </>
+  );
+}
+
+function Card({ title, value, status }: { title: string; value: string; status: 'ok' | 'err' }) {
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h3>{title}</h3>
+        <span className={`status ${status}`} />
+      </div>
+      <div className="value">{value}</div>
+    </div>
+  );
+}
+
+function classifyAuditLevel(action: string, target: string): 'critical' | 'warn' | 'info' {
+  const s = `${action} ${target}`.toLowerCase();
+  if (s.includes("auth.login.locked")) return 'critical';
+  if (s.includes("auth.login.failed")) return 'warn';
+  if (s.includes('delete') || s.includes('revoke') || s.includes('password-reset') || s.includes('reset')) return 'critical';
+  if (s.includes('update') || s.includes('upsert') || s.includes('retry') || s.includes('reload')) return 'warn';
+  return 'info';
+}
+
+function hostStateBadge(state: string): { cls: 'ok' | 'warn' | 'err'; label: string } {
+  const s = (state || '').toLowerCase();
+  if (s === 'active') return { cls: 'ok', label: 'Active' };
+  if (s === 'error') return { cls: 'err', label: 'Error' };
+  if (s === 'cert_manager_async') return { cls: 'warn', label: 'Provisioning' };
+  if (s === 'cert_pending') return { cls: 'warn', label: 'Cert Pending' };
+  if (s === 'dns_pending') return { cls: 'warn', label: 'DNS Pending' };
+  if (s === 'created') return { cls: 'warn', label: 'Created' };
+  return { cls: 'warn', label: state || 'Unknown' };
+}
+
+function normalizeBackends(items: HABackend[]): HABackend[] {
+  const out: HABackend[] = [];
+  const seen = new Set<string>();
+  items.forEach((it, idx) => {
+    const url = (it.url || '').trim();
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    const name = (it.name || '').trim() || `backend-${idx + 1}`;
+    out.push({ name, url });
+  });
+  return out;
+}
+
+function Gauge({ title, value, subtitle }: { title: string; value: number; subtitle: string }) {
+  const clamped = Math.max(0, Math.min(100, value));
+  const deg = Math.round((clamped / 100) * 360);
+  const color = clamped >= 85 ? '#10b981' : clamped >= 60 ? '#f59e0b' : '#ef4444';
+  return (
+    <div className="gauge-card">
+      <div className="gauge-ring" style={{ background: `conic-gradient(${color} ${deg}deg, #2a2a31 ${deg}deg)` }}>
+        <div className="gauge-inner">{clamped}%</div>
+      </div>
+      <div className="gauge-title">{title}</div>
+      <div className="gauge-sub">{subtitle}</div>
+    </div>
+  );
+}
+
+function MetricTile({ label, value, hint }: { label: string; value: string; hint: string }) {
+  return (
+    <div className="metric-tile">
+      <div className="metric-label">{label}</div>
+      <div className="metric-value">{value}</div>
+      <div className="metric-hint">{hint}</div>
+    </div>
+  );
+}
+
+function UserRow({
+  user,
+  domains,
+  loading,
+  onDelete,
+  onSaveDomains,
+}: {
+  user: ManagedUser;
+  domains: Domain[];
+  loading: boolean;
+  onDelete: (id: number) => Promise<void>;
+  onSaveDomains: (id: number, domainIds: number[]) => Promise<void>;
+}) {
+  const [domainIds, setDomainIds] = useState<number[]>(user.domainIds || []);
+
+  useEffect(() => {
+    setDomainIds(user.domainIds || []);
+  }, [user.domainIds]);
+
+  const toggle = (id: number) => {
+    setDomainIds((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
+  };
+
+  return (
+    <div className="card" style={{ marginBottom: '.6rem' }}>
+      <div className="host" style={{ borderTop: 'none', paddingTop: 0 }}>
+        <div>
+          <strong>{user.username}</strong> <span className="muted">({user.role})</span>
+          <div className="muted">ID: {user.id}</div>
+        </div>
+        <button className="btn danger" onClick={() => onDelete(user.id)} disabled={loading}>Delete</button>
+      </div>
+      {user.role === 'domain-admin' ? (
+        <>
+          <div className="domain-pills">
+            {domains.map((d) => (
+              <label key={d.id} className="pill">
+                <input type="checkbox" checked={domainIds.includes(d.id)} onChange={() => toggle(d.id)} />
+                {d.name}
+              </label>
+            ))}
+          </div>
+          <div className="row">
+            <button className="btn" onClick={() => onSaveDomains(user.id, domainIds)} disabled={loading || domainIds.length === 0}>Save Domain Scope</button>
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+createRoot(document.getElementById('root')!).render(<App />);

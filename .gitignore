@@ -1,0 +1,52 @@
+# Go
+bin/
+*.test
+*.out
+
+# Build
+build/
+dist/
+tmp/
+*.tmp
+
+# UI
+ui/node_modules/
+ui/.vite/
+ui/.cache/
+ui/.env
+ui/.env.*
+!ui/.env.example
+
+# Runtime
+*.sqlite3
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+.env
+.env.*
+!.env.example
+
+# Secrets / keys / certs
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.csr
+*.der
+*.kdbx
+keystore.key
+
+# Logs / local dumps
+*.log
+logs/
+*.bak
+*.swp
+*.swo
+
+# Local runtime config overrides
+config/*.env
+config/*.local
+config/*secret*
+config/*private*
