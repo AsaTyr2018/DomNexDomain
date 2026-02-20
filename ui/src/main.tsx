@@ -1065,6 +1065,7 @@ function App() {
 
   return (
     <>
+      {identity ? (
       <div className="app-shell">
         <aside className="sidebar">
           <div className="logo">DomNexDomain</div>
@@ -2187,12 +2188,14 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
           ) : null}
         </main>
       </div>
+      ) : null}
 
       {!identity ? (
-        <div className="overlay">
-          <div className="login-card">
-            <h3>Admin Login</h3>
-            <p className="muted">Sign in to use the control plane.</p>
+        <div className="overlay auth-overlay">
+          <div className="login-card auth-login-card">
+            <div className="auth-logo">DomNexDomain</div>
+            <h3>Control Plane Login</h3>
+            <p className="muted">Sign in with your admin account to continue.</p>
             <div className="col">
               <input value={loginUser} onChange={(e) => setLoginUser(e.target.value)} placeholder="Username" />
               <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Password" />
@@ -2346,8 +2349,24 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .errtxt { color:#fca5a5; }
         .error { margin-bottom:1rem; background:#3a1a1a; border:1px solid #7f1d1d; color:#fecaca; padding:.7rem .9rem; border-radius:10px; }
         .overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); display:grid; place-items:center; padding:1rem; }
+        .auth-overlay {
+          background:
+            radial-gradient(800px 350px at 85% -10%, rgba(34,197,94,.16), transparent 52%),
+            radial-gradient(1000px 420px at 8% -20%, rgba(14,165,233,.18), transparent 56%),
+            #090b10;
+        }
         .login-card { width:min(420px,100%); background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1rem; }
         .login-card h3 { margin-top:0; }
+        .auth-login-card { width:min(460px,100%); border-color:#2b3445; background:linear-gradient(180deg, rgba(18,22,32,.95), rgba(15,18,28,.95)); }
+        .auth-logo {
+          font-size:1.1rem;
+          font-weight:700;
+          margin-bottom:.6rem;
+          background:linear-gradient(90deg,#67e8f9,#34d399);
+          -webkit-background-clip:text;
+          background-clip:text;
+          color:transparent;
+        }
         .col { display:grid; gap:.6rem; }
         @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} }
         @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} }
