@@ -1,6 +1,6 @@
 # DomNexDomain
 
-Security-first edge control plane for self-hosters and operators who want one hardened Linux binary instead of a pile of moving parts.
+Build and run secure public self-hosting with one hardened edge control plane: proxy, TLS, DNS automation, access control, and observability in a single Linux service.
 
 DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, API tokens, audit logging, and Web UI/API management in a single process.
 
