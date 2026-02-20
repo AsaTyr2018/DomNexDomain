@@ -8,8 +8,10 @@ import (
 )
 
 type Collector struct {
-	Requests *prometheus.CounterVec
-	Failures *prometheus.CounterVec
+	Requests      *prometheus.CounterVec
+	Failures      *prometheus.CounterVec
+	ProxyRequests *prometheus.CounterVec
+	GeoBlocks     *prometheus.CounterVec
 }
 
 func New() *Collector {
@@ -22,8 +24,16 @@ func New() *Collector {
 			Name: "domnex_failures_total",
 			Help: "Failures by subsystem.",
 		}, []string{"subsystem"}),
+		ProxyRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "domnex_proxy_requests_total",
+			Help: "Reverse proxy HTTP requests per host and status code.",
+		}, []string{"fqdn", "status"}),
+		GeoBlocks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "domnex_geo_blocks_total",
+			Help: "Blocked requests by host, country, and policy mode.",
+		}, []string{"fqdn", "country", "mode"}),
 	}
-	prometheus.MustRegister(c.Requests, c.Failures)
+	prometheus.MustRegister(c.Requests, c.Failures, c.ProxyRequests, c.GeoBlocks)
 	return c
 }
 

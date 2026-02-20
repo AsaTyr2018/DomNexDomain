@@ -80,6 +80,7 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/hosts", s.handleCreateHost)
 		pr.Put("/api/v1/hosts/{id}", s.handleUpdateHostRouting)
 		pr.Put("/api/v1/hosts/{id}/auth", s.handleSetHostAuth)
+		pr.Put("/api/v1/hosts/{id}/geo", s.handleSetHostGeoPolicy)
 		pr.Post("/api/v1/hosts/{id}/retry", s.handleRetryHost)
 		pr.Delete("/api/v1/hosts/{id}", s.handleDeleteHost)
 	})
@@ -571,6 +572,45 @@ func (s *Server) handleSetHostAuth(w http.ResponseWriter, r *http.Request) {
 		Action: "host.auth.update",
 		Target: updated.FQDN,
 		Meta:   strconv.FormatBool(updated.AuthEnabled),
+	})
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleSetHostGeoPolicy(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "hosts:write") {
+		return
+	}
+	hostID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	h, err := s.app.Store().GetHostByID(r.Context(), hostID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if id.Role == model.RoleDomainAdmin || tokenHasDomainRestriction(id) {
+		if !containsInt64(id.DomainIDs, h.DomainID) {
+			writeErr(w, http.StatusForbidden, "host domain not assigned to this admin")
+			return
+		}
+	}
+	var in struct {
+		Mode      string   `json:"mode"`
+		Countries []string `json:"countries"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := s.app.SetHostGeoPolicy(r.Context(), hostID, in.Mode, in.Countries)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "host.geo.update",
+		Target: updated.FQDN,
+		Meta:   updated.GeoMode + ":" + strings.Join(updated.GeoCountries, ","),
 	})
 	writeJSON(w, http.StatusOK, updated)
 }

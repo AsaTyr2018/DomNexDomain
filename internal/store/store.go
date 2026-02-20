@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS hosts (
   auth_enabled INTEGER NOT NULL DEFAULT 0,
   auth_user TEXT NOT NULL DEFAULT '',
   auth_pass_hash TEXT NOT NULL DEFAULT '',
+  geo_mode TEXT NOT NULL DEFAULT '',
+  geo_countries TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL,
   error_reason TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
@@ -197,6 +199,12 @@ CREATE TABLE IF NOT EXISTS user_domain_scopes (
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE hosts ADD COLUMN ha_backends TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE hosts ADD COLUMN geo_mode TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE hosts ADD COLUMN geo_countries TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return err
 	}
 	return nil
@@ -493,8 +501,9 @@ func (s *Store) GetHostByID(ctx context.Context, id int64) (model.Host, error) {
 	var created, updated string
 	var insecure, haEnabled, authEnabled int
 	var haBackendsJSON string
-	err := s.db.QueryRowContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, state, error_reason, created_at, updated_at FROM hosts WHERE id=?`, id).
-		Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.State, &h.ErrorReason, &created, &updated)
+	var geoCountriesCSV string
+	err := s.db.QueryRowContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE id=?`, id).
+		Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated)
 	if err != nil {
 		return h, err
 	}
@@ -502,13 +511,14 @@ func (s *Store) GetHostByID(ctx context.Context, id int64) (model.Host, error) {
 	h.HAEnabled = haEnabled != 0
 	h.HABackends = decodeBackends(haBackendsJSON)
 	h.AuthEnabled = authEnabled != 0
+	h.GeoCountries = decodeCSV(geoCountriesCSV)
 	h.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	h.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return h, nil
 }
 
 func (s *Store) ListHosts(ctx context.Context) ([]model.Host, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, state, error_reason, created_at, updated_at FROM hosts ORDER BY fqdn`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts ORDER BY fqdn`)
 	if err != nil {
 		return nil, err
 	}
@@ -519,13 +529,15 @@ func (s *Store) ListHosts(ctx context.Context) ([]model.Host, error) {
 		var created, updated string
 		var insecure, haEnabled, authEnabled int
 		var haBackendsJSON string
-		if err := rows.Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.State, &h.ErrorReason, &created, &updated); err != nil {
+		var geoCountriesCSV string
+		if err := rows.Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated); err != nil {
 			return nil, err
 		}
 		h.InsecureTLS = insecure != 0
 		h.HAEnabled = haEnabled != 0
 		h.HABackends = decodeBackends(haBackendsJSON)
 		h.AuthEnabled = authEnabled != 0
+		h.GeoCountries = decodeCSV(geoCountriesCSV)
 		h.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		h.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 		out = append(out, h)
@@ -534,7 +546,7 @@ func (s *Store) ListHosts(ctx context.Context) ([]model.Host, error) {
 }
 
 func (s *Store) ListHostsByDomainID(ctx context.Context, domainID int64) ([]model.Host, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, state, error_reason, created_at, updated_at FROM hosts WHERE domain_id=? ORDER BY fqdn`, domainID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE domain_id=? ORDER BY fqdn`, domainID)
 	if err != nil {
 		return nil, err
 	}
@@ -545,13 +557,15 @@ func (s *Store) ListHostsByDomainID(ctx context.Context, domainID int64) ([]mode
 		var created, updated string
 		var insecure, haEnabled, authEnabled int
 		var haBackendsJSON string
-		if err := rows.Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.State, &h.ErrorReason, &created, &updated); err != nil {
+		var geoCountriesCSV string
+		if err := rows.Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated); err != nil {
 			return nil, err
 		}
 		h.InsecureTLS = insecure != 0
 		h.HAEnabled = haEnabled != 0
 		h.HABackends = decodeBackends(haBackendsJSON)
 		h.AuthEnabled = authEnabled != 0
+		h.GeoCountries = decodeCSV(geoCountriesCSV)
 		h.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		h.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 		out = append(out, h)
@@ -657,8 +671,9 @@ func (s *Store) FindHostByFQDN(ctx context.Context, fqdn string) (model.Host, er
 	var created, updated string
 	var insecure, haEnabled, authEnabled int
 	var haBackendsJSON string
-	err := s.db.QueryRowContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, state, error_reason, created_at, updated_at FROM hosts WHERE fqdn=?`, fqdn).
-		Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.State, &h.ErrorReason, &created, &updated)
+	var geoCountriesCSV string
+	err := s.db.QueryRowContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE fqdn=?`, fqdn).
+		Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated)
 	if err != nil {
 		return h, err
 	}
@@ -666,6 +681,7 @@ func (s *Store) FindHostByFQDN(ctx context.Context, fqdn string) (model.Host, er
 	h.HAEnabled = haEnabled != 0
 	h.HABackends = decodeBackends(haBackendsJSON)
 	h.AuthEnabled = authEnabled != 0
+	h.GeoCountries = decodeCSV(geoCountriesCSV)
 	h.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	h.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return h, nil
@@ -688,6 +704,14 @@ func (s *Store) UpdateHostRouting(ctx context.Context, id int64, upstream string
 UPDATE hosts
 SET upstream_url=?, insecure_tls=?, ha_enabled=?, ha_mode=?, ha_backends=?, updated_at=?
 WHERE id=?`, upstream, boolToInt(insecureTLS), boolToInt(haEnabled), haMode, haBackendsJSON, time.Now().UTC().Format(time.RFC3339Nano), id)
+	return err
+}
+
+func (s *Store) UpdateHostGeoPolicy(ctx context.Context, id int64, mode string, countries []string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE hosts
+SET geo_mode=?, geo_countries=?, updated_at=?
+WHERE id=?`, mode, encodeCSV(countries), time.Now().UTC().Format(time.RFC3339Nano), id)
 	return err
 }
 
@@ -722,6 +746,36 @@ func decodeBackends(raw string) []model.HABackend {
 		converted = append(converted, model.HABackend{Name: fmt.Sprintf("backend-%d", i+1), URL: url})
 	}
 	return converted
+}
+
+func encodeCSV(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	trimmed := make([]string, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			trimmed = append(trimmed, v)
+		}
+	}
+	return strings.Join(trimmed, ",")
+}
+
+func decodeCSV(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func boolToInt(v bool) int {

@@ -1,23 +1,28 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"html"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/domnexdomain/domnexdomain/internal/crypto"
+	"github.com/domnexdomain/domnexdomain/internal/geoip"
 	"github.com/domnexdomain/domnexdomain/internal/logx"
+	"github.com/domnexdomain/domnexdomain/internal/metrics"
 	"github.com/domnexdomain/domnexdomain/internal/model"
 )
 
@@ -28,13 +33,22 @@ type HostSource interface {
 type Engine struct {
 	source HostSource
 	log    *logx.Logger
+	m      *metrics.Collector
+	geo    *geoip.Resolver
 	mu     sync.RWMutex
 	routes map[string]*routeEntry
 	auth   map[string]authSession
 }
 
-func New(source HostSource, log *logx.Logger) *Engine {
-	return &Engine{source: source, log: log, routes: map[string]*routeEntry{}, auth: map[string]authSession{}}
+func New(source HostSource, log *logx.Logger, m *metrics.Collector) *Engine {
+	return &Engine{
+		source: source,
+		log:    log,
+		m:      m,
+		geo:    geoip.New(1 * time.Hour),
+		routes: map[string]*routeEntry{},
+		auth:   map[string]authSession{},
+	}
 }
 
 type routeEntry struct {
@@ -104,6 +118,22 @@ func (e *Engine) Refresh(ctx context.Context) error {
 
 func (e *Engine) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := newStatusWriter(w)
+		defer func() {
+			hostLabel := "_unknown"
+			host := r.Host
+			if idx := strings.Index(host, ":"); idx >= 0 {
+				host = host[:idx]
+			}
+			host = strings.TrimSpace(strings.ToLower(host))
+			if host != "" {
+				hostLabel = host
+			}
+			if e.m != nil {
+				e.m.ProxyRequests.WithLabelValues(hostLabel, strconv.Itoa(sw.StatusCode())).Inc()
+			}
+		}()
+
 		host := r.Host
 		if idx := strings.Index(host, ":"); idx >= 0 {
 			host = host[:idx]
@@ -113,37 +143,154 @@ func (e *Engine) Handler() http.Handler {
 		route, ok := e.routes[host]
 		e.mu.RUnlock()
 		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte("unknown host"))
+			sw.WriteHeader(http.StatusNotFound)
+			_, _ = sw.Write([]byte("unknown host"))
+			return
+		}
+		if blocked, country, mode := e.isGeoBlocked(r, route.host); blocked {
+			if e.m != nil {
+				e.m.GeoBlocks.WithLabelValues(route.host.FQDN, country, mode).Inc()
+			}
+			e.log.Warn("geo policy blocked request", map[string]any{"fqdn": route.host.FQDN, "country": country, "mode": mode})
+			sw.WriteHeader(http.StatusForbidden)
+			_, _ = sw.Write([]byte("geo blocked"))
 			return
 		}
 		if route.host.AuthEnabled {
 			e.pruneAuthSessions()
 			if strings.HasPrefix(r.URL.Path, hostAuthPathLogout) {
-				e.logoutHostAuth(w, r)
+				e.logoutHostAuth(sw, r)
 				next := "/"
 				if strings.HasPrefix(r.URL.Path, hostAuthPathLogout) && len(r.URL.Path) > len(hostAuthPathLogout) {
 					next = "/"
 				}
-				http.Redirect(w, r, next, http.StatusSeeOther)
+				http.Redirect(sw, r, next, http.StatusSeeOther)
 				return
 			}
 			if r.URL.Path == hostAuthPathLogin && r.Method == http.MethodPost {
-				e.handleHostAuthLogin(route.host, w, r)
+				e.handleHostAuthLogin(route.host, sw, r)
 				return
 			}
 			if !e.isHostAuthorized(host, r) {
-				e.renderHostLoginPage(route.host, w, r, "")
+				e.renderHostLoginPage(route.host, sw, r, "")
 				return
 			}
 		}
 		if route.host.HAEnabled && len(route.backends) > 0 {
 			idx := e.selectBackendIndex(route)
-			route.backends[idx].proxy.ServeHTTP(w, r)
+			route.backends[idx].proxy.ServeHTTP(sw, r)
 			return
 		}
-		route.proxy.ServeHTTP(w, r)
+		route.proxy.ServeHTTP(sw, r)
 	})
+}
+
+func (e *Engine) isGeoBlocked(r *http.Request, h model.Host) (bool, string, string) {
+	mode := strings.ToLower(strings.TrimSpace(h.GeoMode))
+	if mode == "" {
+		return false, "", ""
+	}
+	countrySet := map[string]bool{}
+	for _, c := range h.GeoCountries {
+		cc := strings.ToUpper(strings.TrimSpace(c))
+		if len(cc) == 2 {
+			countrySet[cc] = true
+		}
+	}
+	if len(countrySet) == 0 {
+		return false, "", mode
+	}
+	ip := clientIPFromRequest(r)
+	country := e.geo.CountryCode(r.Context(), ip)
+	if country == "LOCAL" {
+		return false, country, mode
+	}
+	switch mode {
+	case "allow":
+		return !countrySet[country], country, mode
+	case "deny":
+		return countrySet[country], country, mode
+	default:
+		return false, country, mode
+	}
+}
+
+func clientIPFromRequest(r *http.Request) string {
+	if cfip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfip != "" {
+		return cfip
+	}
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		if idx := strings.Index(xff, ","); idx >= 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return xff
+	}
+	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+		return xrip
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func newStatusWriter(w http.ResponseWriter) *statusWriter {
+	return &statusWriter{ResponseWriter: w}
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusWriter) StatusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, errors.New("hijack not supported")
+}
+
+func (w *statusWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		if w.status == 0 {
+			w.status = http.StatusOK
+		}
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(w.ResponseWriter, r)
+}
+
+func (w *statusWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
 }
 
 func newReverseProxy(e *Engine, u *url.URL, h model.Host) *httputil.ReverseProxy {

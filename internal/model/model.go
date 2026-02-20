@@ -52,22 +52,24 @@ type Domain struct {
 }
 
 type Host struct {
-	ID           int64     `json:"id"`
-	DomainID     int64     `json:"domainId"`
-	Subdomain    string    `json:"subdomain"`
-	FQDN         string    `json:"fqdn"`
-	UpstreamURL  string    `json:"upstreamUrl"`
-	InsecureTLS  bool      `json:"insecureTls"`
-	HAEnabled    bool      `json:"haEnabled"`
-	HAMode       string    `json:"haMode,omitempty"`
+	ID           int64       `json:"id"`
+	DomainID     int64       `json:"domainId"`
+	Subdomain    string      `json:"subdomain"`
+	FQDN         string      `json:"fqdn"`
+	UpstreamURL  string      `json:"upstreamUrl"`
+	InsecureTLS  bool        `json:"insecureTls"`
+	HAEnabled    bool        `json:"haEnabled"`
+	HAMode       string      `json:"haMode,omitempty"`
 	HABackends   []HABackend `json:"haBackends,omitempty"`
-	AuthEnabled  bool      `json:"authEnabled"`
-	AuthUser     string    `json:"authUser,omitempty"`
-	AuthPassHash string    `json:"-"`
-	State        string    `json:"state"`
-	ErrorReason  string    `json:"errorReason,omitempty"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	AuthEnabled  bool        `json:"authEnabled"`
+	AuthUser     string      `json:"authUser,omitempty"`
+	AuthPassHash string      `json:"-"`
+	GeoMode      string      `json:"geoMode,omitempty"`
+	GeoCountries []string    `json:"geoCountries,omitempty"`
+	State        string      `json:"state"`
+	ErrorReason  string      `json:"errorReason,omitempty"`
+	CreatedAt    time.Time   `json:"createdAt"`
+	UpdatedAt    time.Time   `json:"updatedAt"`
 }
 
 type HABackend struct {

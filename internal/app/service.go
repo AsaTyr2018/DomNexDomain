@@ -505,6 +505,20 @@ func (s *Service) SetHostAuth(ctx context.Context, hostID int64, enabled bool, u
 	return s.store.GetHostByID(ctx, hostID)
 }
 
+func (s *Service) SetHostGeoPolicy(ctx context.Context, hostID int64, mode string, countries []string) (model.Host, error) {
+	if _, err := s.store.GetHostByID(ctx, hostID); err != nil {
+		return model.Host{}, err
+	}
+	normalizedMode, normalizedCountries, err := normalizeHostGeoPolicy(mode, countries)
+	if err != nil {
+		return model.Host{}, err
+	}
+	if err := s.store.UpdateHostGeoPolicy(ctx, hostID, normalizedMode, normalizedCountries); err != nil {
+		return model.Host{}, err
+	}
+	return s.store.GetHostByID(ctx, hostID)
+}
+
 func (s *Service) UpdateHostRouting(ctx context.Context, hostID int64, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) (model.Host, error) {
 	current, err := s.store.GetHostByID(ctx, hostID)
 	if err != nil {
@@ -698,6 +712,35 @@ func validateRoutingInput(upstream string, haEnabled bool, haMode string, haBack
 		return "", "", nil, fmt.Errorf("ha requires at least 2 backends")
 	}
 	return out[0].URL, mode, out, nil
+}
+
+func normalizeHostGeoPolicy(mode string, countries []string) (string, []string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "", "off":
+		return "", nil, nil
+	case "allow":
+	case "deny":
+	default:
+		return "", nil, fmt.Errorf("invalid geo mode")
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(countries))
+	for _, c := range countries {
+		c = strings.ToUpper(strings.TrimSpace(c))
+		if c == "" || seen[c] {
+			continue
+		}
+		if len(c) != 2 || c[0] < 'A' || c[0] > 'Z' || c[1] < 'A' || c[1] > 'Z' {
+			return "", nil, fmt.Errorf("invalid country code: %s", c)
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return "", nil, fmt.Errorf("at least one country code required for geo policy")
+	}
+	return mode, out, nil
 }
 
 func (s *Service) UpdatePublicIP(ctx context.Context, ip string) error {

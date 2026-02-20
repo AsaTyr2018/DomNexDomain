@@ -4,7 +4,7 @@ import { createRoot } from 'react-dom/client';
 type Identity = { username: string; role: string; type: string };
 type Domain = { id: number; name: string; dnsMode?: string; provider?: string; zoneId?: string };
 type HABackend = { name: string; url: string };
-type Host = { id: number; fqdn: string; upstreamUrl: string; insecureTls?: boolean; haEnabled?: boolean; haMode?: string; haBackends?: HABackend[]; authEnabled?: boolean; authUser?: string; state: string; errorReason?: string };
+type Host = { id: number; fqdn: string; upstreamUrl: string; insecureTls?: boolean; haEnabled?: boolean; haMode?: string; haBackends?: HABackend[]; authEnabled?: boolean; authUser?: string; geoMode?: string; geoCountries?: string[]; state: string; errorReason?: string };
 type HostDiagnostic = { fqdn: string; dnsRecords: string[]; httpStatus: number; httpsStatus: number; tlsOk: boolean; certSubject: string; certIssuer: string; certNotAfter: string; certDaysLeft: number; haEnabled?: boolean; haMode?: string; haOnline?: number; haTotal?: number; haOffline?: string[]; error?: string };
 type HostLiveCheck = { fqdn: string; dnsOk: boolean; dnsPointsToServer: boolean; httpReachable: boolean; httpsReachable: boolean; tlsOk: boolean; certDaysLeft: number; cloudflareRecordFound: boolean; error?: string };
 type DomainLiveCheck = { domain: string; dnsMode: string; provider: string; serverIpv4?: string; apexDnsOk: boolean; apexPointsToServer: boolean; cloudflareApiOk: boolean; cloudflareZoneId?: string; cloudflareError?: string; hosts: HostLiveCheck[]; warnings?: string[]; overallOk: boolean };
@@ -84,8 +84,11 @@ function App() {
   const [detailAuthEnabled, setDetailAuthEnabled] = useState(false);
   const [detailAuthUser, setDetailAuthUser] = useState('');
   const [detailAuthPass, setDetailAuthPass] = useState('');
+  const [detailGeoMode, setDetailGeoMode] = useState<'off' | 'allow' | 'deny'>('off');
+  const [detailGeoCountries, setDetailGeoCountries] = useState('');
   const [detailSavingGeneral, setDetailSavingGeneral] = useState(false);
   const [detailSavingAuth, setDetailSavingAuth] = useState(false);
+  const [detailSavingGeo, setDetailSavingGeo] = useState(false);
   const [newTokenName, setNewTokenName] = useState('automation');
   const [newTokenRole, setNewTokenRole] = useState('operator');
   const [newTokenScopes, setNewTokenScopes] = useState('');
@@ -388,6 +391,8 @@ function App() {
     setDetailAuthEnabled(!!h.authEnabled);
     setDetailAuthUser(h.authUser || '');
     setDetailAuthPass('');
+    setDetailGeoMode((h.geoMode === 'allow' || h.geoMode === 'deny') ? h.geoMode : 'off');
+    setDetailGeoCountries((h.geoCountries || []).join(', '));
   };
 
   const saveHostGeneral = async () => {
@@ -434,6 +439,27 @@ function App() {
       setError((e as Error).message);
     } finally {
       setDetailSavingAuth(false);
+    }
+  };
+
+  const saveHostGeo = async () => {
+    if (!selectedHostID) return;
+    setError('');
+    setDetailSavingGeo(true);
+    try {
+      await api(`/api/v1/hosts/${selectedHostID}/geo`, {
+        method: 'PUT',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          mode: detailGeoMode,
+          countries: parseCountryCodes(detailGeoCountries),
+        }),
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setDetailSavingGeo(false);
     }
   };
 
@@ -1130,6 +1156,39 @@ function App() {
                   </section>
 
                   <section className="card">
+                    <div className="card-head"><h3>GeoIP Access Policy</h3></div>
+                    <div className="row">
+                      <select value={detailGeoMode} onChange={(e) => setDetailGeoMode(e.target.value as 'off' | 'allow' | 'deny')}>
+                        <option value="off">Off</option>
+                        <option value="allow">Allow List Countries</option>
+                        <option value="deny">Deny List Countries</option>
+                      </select>
+                      <button className="btn" onClick={saveHostGeo} disabled={detailSavingGeo}>{detailSavingGeo ? 'Saving...' : 'Save Geo Policy'}</button>
+                    </div>
+                    {detailGeoMode !== 'off' ? (
+                      <>
+                        <div className="domain-pills">
+                          {Object.entries(GEO_PRESETS).map(([label, codes]) => (
+                            <button key={label} type="button" className="wiz" onClick={() => setDetailGeoCountries(codes.join(', '))}>{label}</button>
+                          ))}
+                          <button type="button" className="wiz" onClick={() => setDetailGeoCountries(mergeCountryCodes(detailGeoCountries, GEO_PRESETS.EU))}>+ EU</button>
+                          <button type="button" className="wiz" onClick={() => setDetailGeoCountries('')}>Clear</button>
+                        </div>
+                        <div className="row">
+                          <input
+                            value={detailGeoCountries}
+                            onChange={(e) => setDetailGeoCountries(e.target.value.toUpperCase())}
+                            placeholder="Country codes, e.g. DE,AT,CH or US,CA"
+                          />
+                        </div>
+                        <div className="muted">Use ISO country codes. Requests outside this policy are blocked before upstream/auth.</div>
+                      </>
+                    ) : (
+                      <div className="muted">No country filtering. All countries are allowed.</div>
+                    )}
+                  </section>
+
+                  <section className="card">
                     <div className="card-head"><h3>Host Diagnostics</h3></div>
                     {hostDiagnostics[selectedHost.fqdn] ? (
                       <div className="diag">
@@ -1149,6 +1208,7 @@ function App() {
                       <MetricTile label="Auth Page" value={selectedHost.authEnabled ? 'enabled' : 'disabled'} hint="Per-host access gate" />
                       <MetricTile label="TLS Verify" value={selectedHost.insecureTls ? 'disabled' : 'enabled'} hint="Upstream certificate policy" />
                       <MetricTile label="Routing" value={selectedHost.haEnabled ? `HA (${selectedHost.haMode || 'failover'})` : 'Single Upstream'} hint="Proxy mode" />
+                      <MetricTile label="Geo Policy" value={selectedHost.geoMode ? `${selectedHost.geoMode} (${(selectedHost.geoCountries || []).length})` : 'off'} hint="Country access filter" />
                     </div>
                   </section>
                   <section className="card">
@@ -1873,6 +1933,30 @@ function normalizeBackends(items: HABackend[]): HABackend[] {
   return out;
 }
 
+function parseCountryCodes(raw: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  raw.split(/[,\s]+/).forEach((it) => {
+    const code = it.trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(code) || seen.has(code)) return;
+    seen.add(code);
+    out.push(code);
+  });
+  return out;
+}
+
+const GEO_PRESETS: Record<string, string[]> = {
+  DACH: ['DE', 'AT', 'CH'],
+  EU: ['AT', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'DE', 'GR', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE'],
+  'North America': ['US', 'CA', 'MX'],
+  'DACH + EU': ['DE', 'AT', 'CH', 'BE', 'BG', 'HR', 'CY', 'CZ', 'DK', 'EE', 'FI', 'FR', 'GR', 'HU', 'IE', 'IT', 'LV', 'LT', 'LU', 'MT', 'NL', 'PL', 'PT', 'RO', 'SK', 'SI', 'ES', 'SE'],
+};
+
+function mergeCountryCodes(baseRaw: string, add: string[]): string {
+  const merged = [...parseCountryCodes(baseRaw), ...add];
+  return parseCountryCodes(merged.join(',')).join(', ');
+}
+
 function Gauge({ title, value, subtitle }: { title: string; value: number; subtitle: string }) {
   const clamped = Math.max(0, Math.min(100, value));
   const deg = Math.round((clamped / 100) * 360);
@@ -1917,6 +2001,7 @@ function UserRow({
 }) {
   const [domainIds, setDomainIds] = useState<number[]>(user.domainIds || []);
   const [newPassword, setNewPassword] = useState('');
+  const isCurrentUser = currentUserID > 0 && user.id === currentUserID;
 
   useEffect(() => {
     setDomainIds(user.domainIds || []);
@@ -1971,4 +2056,3 @@ function UserRow({
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
-  const isCurrentUser = currentUserID > 0 && user.id === currentUserID;

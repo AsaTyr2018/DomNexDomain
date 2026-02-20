@@ -57,6 +57,8 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
     - Captures login failures and high-impact configuration actions for forensic traceability.
   - Prometheus metrics endpoint
     - Exposes operational telemetry for alerting and dashboard integration.
+  - Per-subdomain GeoIP policy (allow/deny country lists)
+    - Evaluates client IP to ISO country code and enforces optional country-based access rules before proxy upstream/auth flow.
 
 ## DomNexDomain vs Nginx/Caddy/Traefik
 
@@ -185,6 +187,11 @@ After first login:
 - Argon2id password hashing
 - Session cookie + CSRF protections for state-changing requests
 - Audit trail for security-relevant actions
+
+GeoIP implementation note:
+- Country detection is IP-based and mapped to ISO-3166-1 alpha-2 codes.
+- UI presets (for example `EU`, `DACH`, `North America`) are static code lists for predictable behavior.
+- Local/private client addresses are treated as `LOCAL` and are not blocked by Geo policy.
 
 ## API Overview (Technical)
 
