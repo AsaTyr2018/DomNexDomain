@@ -66,6 +66,7 @@ type routeEntry struct {
 }
 
 type backendRoute struct {
+	name   string
 	raw    string
 	parsed *url.URL
 	proxy  *httputil.ReverseProxy
@@ -105,7 +106,11 @@ func (e *Engine) Refresh(ctx context.Context) error {
 					e.log.Warn("invalid HA backend URL", map[string]any{"fqdn": h.FQDN, "url": raw})
 					continue
 				}
-				entry.backends = append(entry.backends, backendRoute{raw: raw, parsed: u, proxy: newReverseProxy(e, u, h, raw)})
+				name := strings.TrimSpace(be.Name)
+				if name == "" {
+					name = u.Host
+				}
+				entry.backends = append(entry.backends, backendRoute{name: name, raw: raw, parsed: u, proxy: newReverseProxy(e, u, h, raw)})
 			}
 			if len(entry.backends) == 0 {
 				e.log.Warn("no valid HA backends; falling back to upstream", map[string]any{"fqdn": h.FQDN})
@@ -253,7 +258,31 @@ func (e *Engine) Handler() http.Handler {
 			}
 		}
 		if route.host.HAEnabled && len(route.backends) > 0 {
-			idx := e.selectBackendIndex(route)
+			idx, online, total, offline := e.selectBackendIndex(route)
+			if idx < 0 {
+				traceID, _ := randomHex(8)
+				scope := requestScope(clientIP, publicIP)
+				e.log.Warn("ha all backends unreachable", map[string]any{
+					"fqdn":    route.host.FQDN,
+					"online":  online,
+					"total":   total,
+					"offline": strings.Join(offline, ","),
+					"traceID": traceID,
+				})
+				e.auditProxyEvent(r.Context(), "proxy.error.ha_all_backends_down", route.host.FQDN, "trace="+traceID+";source="+clientIP+";online="+strconv.Itoa(online)+";total="+strconv.Itoa(total)+";offline="+strings.Join(offline, ",")+";path="+r.URL.Path)
+				e.renderSmartErrorPage(sw, r, smartErrorPage{
+					HTTPStatus:   http.StatusServiceUnavailable,
+					Title:        "HA Backends Unavailable",
+					Description:  "All configured high-availability backends are currently unreachable.",
+					Code:         "DNX-HA-503",
+					FailurePoint: "origin: all HA backends down (" + strconv.Itoa(online) + "/" + strconv.Itoa(total) + " healthy)",
+					Host:         route.host.FQDN,
+					TraceID:      traceID,
+					Theme:        "err",
+					Scope:        scope,
+				})
+				return
+			}
 			route.backends[idx].proxy.ServeHTTP(sw, r)
 			return
 		}
@@ -462,6 +491,9 @@ func newReverseProxy(e *Engine, u *url.URL, h model.Host, upstreamRef string) *h
 		clientIP := clientIPFromRequest(r)
 		e.log.Error("proxy error", map[string]any{"host": r.Host, "upstream": upstreamRef, "traceID": traceID, "source": clientIP, "err": err.Error()})
 		e.auditProxyEvent(r.Context(), "proxy.error.origin_unreachable", h.FQDN, "trace="+traceID+";source="+clientIP+";upstream="+upstreamRef+";path="+r.URL.Path+";err="+err.Error())
+		e.mu.RLock()
+		publicIP := e.publicIP
+		e.mu.RUnlock()
 		e.renderSmartErrorPage(w, r, smartErrorPage{
 			HTTPStatus:   http.StatusBadGateway,
 			Title:        "Upstream Unreachable",
@@ -471,29 +503,41 @@ func newReverseProxy(e *Engine, u *url.URL, h model.Host, upstreamRef string) *h
 			Host:         h.FQDN,
 			TraceID:      traceID,
 			Theme:        "err",
+			Scope:        requestScope(clientIP, publicIP),
 		})
 	}
 	return rp
 }
 
-func (e *Engine) selectBackendIndex(route *routeEntry) int {
+func (e *Engine) selectBackendIndex(route *routeEntry) (int, int, int, []string) {
 	n := len(route.backends)
 	if n == 0 {
-		return 0
+		return -1, 0, 0, nil
 	}
 	mode := strings.ToLower(strings.TrimSpace(route.host.HAMode))
 	if mode == "" {
 		mode = "failover"
 	}
 	if mode == "round_robin" {
-		return int((atomic.AddUint64(&route.rr, 1) - 1) % uint64(n))
+		return int((atomic.AddUint64(&route.rr, 1) - 1) % uint64(n)), n, n, nil
 	}
+	online := 0
+	offline := []string{}
 	for i := 0; i < n; i++ {
 		if isBackendReachable(route.backends[i].parsed) {
-			return i
+			online++
+			if online == 1 {
+				return i, online, n, offline
+			}
+			continue
 		}
+		name := strings.TrimSpace(route.backends[i].name)
+		if name == "" {
+			name = route.backends[i].raw
+		}
+		offline = append(offline, name)
 	}
-	return 0
+	return -1, online, n, offline
 }
 
 func isBackendReachable(u *url.URL) bool {
@@ -651,6 +695,7 @@ type smartErrorPage struct {
 	Host         string
 	TraceID      string
 	Theme        string
+	Scope        string
 }
 
 func (e *Engine) renderSmartErrorPage(w http.ResponseWriter, r *http.Request, p smartErrorPage) {
@@ -668,6 +713,14 @@ func (e *Engine) renderSmartErrorPage(w http.ResponseWriter, r *http.Request, p 
 	}
 	if host == "" {
 		host = "unknown"
+	}
+	scope := strings.TrimSpace(p.Scope)
+	if scope == "" {
+		clientIP := clientIPFromRequest(r)
+		e.mu.RLock()
+		publicIP := e.publicIP
+		e.mu.RUnlock()
+		scope = requestScope(clientIP, publicIP)
 	}
 	theme := strings.TrimSpace(strings.ToLower(p.Theme))
 	gradA := "rgba(245,158,11,.18)"
@@ -706,11 +759,19 @@ p{margin:.2rem 0 .75rem;color:var(--dim)}
 <div class="row"><div class="k">Host</div><div class="v">` + html.EscapeString(host) + `</div></div>
 <div class="row"><div class="k">Path</div><div class="v">` + html.EscapeString(r.URL.Path) + `</div></div>
 <div class="row"><div class="k">Failure Point</div><div class="v">` + html.EscapeString(p.FailurePoint) + `</div></div>
+<div class="row"><div class="k">Request Scope</div><div class="v">` + html.EscapeString(scope) + `</div></div>
 <div class="row"><div class="k">Error Code</div><div class="v">` + html.EscapeString(p.Code) + `</div></div>
 <div class="row"><div class="k">Timestamp (UTC)</div><div class="v">` + time.Now().UTC().Format(time.RFC3339) + `</div></div>
 <div class="row"><div class="k">Trace ID</div><div class="v"><strong>` + html.EscapeString(p.TraceID) + `</strong></div></div>
 </main></body></html>`
 	_, _ = w.Write([]byte(body))
+}
+
+func requestScope(clientIP, publicIP string) string {
+	if isLANClient(clientIP, publicIP) {
+		return "internal (LAN/hairpin request)"
+	}
+	return "external (internet request)"
 }
 
 func (e *Engine) auditProxyEvent(ctx context.Context, action, target, meta string) {
