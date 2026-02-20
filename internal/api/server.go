@@ -120,6 +120,8 @@ func (s *Server) Router() http.Handler {
 			http.NotFound(w, req)
 			return
 		}
+		w.Header().Set("Cache-Control", "no-store, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
 		clean := strings.TrimPrefix(path.Clean(req.URL.Path), "/")
 		if clean == "." || clean == "" {
 			clean = "index.html"

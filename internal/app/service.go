@@ -568,6 +568,10 @@ func (s *Service) ListHosts(ctx context.Context) ([]model.Host, error) {
 	return s.store.ListHosts(ctx)
 }
 
+func (s *Service) AddAuditEvent(ctx context.Context, e model.AuditEvent) error {
+	return s.store.AddAuditEvent(ctx, e)
+}
+
 func (s *Service) PublicIPv4(ctx context.Context) string {
 	_ = ctx
 	return strings.TrimSpace(s.publicIP)

@@ -31,6 +31,7 @@ import (
 type HostSource interface {
 	ListHosts(ctx context.Context) ([]model.Host, error)
 	PublicIPv4(ctx context.Context) string
+	AddAuditEvent(ctx context.Context, e model.AuditEvent) error
 }
 
 type Engine struct {
@@ -104,7 +105,7 @@ func (e *Engine) Refresh(ctx context.Context) error {
 					e.log.Warn("invalid HA backend URL", map[string]any{"fqdn": h.FQDN, "url": raw})
 					continue
 				}
-				entry.backends = append(entry.backends, backendRoute{raw: raw, parsed: u, proxy: newReverseProxy(e, u, h)})
+				entry.backends = append(entry.backends, backendRoute{raw: raw, parsed: u, proxy: newReverseProxy(e, u, h, raw)})
 			}
 			if len(entry.backends) == 0 {
 				e.log.Warn("no valid HA backends; falling back to upstream", map[string]any{"fqdn": h.FQDN})
@@ -116,7 +117,7 @@ func (e *Engine) Refresh(ctx context.Context) error {
 				e.log.Warn("invalid upstream URL", map[string]any{"fqdn": h.FQDN, "url": h.UpstreamURL})
 				continue
 			}
-			entry.proxy = newReverseProxy(e, u, h)
+			entry.proxy = newReverseProxy(e, u, h, h.UpstreamURL)
 		}
 		routes[strings.ToLower(h.FQDN)] = entry
 	}
@@ -148,7 +149,8 @@ func (e *Engine) Handler() http.Handler {
 			if e.m != nil {
 				e.m.ProxyRequests.WithLabelValues(hostLabel, strconv.Itoa(sw.StatusCode())).Inc()
 			}
-			if e.tr != nil && selectedRoute != nil {
+			edgeError := strings.EqualFold(strings.TrimSpace(sw.Header().Get("X-DomNex-Edge-Error")), "1")
+			if e.tr != nil && selectedRoute != nil && !edgeError {
 				contentIn := int64(0)
 				if r.ContentLength > 0 {
 					contentIn = r.ContentLength
@@ -178,20 +180,35 @@ func (e *Engine) Handler() http.Handler {
 		e.mu.RUnlock()
 		selectedRoute = route
 		if !ok {
-			sw.WriteHeader(http.StatusNotFound)
-			_, _ = sw.Write([]byte("unknown host"))
+			traceID, _ := randomHex(8)
+			clientIP = clientIPFromRequest(r)
+			e.auditProxyEvent(r.Context(), "proxy.error.unknown_host", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
+			e.renderSmartErrorPage(sw, r, smartErrorPage{
+				HTTPStatus:   http.StatusNotFound,
+				Title:        "Unknown Endpoint",
+				Description:  "This hostname is not configured on this edge.",
+				Code:         "DNX-ROUTE-404",
+				FailurePoint: "routing",
+				Host:         host,
+				TraceID:      traceID,
+				Theme:        "warn",
+			})
 			return
 		}
 		clientIP = clientIPFromRequest(r)
 		if route.host.State == "disabled" {
-			e.renderHostDisabledPage(route.host, sw, r)
+			traceID, _ := randomHex(8)
+			e.auditProxyEvent(r.Context(), "proxy.error.host_disabled", route.host.FQDN, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
+			e.renderHostDisabledPage(route.host, traceID, sw, r)
 			return
 		}
 		e.mu.RLock()
 		publicIP := e.publicIP
 		e.mu.RUnlock()
 		if route.host.State == "maintenance" && !isLANClient(clientIP, publicIP) {
-			e.renderHostMaintenancePage(route.host, sw, r)
+			traceID, _ := randomHex(8)
+			e.auditProxyEvent(r.Context(), "proxy.error.maintenance", route.host.FQDN, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
+			e.renderHostMaintenancePage(route.host, traceID, sw, r)
 			return
 		}
 		country = countryFromHeaders(r)
@@ -211,6 +228,7 @@ func (e *Engine) Handler() http.Handler {
 				"path":    r.URL.Path,
 				"traceID": traceID,
 			})
+			e.auditProxyEvent(r.Context(), "proxy.error.geo_blocked", route.host.FQDN, "trace="+traceID+";source="+clientIP+";country="+country+";mode="+mode+";path="+r.URL.Path)
 			e.renderGeoBlockedPage(route.host.FQDN, country, mode, traceID, sw, r)
 			return
 		}
@@ -424,7 +442,7 @@ func (w *statusWriter) BytesWritten() int64 {
 	return w.bytes
 }
 
-func newReverseProxy(e *Engine, u *url.URL, h model.Host) *httputil.ReverseProxy {
+func newReverseProxy(e *Engine, u *url.URL, h model.Host, upstreamRef string) *httputil.ReverseProxy {
 	rp := httputil.NewSingleHostReverseProxy(u)
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -440,9 +458,20 @@ func newReverseProxy(e *Engine, u *url.URL, h model.Host) *httputil.ReverseProxy
 	}
 	rp.Transport = transport
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		e.log.Error("proxy error", map[string]any{"host": r.Host, "err": err.Error()})
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte("bad gateway"))
+		traceID, _ := randomHex(8)
+		clientIP := clientIPFromRequest(r)
+		e.log.Error("proxy error", map[string]any{"host": r.Host, "upstream": upstreamRef, "traceID": traceID, "source": clientIP, "err": err.Error()})
+		e.auditProxyEvent(r.Context(), "proxy.error.origin_unreachable", h.FQDN, "trace="+traceID+";source="+clientIP+";upstream="+upstreamRef+";path="+r.URL.Path+";err="+err.Error())
+		e.renderSmartErrorPage(w, r, smartErrorPage{
+			HTTPStatus:   http.StatusBadGateway,
+			Title:        "Upstream Unreachable",
+			Description:  "The edge received your request, but could not reach the configured origin service.",
+			Code:         "DNX-ORIGIN-502",
+			FailurePoint: "origin",
+			Host:         h.FQDN,
+			TraceID:      traceID,
+			Theme:        "err",
+		})
 	}
 	return rp
 }
@@ -613,67 +642,123 @@ func normalizeNext(raw string) string {
 	return raw
 }
 
-func (e *Engine) renderGeoBlockedPage(fqdn, country, mode, traceID string, w http.ResponseWriter, r *http.Request) {
+type smartErrorPage struct {
+	HTTPStatus   int
+	Title        string
+	Description  string
+	Code         string
+	FailurePoint string
+	Host         string
+	TraceID      string
+	Theme        string
+}
+
+func (e *Engine) renderSmartErrorPage(w http.ResponseWriter, r *http.Request, p smartErrorPage) {
+	status := p.HTTPStatus
+	if status == 0 {
+		status = http.StatusServiceUnavailable
+	}
+	host := strings.TrimSpace(p.Host)
+	if host == "" {
+		h := r.Host
+		if idx := strings.Index(h, ":"); idx >= 0 {
+			h = h[:idx]
+		}
+		host = strings.TrimSpace(strings.ToLower(h))
+	}
+	if host == "" {
+		host = "unknown"
+	}
+	theme := strings.TrimSpace(strings.ToLower(p.Theme))
+	gradA := "rgba(245,158,11,.18)"
+	gradB := "rgba(239,68,68,.12)"
+	if theme == "ok" {
+		gradA = "rgba(16,185,129,.18)"
+		gradB = "rgba(34,197,94,.12)"
+	}
+	if theme == "warn" {
+		gradA = "rgba(245,158,11,.18)"
+		gradB = "rgba(99,102,241,.12)"
+	}
+	if theme == "err" {
+		gradA = "rgba(239,68,68,.2)"
+		gradB = "rgba(245,158,11,.12)"
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusForbidden)
+	w.Header().Set("X-DomNex-Trace", p.TraceID)
+	w.Header().Set("X-DomNex-Edge-Error", "1")
+	w.WriteHeader(status)
 	body := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Access Blocked</title>
+<title>` + html.EscapeString(p.Title) + `</title>
 <style>
 :root{--bg:#0b0c12;--surface:#13141c;--border:#2a2d3a;--text:#f3f4f6;--dim:#9ca3af}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1200px 700px at 80% -10%,rgba(245,158,11,.18),transparent 45%),radial-gradient(900px 600px at -10% 110%,rgba(239,68,68,.14),transparent 45%),var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;color:var(--text)}
-.card{width:min(620px,94vw);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1rem 1rem .95rem}
-.logo{font-size:.8rem;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
-h1{margin:.45rem 0 .25rem;font-size:1.2rem}p{margin:.25rem 0 .8rem;color:var(--dim)}
-.row{display:grid;grid-template-columns:180px 1fr;gap:.45rem;padding:.4rem 0;border-top:1px solid #232533}
-.k{color:var(--dim)}.v{color:var(--text);word-break:break-word}
-.trace{margin-top:.7rem;padding:.55rem .65rem;border:1px solid #5a4318;background:#2b1f0c;border-radius:10px;color:#ffd89a}
-.hint{margin-top:.65rem;color:var(--dim);font-size:.9rem}
-a{color:#93c5fd}
-@media (max-width:620px){.row{grid-template-columns:1fr}}
-</style></head><body><main class="card"><div class="logo">DomNexDomain Protection</div><h1>Access Blocked</h1><p>This request was denied by the host access policy.</p>
-<div class="row"><div class="k">Host</div><div class="v">` + html.EscapeString(fqdn) + `</div></div>
-<div class="row"><div class="k">Path</div><div class="v">` + html.EscapeString(r.URL.Path) + `</div></div>
-<div class="row"><div class="k">Policy</div><div class="v">geo ` + html.EscapeString(mode) + `</div></div>
-<div class="row"><div class="k">Detected Country</div><div class="v">` + html.EscapeString(country) + `</div></div>
-<div class="row"><div class="k">Timestamp (UTC)</div><div class="v">` + time.Now().UTC().Format(time.RFC3339) + `</div></div>
-<div class="trace">Trace ID: <strong>` + html.EscapeString(traceID) + `</strong></div>
-<div class="hint">If you believe this is an error, contact the site owner and include the Trace ID.</div></main></body></html>`
-	_, _ = w.Write([]byte(body))
-}
-
-func (e *Engine) renderHostDisabledPage(h model.Host, w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	body := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Host Disabled</title>
-<style>
-:root{--bg:#0b0c12;--surface:#13141c;--border:#2a2d3a;--text:#f3f4f6;--dim:#9ca3af;--warn:#f59e0b}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1100px 650px at 80% -10%,rgba(245,158,11,.18),transparent 45%),radial-gradient(900px 600px at -10% 110%,rgba(239,68,68,.12),transparent 45%),var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;color:var(--text)}
-.card{width:min(520px,92vw);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1rem}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1100px 650px at 80% -10%,` + gradA + `,transparent 45%),radial-gradient(900px 600px at -10% 110%,` + gradB + `,transparent 45%),var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;color:var(--text)}
+.card{width:min(680px,94vw);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1rem}
 .top{display:flex;justify-content:space-between;align-items:center;gap:.75rem}
-.tag{font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;color:#fcd34d}
-h1{margin:.65rem 0 .25rem;font-size:1.24rem}
+.tag{font-size:.74rem;letter-spacing:.07em;text-transform:uppercase;color:#cbd5e1}
+h1{margin:.65rem 0 .25rem;font-size:1.22rem}
 p{margin:.2rem 0 .75rem;color:var(--dim)}
-.meta{margin-top:.65rem;padding-top:.65rem;border-top:1px solid var(--border);font-size:.86rem;color:var(--dim)}
-</style></head><body><main class="card"><div class="top"><div class="tag">Host Disabled</div><div>DomNexDomain</div></div><h1>This endpoint is currently disabled</h1><p>External access is blocked by administrator policy for this host.</p><div class="meta">Host: ` + html.EscapeString(h.FQDN) + `</div></main></body></html>`
+.row{display:grid;grid-template-columns:190px 1fr;gap:.45rem;padding:.4rem 0;border-top:1px solid #232533}
+.k{color:var(--dim)}.v{color:var(--text);word-break:break-word}
+@media (max-width:640px){.row{grid-template-columns:1fr}}
+</style></head><body><main class="card"><div class="top"><div class="tag">DomNexDomain Smart Error</div><div>` + strconv.Itoa(status) + `</div></div>
+<h1>` + html.EscapeString(p.Title) + `</h1><p>` + html.EscapeString(p.Description) + `</p>
+<div class="row"><div class="k">Host</div><div class="v">` + html.EscapeString(host) + `</div></div>
+<div class="row"><div class="k">Path</div><div class="v">` + html.EscapeString(r.URL.Path) + `</div></div>
+<div class="row"><div class="k">Failure Point</div><div class="v">` + html.EscapeString(p.FailurePoint) + `</div></div>
+<div class="row"><div class="k">Error Code</div><div class="v">` + html.EscapeString(p.Code) + `</div></div>
+<div class="row"><div class="k">Timestamp (UTC)</div><div class="v">` + time.Now().UTC().Format(time.RFC3339) + `</div></div>
+<div class="row"><div class="k">Trace ID</div><div class="v"><strong>` + html.EscapeString(p.TraceID) + `</strong></div></div>
+</main></body></html>`
 	_, _ = w.Write([]byte(body))
 }
 
-func (e *Engine) renderHostMaintenancePage(h model.Host, w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	body := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Maintenance</title>
-<style>
-:root{--bg:#0b0c12;--surface:#13141c;--border:#2a2d3a;--text:#f3f4f6;--dim:#9ca3af;--accent:#38bdf8}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1100px 650px at 80% -10%,rgba(56,189,248,.18),transparent 45%),radial-gradient(900px 600px at -10% 110%,rgba(99,102,241,.14),transparent 45%),var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;color:var(--text)}
-.card{width:min(540px,92vw);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1rem}
-.tag{font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;color:#7dd3fc}
-h1{margin:.65rem 0 .25rem;font-size:1.24rem}
-p{margin:.2rem 0 .75rem;color:var(--dim)}
-.meta{margin-top:.65rem;padding-top:.65rem;border-top:1px solid var(--border);font-size:.86rem;color:var(--dim)}
-</style></head><body><main class="card"><div class="tag">Maintenance Mode</div><h1>This service is temporarily unavailable</h1><p>This endpoint is currently in maintenance mode for external traffic.</p><div class="meta">Host: ` + html.EscapeString(h.FQDN) + `</div></main></body></html>`
-	_, _ = w.Write([]byte(body))
+func (e *Engine) auditProxyEvent(ctx context.Context, action, target, meta string) {
+	_ = e.source.AddAuditEvent(ctx, model.AuditEvent{
+		Actor:  "edge",
+		Action: action,
+		Target: target,
+		Meta:   meta,
+	})
+}
+
+func (e *Engine) renderGeoBlockedPage(fqdn, country, mode, traceID string, w http.ResponseWriter, r *http.Request) {
+	e.renderSmartErrorPage(w, r, smartErrorPage{
+		HTTPStatus:   http.StatusForbidden,
+		Title:        "Access Blocked",
+		Description:  "This request was denied by host access policy.",
+		Code:         "DNX-GEO-403",
+		FailurePoint: "policy: geo " + mode + " / country " + country,
+		Host:         fqdn,
+		TraceID:      traceID,
+		Theme:        "warn",
+	})
+}
+
+func (e *Engine) renderHostDisabledPage(h model.Host, traceID string, w http.ResponseWriter, r *http.Request) {
+	e.renderSmartErrorPage(w, r, smartErrorPage{
+		HTTPStatus:   http.StatusServiceUnavailable,
+		Title:        "Host Disabled",
+		Description:  "External access is blocked by administrator policy for this host.",
+		Code:         "DNX-HOST-503",
+		FailurePoint: "policy",
+		Host:         h.FQDN,
+		TraceID:      traceID,
+		Theme:        "warn",
+	})
+}
+
+func (e *Engine) renderHostMaintenancePage(h model.Host, traceID string, w http.ResponseWriter, r *http.Request) {
+	e.renderSmartErrorPage(w, r, smartErrorPage{
+		HTTPStatus:   http.StatusServiceUnavailable,
+		Title:        "Maintenance Mode",
+		Description:  "This endpoint is currently in maintenance mode for external traffic.",
+		Code:         "DNX-MAINT-503",
+		FailurePoint: "policy",
+		Host:         h.FQDN,
+		TraceID:      traceID,
+		Theme:        "warn",
+	})
 }
 
 func randomHex(n int) (string, error) {

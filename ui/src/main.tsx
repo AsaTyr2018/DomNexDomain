@@ -222,6 +222,15 @@ function App() {
     }
   };
 
+  const refreshAuditOnly = async () => {
+    try {
+      const out = await api<{ items: Audit[] }>('/api/v1/audit');
+      setAudit(out.items || []);
+    } catch {
+      // Keep existing audit list on transient failures.
+    }
+  };
+
   useEffect(() => {
     void refresh();
   }, []);
@@ -262,6 +271,13 @@ function App() {
     if (tab !== 'metricCenter') return;
     void loadMetricCenter();
   }, [tab, metricHostFilter, metricHours, metricClass, hosts]);
+
+  useEffect(() => {
+    if (tab !== 'audit') return;
+    void refreshAuditOnly();
+    const t = window.setInterval(() => { void refreshAuditOnly(); }, 5000);
+    return () => window.clearInterval(t);
+  }, [tab]);
 
   const login = async () => {
     setLoading(true);
@@ -575,7 +591,20 @@ function App() {
     if (logIPFilter !== 'all' && src !== logIPFilter) return false;
     if (!logQuery.trim()) return true;
     const q = logQuery.trim().toLowerCase();
-    return `${e.action} ${e.actor} ${e.target} ${src}`.toLowerCase().includes(q);
+    const qCompact = q.replace(/[^a-z0-9]/g, '');
+    const trace = extractTraceID(e);
+    const hay = `${e.action} ${e.actor} ${e.target} ${src} ${e.meta || ''}`.toLowerCase();
+    const hayCompact = hay.replace(/[^a-z0-9]/g, '');
+    if (hay.includes(q)) return true;
+    if (qCompact && hayCompact.includes(qCompact)) return true;
+    const traceNeedles = extractTraceNeedles(q);
+    if (traceNeedles.length > 0) {
+      const traceCompact = trace.toLowerCase().replace(/[^a-z0-9]/g, '');
+      return traceNeedles.some((n) => traceCompact.includes(n) || hayCompact.includes(n));
+    }
+    if (!qCompact) return false;
+    const traceCompact = trace.toLowerCase().replace(/[^a-z0-9]/g, '');
+    return traceCompact.includes(qCompact) || hayCompact.includes(qCompact);
   });
   const criticalLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'critical').length;
   const warningLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'warn').length;
@@ -2098,7 +2127,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
               <div className="card">
                 <div className="card-head"><h3>Audit Stream</h3></div>
                 <div className="row">
-                  <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="Search actor, action, target..." />
+                  <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="Search actor, action, target, trace id..." />
                   <select value={logActionFilter} onChange={(e) => setLogActionFilter(e.target.value)}>
                     <option value="all">All actions</option>
                     {logActions.map((a) => <option key={a} value={a}>{a}</option>)}
@@ -2133,6 +2162,10 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                             <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
                           </div>
                           <div className="muted">{e.actor} {'->'} {e.target}</div>
+                          {e.meta ? <div className="muted" style={{ marginTop: '.2rem', wordBreak: 'break-word' }}>Meta: {e.meta}</div> : null}
+                          <div className="muted" style={{ marginTop: '.2rem' }}>
+                            Trace ID: <strong>{extractTraceID(e) || '-'}</strong>
+                          </div>
                           <div className="muted" style={{ marginTop: '.2rem' }}>
                             Source IP: <strong>{src || '-'}</strong>
                             {canBlock ? (
@@ -2399,6 +2432,7 @@ function classifyAuditLevel(action: string, target: string): 'critical' | 'warn'
   const s = `${action} ${target}`.toLowerCase();
   if (s.includes("auth.login.locked")) return 'critical';
   if (s.includes("auth.login.failed")) return 'warn';
+  if (s.includes("proxy.error")) return 'warn';
   if (s.includes('delete') || s.includes('revoke') || s.includes('password-reset') || s.includes('reset')) return 'critical';
   if (s.includes('update') || s.includes('upsert') || s.includes('retry') || s.includes('reload')) return 'warn';
   return 'info';
@@ -2413,6 +2447,29 @@ function extractSourceIP(e: Audit): string {
   const src = parts.find((p) => p.startsWith('source='));
   if (!src) return '';
   return src.slice('source='.length).trim();
+}
+
+function extractTraceID(e: Audit): string {
+  const meta = (e.meta || '').trim();
+  if (!meta) return '';
+  const parts = meta.split(';').map((p) => p.trim());
+  const trace = parts.find((p) => p.startsWith('trace='));
+  if (!trace) return '';
+  return trace.slice('trace='.length).trim();
+}
+
+function extractTraceNeedles(query: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const re = /[a-f0-9]{8,}/gi;
+  let m: RegExpExecArray | null = null;
+  while ((m = re.exec(query)) !== null) {
+    const v = (m[0] || '').toLowerCase();
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
 }
 
 function hostStateBadge(state: string): { cls: 'ok' | 'warn' | 'err'; label: string } {
