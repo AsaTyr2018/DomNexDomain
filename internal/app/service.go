@@ -578,6 +578,23 @@ func (s *Service) PublicIPv4(ctx context.Context) string {
 }
 
 func (s *Service) RemoveHost(ctx context.Context, id int64) error {
+	h, err := s.store.GetHostByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	d, err := s.store.GetDomainByID(ctx, h.DomainID)
+	if err != nil {
+		return err
+	}
+	if d.DNSMode == "cloudflare" && s.dns != nil {
+		zoneID, err := s.ensureDomainZoneID(ctx, d)
+		if err != nil {
+			return fmt.Errorf("cloudflare zone resolution failed: %w", err)
+		}
+		if err := s.dns.DeleteARecord(ctx, zoneID, h.FQDN); err != nil {
+			return fmt.Errorf("cloudflare host record delete failed: %w", err)
+		}
+	}
 	return s.store.RemoveHost(ctx, id)
 }
 

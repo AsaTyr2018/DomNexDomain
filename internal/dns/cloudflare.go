@@ -12,6 +12,7 @@ import (
 
 type Provider interface {
 	UpsertARecord(ctx context.Context, zoneID, name, ip string, proxied bool) error
+	DeleteARecord(ctx context.Context, zoneID, name string) error
 }
 
 type Cloudflare struct {
@@ -59,6 +60,33 @@ func (c *Cloudflare) UpsertARecord(ctx context.Context, zoneID, name, ip string,
 	return nil
 }
 
+func (c *Cloudflare) DeleteARecord(ctx context.Context, zoneID, name string) error {
+	if c.token == "" || zoneID == "" {
+		return fmt.Errorf("cloudflare not configured")
+	}
+	records, err := c.lookupARecords(ctx, zoneID, name)
+	if err != nil {
+		return err
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	for _, rec := range records {
+		endpoint := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zoneID, rec.ID)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return err
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return fmt.Errorf("cloudflare delete status=%d", resp.StatusCode)
+		}
+	}
+	return nil
+}
+
 type cfRecord struct {
 	ID      string `json:"id"`
 	Content string `json:"content"`
@@ -81,6 +109,17 @@ type cfZoneLookupResp struct {
 }
 
 func (c *Cloudflare) lookupARecord(ctx context.Context, zoneID, name string) (*cfRecord, error) {
+	records, err := c.lookupARecords(ctx, zoneID, name)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+	return &records[0], nil
+}
+
+func (c *Cloudflare) lookupARecords(ctx context.Context, zoneID, name string) ([]cfRecord, error) {
 	q := url.Values{}
 	q.Set("type", "A")
 	q.Set("name", name)
@@ -99,10 +138,7 @@ func (c *Cloudflare) lookupARecord(ctx context.Context, zoneID, name string) (*c
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
-	if len(out.Result) == 0 {
-		return nil, nil
-	}
-	return &out.Result[0], nil
+	return out.Result, nil
 }
 
 func (c *Cloudflare) HasRecord(ctx context.Context, zoneID, name string) (bool, error) {
