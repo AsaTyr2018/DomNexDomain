@@ -431,6 +431,15 @@ func (s *Service) RunDomainPreflight(ctx context.Context, name, dnsMode, provide
 			return out, nil
 		}
 		out.Checks = append(out.Checks, DomainPreflightCheck{Name: "cloudflare_api", OK: true})
+
+		// For Cloudflare-managed domains, preflight proactively ensures apex A exists.
+		if publicIP != "" {
+			if err := cf.UpsertARecord(ctx, resolvedZone, name, publicIP, false); err != nil {
+				out.Checks = append(out.Checks, DomainPreflightCheck{Name: "cloudflare_apex_upsert", OK: false, Detail: err.Error()})
+			} else {
+				out.Checks = append(out.Checks, DomainPreflightCheck{Name: "cloudflare_apex_upsert", OK: true, Detail: publicIP})
+			}
+		}
 	}
 
 	ready := true
@@ -1476,4 +1485,39 @@ func (s *Service) SetManagedUserDomains(ctx context.Context, userID int64, domai
 
 func (s *Service) DeleteManagedUser(ctx context.Context, userID int64) error {
 	return s.store.DeleteUser(ctx, userID)
+}
+
+func (s *Service) SetManagedUserPassword(ctx context.Context, userID int64, newPassword string) error {
+	if len(newPassword) < 10 {
+		return fmt.Errorf("password too short")
+	}
+	if _, err := s.store.GetUserByID(ctx, userID); err != nil {
+		return err
+	}
+	newHash, err := crypto.HashPassword(newPassword, crypto.DefaultArgonConfig())
+	if err != nil {
+		return err
+	}
+	return s.store.SetUserPasswordHashByID(ctx, userID, newHash)
+}
+
+func (s *Service) ChangeOwnPassword(ctx context.Context, userID int64, currentPassword, newPassword string) error {
+	if strings.TrimSpace(currentPassword) == "" {
+		return fmt.Errorf("current password required")
+	}
+	if len(newPassword) < 10 {
+		return fmt.Errorf("password too short")
+	}
+	u, err := s.store.GetUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !crypto.VerifyPassword(currentPassword, u.PasswordHash) {
+		return fmt.Errorf("invalid current password")
+	}
+	newHash, err := crypto.HashPassword(newPassword, crypto.DefaultArgonConfig())
+	if err != nil {
+		return err
+	}
+	return s.store.SetUserPasswordHashByID(ctx, userID, newHash)
 }

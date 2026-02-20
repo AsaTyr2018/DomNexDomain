@@ -68,6 +68,12 @@ func (s *Server) Router() http.Handler {
 	})
 
 	r.Group(func(pr chi.Router) {
+		pr.Use(s.requireAuth(model.RoleReadOnly, ""))
+		pr.Use(s.requireCSRF)
+		pr.Post("/api/v1/me/password", s.handleChangeOwnPassword)
+	})
+
+	r.Group(func(pr chi.Router) {
 		pr.Use(s.requireAuth(model.RoleOperator, "hosts:write"))
 		pr.Use(s.requireCSRF)
 		pr.Post("/api/v1/hosts/preflight", s.handleHostPreflight)
@@ -94,6 +100,7 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/reload", s.handleReloadService)
 		pr.Post("/api/v1/users", s.handleCreateUser)
 		pr.Put("/api/v1/users/{id}/domains", s.handleSetUserDomains)
+		pr.Put("/api/v1/users/{id}/password", s.handleSetUserPassword)
 		pr.Delete("/api/v1/users/{id}", s.handleDeleteUser)
 		pr.Post("/api/v1/logout-all", s.handleLogoutAll)
 	})
@@ -973,6 +980,67 @@ func (s *Server) handleSetUserDomains(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "user.update_domains", Target: strconv.FormatInt(userID, 10), Meta: ""})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	userID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if userID == id.UserID {
+		writeErr(w, http.StatusBadRequest, "use /api/v1/me/password for own account")
+		return
+	}
+	var in struct {
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.SetManagedUserPassword(r.Context(), userID, in.Password); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "user.password.reset",
+		Target: strconv.FormatInt(userID, 10),
+		Meta:   "admin-reset",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if id.Type != "session" || id.UserID <= 0 {
+		writeErr(w, http.StatusForbidden, "session auth required")
+		return
+	}
+	var in struct {
+		CurrentPassword string `json:"currentPassword"`
+		NewPassword     string `json:"newPassword"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.ChangeOwnPassword(r.Context(), id.UserID, in.CurrentPassword, in.NewPassword); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "auth.password.changed",
+		Target: id.Username,
+		Meta:   "self-service",
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

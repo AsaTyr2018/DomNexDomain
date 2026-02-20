@@ -116,6 +116,10 @@ function App() {
   const [newUserPassword, setNewUserPassword] = useState('');
   const [newUserRole, setNewUserRole] = useState<'admin' | 'domain-admin'>('domain-admin');
   const [newUserDomainIDs, setNewUserDomainIDs] = useState<number[]>([]);
+  const [showPasswordDialog, setShowPasswordDialog] = useState(false);
+  const [selfCurrentPassword, setSelfCurrentPassword] = useState('');
+  const [selfNewPassword, setSelfNewPassword] = useState('');
+  const [selfConfirmPassword, setSelfConfirmPassword] = useState('');
 
   const csrf = useMemo(() => getCookie('domnex_csrf'), [identity, loading]);
 
@@ -772,6 +776,48 @@ function App() {
     }
   };
 
+  const resetUserPassword = async (id: number, password: string) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/users/${id}/password`, {
+        method: 'PUT',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ password }),
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const changeOwnPassword = async () => {
+    if (!selfCurrentPassword || !selfNewPassword) return;
+    if (selfNewPassword !== selfConfirmPassword) {
+      setError('New password confirmation does not match.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/me/password', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ currentPassword: selfCurrentPassword, newPassword: selfNewPassword }),
+      });
+      setSelfCurrentPassword('');
+      setSelfNewPassword('');
+      setSelfConfirmPassword('');
+      setShowPasswordDialog(false);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const toggleNewUserDomain = (id: number) => {
     setNewUserDomainIDs((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
   };
@@ -829,6 +875,7 @@ function App() {
             </div>
             <div className="top-actions">
               <button className="btn" onClick={refresh} disabled={loading}>Refresh</button>
+              {identity ? <button className="btn" onClick={() => setShowPasswordDialog(true)}>Change Password</button> : null}
               {identity ? <button className="btn" onClick={logout}>Logout</button> : null}
             </div>
           </header>
@@ -962,7 +1009,7 @@ function App() {
                       )}
                       <div className="row">
                         <button className="btn" onClick={() => setDomainWizardStep(2)}>Back</button>
-                        <button className="btn" onClick={saveDomain} disabled={loading || domainPreflightRunning || !domainPreflight?.ready}>Create Domain</button>
+                        <button className="btn" onClick={saveDomain} disabled={loading || !domainPreflight?.ready}>Create Domain</button>
                       </div>
                     </div>
                   ) : null}
@@ -1211,7 +1258,9 @@ function App() {
                     {hosts.map((h) => (
                       <div className="host" key={h.id}>
                         <div>
-                          <strong>{h.fqdn}</strong> {' -> '} {h.upstreamUrl}
+                          <strong>
+                            <a href={`https://${h.fqdn}`} target="_blank" rel="noopener noreferrer">{h.fqdn}</a>
+                          </strong> {' -> '} {h.upstreamUrl}
                           {h.haEnabled ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>HA {h.haMode || 'failover'}</span> : null}
                           {h.insecureTls ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>insecure TLS</span> : null}
                           {h.authEnabled ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>auth page enabled</span> : null}
@@ -1356,8 +1405,10 @@ function App() {
                       user={u}
                       domains={domains}
                       loading={loading}
+                      currentUserID={identity?.type === 'session' ? identity.userId : 0}
                       onDelete={deleteUser}
                       onSaveDomains={saveUserDomains}
+                      onResetPassword={resetUserPassword}
                     />
                   ))}
                 </section>
@@ -1674,6 +1725,24 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         </div>
       ) : null}
 
+      {identity && showPasswordDialog ? (
+        <div className="overlay">
+          <div className="login-card">
+            <h3>Change Password</h3>
+            <p className="muted">Update your current account password.</p>
+            <div className="col">
+              <input type="password" value={selfCurrentPassword} onChange={(e) => setSelfCurrentPassword(e.target.value)} placeholder="Current password" />
+              <input type="password" value={selfNewPassword} onChange={(e) => setSelfNewPassword(e.target.value)} placeholder="New password (min 10)" />
+              <input type="password" value={selfConfirmPassword} onChange={(e) => setSelfConfirmPassword(e.target.value)} placeholder="Confirm new password" />
+              <div className="row" style={{ marginBottom: 0 }}>
+                <button className="btn" onClick={changeOwnPassword} disabled={loading || selfNewPassword.length < 10 || selfNewPassword !== selfConfirmPassword}>Save Password</button>
+                <button className="btn danger" onClick={() => { setShowPasswordDialog(false); setSelfCurrentPassword(''); setSelfNewPassword(''); setSelfConfirmPassword(''); }}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <style>{`
         :root { --bg:#0f0f11; --surface:#16161a; --border:#222229; --text:#e0e0e5; --text-dim:#9ca3af; --accent:#6366f1; --accent-dark:#4f46e5; --green:#10b981; --red:#ef4444; --radius:12px; }
         * { box-sizing: border-box; }
@@ -1833,16 +1902,21 @@ function UserRow({
   user,
   domains,
   loading,
+  currentUserID,
   onDelete,
   onSaveDomains,
+  onResetPassword,
 }: {
   user: ManagedUser;
   domains: Domain[];
   loading: boolean;
+  currentUserID: number;
   onDelete: (id: number) => Promise<void>;
   onSaveDomains: (id: number, domainIds: number[]) => Promise<void>;
+  onResetPassword: (id: number, password: string) => Promise<void>;
 }) {
   const [domainIds, setDomainIds] = useState<number[]>(user.domainIds || []);
+  const [newPassword, setNewPassword] = useState('');
 
   useEffect(() => {
     setDomainIds(user.domainIds || []);
@@ -1876,8 +1950,25 @@ function UserRow({
           </div>
         </>
       ) : null}
+      <div className="row" style={{ marginTop: '.4rem' }}>
+        <input
+          type="password"
+          value={newPassword}
+          onChange={(e) => setNewPassword(e.target.value)}
+          placeholder={isCurrentUser ? 'Use Change Password (top bar) for your account' : `Reset password for ${user.username} (min 10)`}
+          disabled={isCurrentUser}
+        />
+        <button
+          className="btn"
+          onClick={async () => { await onResetPassword(user.id, newPassword); setNewPassword(''); }}
+          disabled={isCurrentUser || loading || newPassword.length < 10}
+        >
+          Reset Password
+        </button>
+      </div>
     </div>
   );
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
+  const isCurrentUser = currentUserID > 0 && user.id === currentUserID;
