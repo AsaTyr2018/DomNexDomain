@@ -16,6 +16,10 @@ type DomainPreflightCheck = { name: string; ok: boolean; detail?: string };
 type DomainPreflight = { domain: string; dnsMode: string; provider: string; zoneId?: string; resolvedZone?: string; publicIpv4?: string; checks: DomainPreflightCheck[]; ready: boolean };
 type HostPreflightCheck = { name: string; ok: boolean; detail?: string };
 type HostPreflight = { domain: string; fqdn?: string; upstream: string; insecureTls?: boolean; dnsMode?: string; provider?: string; zoneId?: string; checks: HostPreflightCheck[]; ready: boolean };
+type TrafficHostSummary = { hostId: number; fqdn: string; requests: number; bytesIn: number; bytesOut: number; blocked: number; uniqueVisitors: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number };
+type TrafficOverview = { hours: number; generatedAt: string; totalRequests: number; totalBytesIn: number; totalBytesOut: number; totalBlocked: number; uniqueVisitors: number; hosts: TrafficHostSummary[] };
+type TrafficPoint = { bucketStart: string; requests: number; bytesIn: number; bytesOut: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number };
+type HostTrafficDetails = { hours: number; hostId: number; fqdn: string; requests: number; bytesIn: number; bytesOut: number; blocked: number; uniqueVisitors: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; series: TrafficPoint[] };
 
 type Tab = 'dashboard' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'audit';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
@@ -54,6 +58,8 @@ function App() {
   const [tokens, setTokens] = useState<APIToken[]>([]);
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [domainChecks, setDomainChecks] = useState<Record<number, DomainLiveCheck>>({});
+  const [trafficOverview, setTrafficOverview] = useState<TrafficOverview | null>(null);
+  const [selectedHostTraffic, setSelectedHostTraffic] = useState<HostTrafficDetails | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -173,6 +179,12 @@ function App() {
         setSettingsPublicIPv4('');
         setSettingsBaseDomain('');
       }
+      try {
+        const t = await api<TrafficOverview>('/api/v1/traffic/overview?hours=24');
+        setTrafficOverview(t);
+      } catch {
+        setTrafficOverview(null);
+      }
     } catch (e) {
       const err = e as Error & { status?: number };
       if (err.status === 401 || /unauthorized/i.test(err.message)) {
@@ -180,6 +192,8 @@ function App() {
         setDomains([]);
         setHosts([]);
         setAudit([]);
+        setTrafficOverview(null);
+        setSelectedHostTraffic(null);
       } else {
         setError(err.message);
       }
@@ -215,6 +229,14 @@ function App() {
     const t = window.setInterval(() => { void checkHostPreflight(); }, 4000);
     return () => window.clearInterval(t);
   }, [tab, hostWizardStep, hostDomain, hostSub, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends]);
+
+  useEffect(() => {
+    if (!selectedHostID) {
+      setSelectedHostTraffic(null);
+      return;
+    }
+    void loadHostTraffic(selectedHostID);
+  }, [selectedHostID]);
 
   const login = async () => {
     setLoading(true);
@@ -393,6 +415,7 @@ function App() {
     setDetailAuthPass('');
     setDetailGeoMode((h.geoMode === 'allow' || h.geoMode === 'deny') ? h.geoMode : 'off');
     setDetailGeoCountries((h.geoCountries || []).join(', '));
+    void loadHostTraffic(h.id);
   };
 
   const saveHostGeneral = async () => {
@@ -463,6 +486,15 @@ function App() {
     }
   };
 
+  const loadHostTraffic = async (hostID: number) => {
+    try {
+      const out = await api<HostTrafficDetails>(`/api/v1/traffic/hosts/${hostID}?hours=24`);
+      setSelectedHostTraffic(out);
+    } catch {
+      setSelectedHostTraffic(null);
+    }
+  };
+
   const activeHosts = hosts.filter((h) => h.state === 'active').length;
   const errorHosts = hosts.filter((h) => h.state === 'error').length;
   const diagnostics = Object.values(hostDiagnostics);
@@ -516,6 +548,11 @@ function App() {
   const configuredAdminFQDN = settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '');
   const fqdnPreview = hostSub && hostDomain ? `${hostSub}.${hostDomain}` : '';
   const selectedHost = selectedHostID ? (hosts.find((h) => h.id === selectedHostID) || null) : null;
+  const requestsByHostID = useMemo(() => {
+    const out: Record<number, number> = {};
+    (trafficOverview?.hosts || []).forEach((h) => { out[h.hostId] = h.requests || 0; });
+    return out;
+  }, [trafficOverview]);
   const haHostsMonitored = hosts.filter((h) => h.haEnabled && (hostDiagnostics[h.fqdn]?.haTotal || 0) > 0).length;
   const haHostsDegraded = hosts.filter((h) => {
     const d = hostDiagnostics[h.fqdn];
@@ -539,6 +576,15 @@ function App() {
   const domainApexPreview = domainName || 'example.com';
   const adminPreview = `admin.${domainApexPreview}`;
   const publicIPPreview = settingsPublicIPv4 || settings?.publicIpv4 || '<your-public-ip>';
+  const trafficReq24h = trafficOverview?.totalRequests || 0;
+  const trafficVisitors24h = trafficOverview?.uniqueVisitors || 0;
+  const trafficOut24h = trafficOverview?.totalBytesOut || 0;
+  const trafficBlocked24h = trafficOverview?.totalBlocked || 0;
+  const hostTrafficReq = selectedHostTraffic?.requests || 0;
+  const hostTraffic2xxRate = hostTrafficReq > 0 ? Math.round(((selectedHostTraffic?.status2xx || 0) / hostTrafficReq) * 100) : 0;
+  const hostTrafficErrRate = hostTrafficReq > 0 ? Math.round((((selectedHostTraffic?.status4xx || 0) + (selectedHostTraffic?.status5xx || 0)) / hostTrafficReq) * 100) : 0;
+  const hostTrafficBlockRate = hostTrafficReq > 0 ? Math.round(((selectedHostTraffic?.blocked || 0) / hostTrafficReq) * 100) : 0;
+  const hostVisitorRatio = hostTrafficReq > 0 ? Math.round(((selectedHostTraffic?.uniqueVisitors || 0) / hostTrafficReq) * 100) : 0;
 
   const domainProviderGuide: Record<DomainProvider, { title: string; steps: string[]; records: string[] }> = {
     cloudflare: {
@@ -949,6 +995,15 @@ function App() {
                       <MetricTile label="DNS Failure Count" value={String(Math.max(0, monitoredHosts - dnsHealthy))} hint="Should trend to 0" />
                     </div>
                   </div>
+                  <div className="card">
+                    <div className="card-head"><h3>Traffic Snapshot (24h)</h3></div>
+                    <div className="metric-grid">
+                      <MetricTile label="Requests" value={String(trafficReq24h)} hint="Total across all subdomains" />
+                      <MetricTile label="Unique Visitors" value={String(trafficVisitors24h)} hint="Distinct client IP hashes" />
+                      <MetricTile label="Traffic Out" value={formatBytes(trafficOut24h)} hint="Response bytes" />
+                      <MetricTile label="Geo Blocks" value={String(trafficBlocked24h)} hint="Blocked by GeoIP policy" />
+                    </div>
+                  </div>
                 </div>
                 <div className="card">
                   <div className="card-head"><h3>Recent Events</h3></div>
@@ -1199,6 +1254,7 @@ function App() {
                       </div>
                     ) : <div className="muted">No diagnostics available yet.</div>}
                   </section>
+
                 </div>
                 <aside className="entity-side">
                   <section className="card">
@@ -1210,6 +1266,25 @@ function App() {
                       <MetricTile label="Routing" value={selectedHost.haEnabled ? `HA (${selectedHost.haMode || 'failover'})` : 'Single Upstream'} hint="Proxy mode" />
                       <MetricTile label="Geo Policy" value={selectedHost.geoMode ? `${selectedHost.geoMode} (${(selectedHost.geoCountries || []).length})` : 'off'} hint="Country access filter" />
                     </div>
+                  </section>
+                  <section className="card">
+                    <div className="card-head"><h3>Traffic & Visits (24h)</h3></div>
+                    {selectedHostTraffic ? (
+                      <>
+                        <div className="gauge-grid">
+                          <Gauge title="2xx Rate" value={hostTraffic2xxRate} subtitle={`${selectedHostTraffic.status2xx || 0}/${hostTrafficReq} requests`} />
+                          <Gauge title="4xx/5xx Rate" value={hostTrafficErrRate} subtitle={`${(selectedHostTraffic.status4xx || 0) + (selectedHostTraffic.status5xx || 0)} errors`} />
+                          <Gauge title="Geo Block Rate" value={hostTrafficBlockRate} subtitle={`${selectedHostTraffic.blocked || 0} blocked`} />
+                          <Gauge title="Visitor Ratio" value={hostVisitorRatio} subtitle={`${selectedHostTraffic.uniqueVisitors || 0} unique visitors`} />
+                        </div>
+                        <div className="metric-grid" style={{ marginTop: '.8rem' }}>
+                          <MetricTile label="Requests" value={String(selectedHostTraffic.requests || 0)} hint="Total requests in 24h" />
+                          <MetricTile label="Traffic Out" value={formatBytes(selectedHostTraffic.bytesOut || 0)} hint="Response bytes in 24h" />
+                        </div>
+                      </>
+                    ) : (
+                      <div className="muted">No traffic stats yet. Generate traffic and refresh.</div>
+                    )}
                   </section>
                   <section className="card">
                     <div className="card-head"><h3>Danger Zone</h3></div>
@@ -1324,6 +1399,7 @@ function App() {
                           {h.haEnabled ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>HA {h.haMode || 'failover'}</span> : null}
                           {h.insecureTls ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>insecure TLS</span> : null}
                           {h.authEnabled ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>auth page enabled</span> : null}
+                          {requestsByHostID[h.id] ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>24h req {requestsByHostID[h.id]}</span> : null}
                           {h.haEnabled && hostDiagnostics[h.fqdn]?.haTotal ? (
                             <span className={`badge ${(hostDiagnostics[h.fqdn].haOnline || 0) === hostDiagnostics[h.fqdn].haTotal ? 'ok' : (hostDiagnostics[h.fqdn].haOnline || 0) > 0 ? 'warn' : 'err'}`} style={{ marginLeft: '.45rem' }}>
                               Hosts Online {hostDiagnostics[h.fqdn].haOnline || 0}/{hostDiagnostics[h.fqdn].haTotal || 0}
@@ -1943,6 +2019,18 @@ function parseCountryCodes(raw: string): string[] {
     out.push(code);
   });
   return out;
+}
+
+function formatBytes(v: number): string {
+  if (!Number.isFinite(v) || v <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let n = v;
+  let idx = 0;
+  while (n >= 1024 && idx < units.length - 1) {
+    n /= 1024;
+    idx++;
+  }
+  return `${n >= 100 || idx === 0 ? n.toFixed(0) : n.toFixed(1)} ${units[idx]}`;
 }
 
 const GEO_PRESETS: Record<string, string[]> = {

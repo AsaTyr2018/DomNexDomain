@@ -138,6 +138,59 @@ type HostPreflight struct {
 	Ready       bool                 `json:"ready"`
 }
 
+type TrafficPoint struct {
+	BucketStart string `json:"bucketStart"`
+	Requests    int64  `json:"requests"`
+	BytesIn     int64  `json:"bytesIn"`
+	BytesOut    int64  `json:"bytesOut"`
+	Blocked     int64  `json:"blocked"`
+	Status2xx   int64  `json:"status2xx"`
+	Status3xx   int64  `json:"status3xx"`
+	Status4xx   int64  `json:"status4xx"`
+	Status5xx   int64  `json:"status5xx"`
+}
+
+type HostTrafficSummary struct {
+	HostID         int64  `json:"hostId"`
+	FQDN           string `json:"fqdn"`
+	Requests       int64  `json:"requests"`
+	BytesIn        int64  `json:"bytesIn"`
+	BytesOut       int64  `json:"bytesOut"`
+	Blocked        int64  `json:"blocked"`
+	Status2xx      int64  `json:"status2xx"`
+	Status3xx      int64  `json:"status3xx"`
+	Status4xx      int64  `json:"status4xx"`
+	Status5xx      int64  `json:"status5xx"`
+	UniqueVisitors int64  `json:"uniqueVisitors"`
+}
+
+type TrafficOverview struct {
+	Hours          int                  `json:"hours"`
+	GeneratedAt    string               `json:"generatedAt"`
+	TotalRequests  int64                `json:"totalRequests"`
+	TotalBytesIn   int64                `json:"totalBytesIn"`
+	TotalBytesOut  int64                `json:"totalBytesOut"`
+	TotalBlocked   int64                `json:"totalBlocked"`
+	UniqueVisitors int64                `json:"uniqueVisitors"`
+	Hosts          []HostTrafficSummary `json:"hosts"`
+}
+
+type HostTrafficDetails struct {
+	Hours          int            `json:"hours"`
+	HostID         int64          `json:"hostId"`
+	FQDN           string         `json:"fqdn"`
+	Requests       int64          `json:"requests"`
+	BytesIn        int64          `json:"bytesIn"`
+	BytesOut       int64          `json:"bytesOut"`
+	Blocked        int64          `json:"blocked"`
+	Status2xx      int64          `json:"status2xx"`
+	Status3xx      int64          `json:"status3xx"`
+	Status4xx      int64          `json:"status4xx"`
+	Status5xx      int64          `json:"status5xx"`
+	UniqueVisitors int64          `json:"uniqueVisitors"`
+	Series         []TrafficPoint `json:"series"`
+}
+
 func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dns.Provider, log *logx.Logger) *Service {
 	return &Service{cfg: cfg, store: st, keystore: ks, dns: dnsProvider, log: log, backoff: map[int64]time.Time{}}
 }
@@ -469,6 +522,103 @@ func (s *Service) ListHosts(ctx context.Context) ([]model.Host, error) {
 
 func (s *Service) RemoveHost(ctx context.Context, id int64) error {
 	return s.store.RemoveHost(ctx, id)
+}
+
+func normalizeTrafficHours(hours int) int {
+	if hours <= 0 {
+		return 24
+	}
+	if hours > 24*30 {
+		return 24 * 30
+	}
+	return hours
+}
+
+func (s *Service) GetTrafficOverview(ctx context.Context, hours int) (TrafficOverview, error) {
+	hours = normalizeTrafficHours(hours)
+	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	rows, err := s.store.ListHostTrafficSummaries(ctx, since)
+	if err != nil {
+		return TrafficOverview{}, err
+	}
+	out := TrafficOverview{
+		Hours:       hours,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Hosts:       make([]HostTrafficSummary, 0, len(rows)),
+	}
+	visitorSet := map[int64]bool{}
+	for _, r := range rows {
+		item := HostTrafficSummary{
+			HostID:         r.HostID,
+			FQDN:           r.FQDN,
+			Requests:       r.Requests,
+			BytesIn:        r.BytesIn,
+			BytesOut:       r.BytesOut,
+			Blocked:        r.Blocked,
+			Status2xx:      r.Status2xx,
+			Status3xx:      r.Status3xx,
+			Status4xx:      r.Status4xx,
+			Status5xx:      r.Status5xx,
+			UniqueVisitors: r.UniqueVisitors,
+		}
+		out.Hosts = append(out.Hosts, item)
+		out.TotalRequests += item.Requests
+		out.TotalBytesIn += item.BytesIn
+		out.TotalBytesOut += item.BytesOut
+		out.TotalBlocked += item.Blocked
+		if item.UniqueVisitors > 0 && !visitorSet[item.HostID] {
+			out.UniqueVisitors += item.UniqueVisitors
+			visitorSet[item.HostID] = true
+		}
+	}
+	return out, nil
+}
+
+func (s *Service) GetHostTraffic(ctx context.Context, hostID int64, hours int) (HostTrafficDetails, error) {
+	hours = normalizeTrafficHours(hours)
+	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	host, err := s.store.GetHostByID(ctx, hostID)
+	if err != nil {
+		return HostTrafficDetails{}, err
+	}
+	seriesRows, err := s.store.GetHostTrafficSeries(ctx, hostID, since)
+	if err != nil {
+		return HostTrafficDetails{}, err
+	}
+	uv, err := s.store.CountHostUniqueVisitors(ctx, hostID, since)
+	if err != nil {
+		return HostTrafficDetails{}, err
+	}
+	out := HostTrafficDetails{
+		Hours:          hours,
+		HostID:         hostID,
+		FQDN:           host.FQDN,
+		UniqueVisitors: uv,
+		Series:         make([]TrafficPoint, 0, len(seriesRows)),
+	}
+	for _, r := range seriesRows {
+		p := TrafficPoint{
+			BucketStart: r.BucketStart,
+			Requests:    r.Requests,
+			BytesIn:     r.BytesIn,
+			BytesOut:    r.BytesOut,
+			Blocked:     r.Blocked,
+			Status2xx:   r.Status2xx,
+			Status3xx:   r.Status3xx,
+			Status4xx:   r.Status4xx,
+			Status5xx:   r.Status5xx,
+		}
+		out.Series = append(out.Series, p)
+		out.Requests += p.Requests
+		out.BytesIn += p.BytesIn
+		out.BytesOut += p.BytesOut
+		out.Blocked += p.Blocked
+		out.Status2xx += p.Status2xx
+		out.Status3xx += p.Status3xx
+		out.Status4xx += p.Status4xx
+		out.Status5xx += p.Status5xx
+	}
+	return out, nil
 }
 
 func (s *Service) SetHostAuth(ctx context.Context, hostID int64, enabled bool, username, password string) (model.Host, error) {

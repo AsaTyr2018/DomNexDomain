@@ -24,6 +24,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/logx"
 	"github.com/domnexdomain/domnexdomain/internal/metrics"
 	"github.com/domnexdomain/domnexdomain/internal/model"
+	"github.com/domnexdomain/domnexdomain/internal/traffic"
 )
 
 type HostSource interface {
@@ -35,17 +36,19 @@ type Engine struct {
 	log    *logx.Logger
 	m      *metrics.Collector
 	geo    *geoip.Resolver
+	tr     *traffic.Recorder
 	mu     sync.RWMutex
 	routes map[string]*routeEntry
 	auth   map[string]authSession
 }
 
-func New(source HostSource, log *logx.Logger, m *metrics.Collector) *Engine {
+func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.Recorder) *Engine {
 	return &Engine{
 		source: source,
 		log:    log,
 		m:      m,
 		geo:    geoip.New(1 * time.Hour),
+		tr:     tr,
 		routes: map[string]*routeEntry{},
 		auth:   map[string]authSession{},
 	}
@@ -119,6 +122,10 @@ func (e *Engine) Refresh(ctx context.Context) error {
 func (e *Engine) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sw := newStatusWriter(w)
+		var selectedRoute *routeEntry
+		var country string
+		var clientIP string
+		var blocked bool
 		defer func() {
 			hostLabel := "_unknown"
 			host := r.Host
@@ -132,6 +139,23 @@ func (e *Engine) Handler() http.Handler {
 			if e.m != nil {
 				e.m.ProxyRequests.WithLabelValues(hostLabel, strconv.Itoa(sw.StatusCode())).Inc()
 			}
+			if e.tr != nil && selectedRoute != nil {
+				contentIn := int64(0)
+				if r.ContentLength > 0 {
+					contentIn = r.ContentLength
+				}
+				e.tr.Record(traffic.Event{
+					HostID:    selectedRoute.host.ID,
+					FQDN:      selectedRoute.host.FQDN,
+					Country:   country,
+					ClientIP:  clientIP,
+					Status:    sw.StatusCode(),
+					BytesIn:   contentIn,
+					BytesOut:  sw.BytesWritten(),
+					Blocked:   blocked,
+					Timestamp: time.Now().UTC(),
+				})
+			}
 		}()
 
 		host := r.Host
@@ -142,12 +166,16 @@ func (e *Engine) Handler() http.Handler {
 		e.mu.RLock()
 		route, ok := e.routes[host]
 		e.mu.RUnlock()
+		selectedRoute = route
 		if !ok {
 			sw.WriteHeader(http.StatusNotFound)
 			_, _ = sw.Write([]byte("unknown host"))
 			return
 		}
-		if blocked, country, mode := e.isGeoBlocked(r, route.host); blocked {
+		clientIP = clientIPFromRequest(r)
+		country = e.geo.CountryCode(r.Context(), clientIP)
+		if deny, mode := e.isGeoBlocked(country, route.host); deny {
+			blocked = true
 			if e.m != nil {
 				e.m.GeoBlocks.WithLabelValues(route.host.FQDN, country, mode).Inc()
 			}
@@ -185,10 +213,10 @@ func (e *Engine) Handler() http.Handler {
 	})
 }
 
-func (e *Engine) isGeoBlocked(r *http.Request, h model.Host) (bool, string, string) {
+func (e *Engine) isGeoBlocked(country string, h model.Host) (bool, string) {
 	mode := strings.ToLower(strings.TrimSpace(h.GeoMode))
 	if mode == "" {
-		return false, "", ""
+		return false, ""
 	}
 	countrySet := map[string]bool{}
 	for _, c := range h.GeoCountries {
@@ -198,20 +226,18 @@ func (e *Engine) isGeoBlocked(r *http.Request, h model.Host) (bool, string, stri
 		}
 	}
 	if len(countrySet) == 0 {
-		return false, "", mode
+		return false, mode
 	}
-	ip := clientIPFromRequest(r)
-	country := e.geo.CountryCode(r.Context(), ip)
 	if country == "LOCAL" {
-		return false, country, mode
+		return false, mode
 	}
 	switch mode {
 	case "allow":
-		return !countrySet[country], country, mode
+		return !countrySet[country], mode
 	case "deny":
-		return countrySet[country], country, mode
+		return countrySet[country], mode
 	default:
-		return false, country, mode
+		return false, mode
 	}
 }
 
@@ -238,6 +264,7 @@ func clientIPFromRequest(r *http.Request) string {
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	bytes  int64
 }
 
 func newStatusWriter(w http.ResponseWriter) *statusWriter {
@@ -253,7 +280,11 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	return w.ResponseWriter.Write(b)
+	n, err := w.ResponseWriter.Write(b)
+	if n > 0 {
+		w.bytes += int64(n)
+	}
+	return n, err
 }
 
 func (w *statusWriter) StatusCode() int {
@@ -281,9 +312,17 @@ func (w *statusWriter) ReadFrom(r io.Reader) (int64, error) {
 		if w.status == 0 {
 			w.status = http.StatusOK
 		}
-		return rf.ReadFrom(r)
+		n, err := rf.ReadFrom(r)
+		if n > 0 {
+			w.bytes += n
+		}
+		return n, err
 	}
-	return io.Copy(w.ResponseWriter, r)
+	n, err := io.Copy(w.ResponseWriter, r)
+	if n > 0 {
+		w.bytes += n
+	}
+	return n, err
 }
 
 func (w *statusWriter) Push(target string, opts *http.PushOptions) error {
@@ -291,6 +330,10 @@ func (w *statusWriter) Push(target string, opts *http.PushOptions) error {
 		return p.Push(target, opts)
 	}
 	return http.ErrNotSupported
+}
+
+func (w *statusWriter) BytesWritten() int64 {
+	return w.bytes
 }
 
 func newReverseProxy(e *Engine, u *url.URL, h model.Host) *httputil.ReverseProxy {

@@ -172,6 +172,35 @@ CREATE TABLE IF NOT EXISTS user_domain_scopes (
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY(domain_id) REFERENCES domains(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS host_traffic_minute (
+  host_id INTEGER NOT NULL,
+  fqdn TEXT NOT NULL,
+  country TEXT NOT NULL,
+  bucket_start TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  bytes_in INTEGER NOT NULL DEFAULT 0,
+  bytes_out INTEGER NOT NULL DEFAULT 0,
+  blocked INTEGER NOT NULL DEFAULT 0,
+  status_2xx INTEGER NOT NULL DEFAULT 0,
+  status_3xx INTEGER NOT NULL DEFAULT 0,
+  status_4xx INTEGER NOT NULL DEFAULT 0,
+  status_5xx INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(host_id, country, bucket_start),
+  FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS host_visitors_daily (
+  host_id INTEGER NOT NULL,
+  day TEXT NOT NULL,
+  ip_hash TEXT NOT NULL,
+  PRIMARY KEY(host_id, day, ip_hash),
+  FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_bucket ON host_traffic_minute(bucket_start);
+CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_host_bucket ON host_traffic_minute(host_id, bucket_start);
+CREATE INDEX IF NOT EXISTS idx_host_visitors_daily_day ON host_visitors_daily(day);
 `
 	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
@@ -713,6 +742,123 @@ UPDATE hosts
 SET geo_mode=?, geo_countries=?, updated_at=?
 WHERE id=?`, mode, encodeCSV(countries), time.Now().UTC().Format(time.RFC3339Nano), id)
 	return err
+}
+
+func (s *Store) UpsertHostTrafficMinute(ctx context.Context, hostID int64, fqdn, country, bucketStart string, requests, bytesIn, bytesOut, blocked, status2xx, status3xx, status4xx, status5xx int64) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO host_traffic_minute(host_id, fqdn, country, bucket_start, requests, bytes_in, bytes_out, blocked, status_2xx, status_3xx, status_4xx, status_5xx)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(host_id, country, bucket_start) DO UPDATE SET
+  fqdn=excluded.fqdn,
+  requests=host_traffic_minute.requests + excluded.requests,
+  bytes_in=host_traffic_minute.bytes_in + excluded.bytes_in,
+  bytes_out=host_traffic_minute.bytes_out + excluded.bytes_out,
+  blocked=host_traffic_minute.blocked + excluded.blocked,
+  status_2xx=host_traffic_minute.status_2xx + excluded.status_2xx,
+  status_3xx=host_traffic_minute.status_3xx + excluded.status_3xx,
+  status_4xx=host_traffic_minute.status_4xx + excluded.status_4xx,
+  status_5xx=host_traffic_minute.status_5xx + excluded.status_5xx`,
+		hostID, fqdn, country, bucketStart, requests, bytesIn, bytesOut, blocked, status2xx, status3xx, status4xx, status5xx)
+	return err
+}
+
+func (s *Store) UpsertHostVisitorDaily(ctx context.Context, hostID int64, day, ipHash string) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO host_visitors_daily(host_id, day, ip_hash)
+VALUES(?,?,?)
+ON CONFLICT(host_id, day, ip_hash) DO NOTHING`, hostID, day, ipHash)
+	return err
+}
+
+type HostTrafficSummaryRow struct {
+	HostID         int64
+	FQDN           string
+	Requests       int64
+	BytesIn        int64
+	BytesOut       int64
+	Blocked        int64
+	Status2xx      int64
+	Status3xx      int64
+	Status4xx      int64
+	Status5xx      int64
+	UniqueVisitors int64
+}
+
+type HostTrafficPointRow struct {
+	BucketStart string
+	Requests    int64
+	BytesIn     int64
+	BytesOut    int64
+	Blocked     int64
+	Status2xx   int64
+	Status3xx   int64
+	Status4xx   int64
+	Status5xx   int64
+}
+
+func (s *Store) ListHostTrafficSummaries(ctx context.Context, since time.Time) ([]HostTrafficSummaryRow, error) {
+	sinceBucket := since.UTC().Format(time.RFC3339)
+	sinceDay := since.UTC().Format("2006-01-02")
+	rows, err := s.db.QueryContext(ctx, `
+SELECT m.host_id, m.fqdn,
+       SUM(m.requests), SUM(m.bytes_in), SUM(m.bytes_out), SUM(m.blocked),
+       SUM(m.status_2xx), SUM(m.status_3xx), SUM(m.status_4xx), SUM(m.status_5xx),
+       COALESCE(v.uniques, 0)
+FROM host_traffic_minute m
+LEFT JOIN (
+  SELECT host_id, COUNT(DISTINCT ip_hash) AS uniques
+  FROM host_visitors_daily
+  WHERE day >= ?
+  GROUP BY host_id
+) v ON v.host_id = m.host_id
+WHERE m.bucket_start >= ?
+GROUP BY m.host_id, m.fqdn, v.uniques
+ORDER BY SUM(m.requests) DESC`, sinceDay, sinceBucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []HostTrafficSummaryRow{}
+	for rows.Next() {
+		var r HostTrafficSummaryRow
+		if err := rows.Scan(&r.HostID, &r.FQDN, &r.Requests, &r.BytesIn, &r.BytesOut, &r.Blocked, &r.Status2xx, &r.Status3xx, &r.Status4xx, &r.Status5xx, &r.UniqueVisitors); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetHostTrafficSeries(ctx context.Context, hostID int64, since time.Time) ([]HostTrafficPointRow, error) {
+	sinceBucket := since.UTC().Format(time.RFC3339)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT bucket_start,
+       SUM(requests), SUM(bytes_in), SUM(bytes_out), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx)
+FROM host_traffic_minute
+WHERE host_id=? AND bucket_start>=?
+GROUP BY bucket_start
+ORDER BY bucket_start`, hostID, sinceBucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []HostTrafficPointRow{}
+	for rows.Next() {
+		var r HostTrafficPointRow
+		if err := rows.Scan(&r.BucketStart, &r.Requests, &r.BytesIn, &r.BytesOut, &r.Blocked, &r.Status2xx, &r.Status3xx, &r.Status4xx, &r.Status5xx); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CountHostUniqueVisitors(ctx context.Context, hostID int64, since time.Time) (int64, error) {
+	sinceDay := since.UTC().Format("2006-01-02")
+	var c int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT ip_hash) FROM host_visitors_daily WHERE host_id=? AND day>=?`, hostID, sinceDay).Scan(&c)
+	return c, err
 }
 
 func encodeBackends(in []model.HABackend) (string, error) {

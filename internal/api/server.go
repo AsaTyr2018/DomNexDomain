@@ -62,6 +62,8 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/domains/{id}/live-check", s.handleDomainLiveCheck)
 		pr.Get("/api/v1/hosts", s.handleListHosts)
 		pr.Get("/api/v1/hosts/diagnostics", s.handleHostsDiagnostics)
+		pr.Get("/api/v1/traffic/overview", s.handleTrafficOverview)
+		pr.Get("/api/v1/traffic/hosts/{id}", s.handleHostTraffic)
 		pr.Get("/api/v1/audit", s.handleListAudit)
 		pr.Get("/api/v1/settings", s.handleGetSettings)
 		pr.Get("/api/v1/users", s.handleListUsers)
@@ -417,6 +419,74 @@ func (s *Server) handleHostsDiagnostics(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleTrafficOverview(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "hosts:read") {
+		return
+	}
+	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
+	overview, err := s.app.GetTrafficOverview(r.Context(), hours)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if id.Role == model.RoleDomainAdmin || tokenHasDomainRestriction(id) {
+		allowedHosts, err := s.app.ListHosts(r.Context())
+		if err == nil {
+			allowed := map[int64]bool{}
+			for _, h := range filterHostsByDomainIDs(allowedHosts, id.DomainIDs) {
+				allowed[h.ID] = true
+			}
+			filtered := make([]app.HostTrafficSummary, 0, len(overview.Hosts))
+			var req, bin, bout, blk, uv int64
+			for _, h := range overview.Hosts {
+				if !allowed[h.HostID] {
+					continue
+				}
+				filtered = append(filtered, h)
+				req += h.Requests
+				bin += h.BytesIn
+				bout += h.BytesOut
+				blk += h.Blocked
+				uv += h.UniqueVisitors
+			}
+			overview.Hosts = filtered
+			overview.TotalRequests = req
+			overview.TotalBytesIn = bin
+			overview.TotalBytesOut = bout
+			overview.TotalBlocked = blk
+			overview.UniqueVisitors = uv
+		}
+	}
+	writeJSON(w, http.StatusOK, overview)
+}
+
+func (s *Server) handleHostTraffic(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "hosts:read") {
+		return
+	}
+	hostID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	h, err := s.app.Store().GetHostByID(r.Context(), hostID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if id.Role == model.RoleDomainAdmin || tokenHasDomainRestriction(id) {
+		if !containsInt64(id.DomainIDs, h.DomainID) {
+			writeErr(w, http.StatusForbidden, "host domain not assigned to this admin")
+			return
+		}
+	}
+	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
+	out, err := s.app.GetHostTraffic(r.Context(), hostID, hours)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {

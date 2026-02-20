@@ -23,6 +23,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/metrics"
 	"github.com/domnexdomain/domnexdomain/internal/proxy"
 	"github.com/domnexdomain/domnexdomain/internal/store"
+	"github.com/domnexdomain/domnexdomain/internal/traffic"
 )
 
 func main() {
@@ -95,6 +96,7 @@ func main() {
 		os.Exit(1)
 	}
 	m := metrics.New()
+	tr := traffic.NewRecorder(st, log)
 
 	apiSrv := api.New(appSvc, authSvc, log, m)
 	adminServer := &http.Server{
@@ -107,7 +109,7 @@ func main() {
 		ErrorLog:          logx.StdLogger(log),
 	}
 
-	px := proxy.New(st, log, m)
+	px := proxy.New(st, log, m, tr)
 	if err := px.Refresh(context.Background()); err != nil {
 		log.Warn("initial proxy refresh failed", map[string]any{"err": err.Error()})
 	}
@@ -182,6 +184,7 @@ func main() {
 
 	go px.StartRefresher(ctx, 10*time.Second)
 	go pruneSessions(ctx, st, log)
+	go tr.Start(ctx)
 
 	<-ctx.Done()
 	log.Info("shutdown requested", nil)
