@@ -29,6 +29,10 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
     - `failover`: prioritizes a primary backend and switches to secondary targets when reachability checks fail.
     - `round_robin`: distributes requests across multiple healthy targets for load spreading.
     - Health state is visible in the UI (`Hosts Online x/x`) with explicit offline backend names.
+  - Per-subdomain traffic gating modes
+    - `active`: normal external + internal access.
+    - `maintenance`: external traffic gets a maintenance page, LAN/hairpin clients can still access the upstream.
+    - `disabled`: all traffic receives a host-disabled page.
 - ACME:
   - Let's Encrypt production + staging
     - Switch between staging and production ACME endpoints without changing deployment architecture.
@@ -61,6 +65,8 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
     - Exposes operational telemetry for alerting and dashboard integration.
   - Per-subdomain GeoIP policy (allow/deny country lists)
     - Evaluates client IP to ISO country code and enforces optional country-based access rules before proxy upstream/auth flow.
+  - Destructive action confirmation for host deletion
+    - Subdomain delete requires explicit `Remove` text confirmation in the UI.
 
 ## DomNexDomain vs Nginx/Caddy/Traefik
 
@@ -239,6 +245,9 @@ curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/me"
   - `POST /hosts`
   - `PUT /hosts/{id}`
   - `PUT /hosts/{id}/auth`
+  - `PUT /hosts/{id}/geo`
+  - `POST /hosts/{id}/disable`
+  - `POST /hosts/{id}/maintenance`
   - `POST /hosts/{id}/retry`
   - `DELETE /hosts/{id}`
 - Settings/system:

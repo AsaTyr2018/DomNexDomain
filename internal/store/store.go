@@ -625,8 +625,10 @@ func validTransition(from, to string) bool {
 		"created":      {"dns_pending": true, "cert_pending": true, "error": true},
 		"dns_pending":  {"cert_pending": true, "error": true},
 		"cert_pending": {"active": true, "error": true},
-		"active":       {"error": true, "cert_pending": true},
-		"error":        {"dns_pending": true, "cert_pending": true},
+		"active":       {"error": true, "cert_pending": true, "disabled": true, "maintenance": true},
+		"maintenance":  {"active": true, "error": true, "disabled": true},
+		"disabled":     {"active": true, "error": true},
+		"error":        {"dns_pending": true, "cert_pending": true, "disabled": true, "maintenance": true},
 	}
 	return allowed[from][to]
 }

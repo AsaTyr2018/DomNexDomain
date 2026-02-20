@@ -251,7 +251,7 @@ func (s *Service) ListFQDNs(ctx context.Context) ([]string, error) {
 	}
 	out := make([]string, 0, len(hosts))
 	for _, h := range hosts {
-		if h.State == "active" || h.State == "cert_pending" {
+		if h.State == "active" || h.State == "cert_pending" || h.State == "maintenance" || h.State == "disabled" {
 			out = append(out, h.FQDN)
 		}
 	}
@@ -520,8 +520,59 @@ func (s *Service) ListHosts(ctx context.Context) ([]model.Host, error) {
 	return s.store.ListHosts(ctx)
 }
 
+func (s *Service) PublicIPv4(ctx context.Context) string {
+	_ = ctx
+	return strings.TrimSpace(s.publicIP)
+}
+
 func (s *Service) RemoveHost(ctx context.Context, id int64) error {
 	return s.store.RemoveHost(ctx, id)
+}
+
+func (s *Service) SetHostDisabled(ctx context.Context, hostID int64, disabled bool) (model.Host, error) {
+	h, err := s.store.GetHostByID(ctx, hostID)
+	if err != nil {
+		return model.Host{}, err
+	}
+	if disabled {
+		if h.State == "disabled" {
+			return h, nil
+		}
+		if err := s.store.SetHostState(ctx, hostID, "disabled", "manual_disable"); err != nil {
+			return model.Host{}, err
+		}
+	} else {
+		if h.State != "disabled" {
+			return h, nil
+		}
+		if err := s.store.SetHostState(ctx, hostID, "active", "manual_enable"); err != nil {
+			return model.Host{}, err
+		}
+	}
+	return s.store.GetHostByID(ctx, hostID)
+}
+
+func (s *Service) SetHostMaintenance(ctx context.Context, hostID int64, enabled bool) (model.Host, error) {
+	h, err := s.store.GetHostByID(ctx, hostID)
+	if err != nil {
+		return model.Host{}, err
+	}
+	if enabled {
+		if h.State == "maintenance" {
+			return h, nil
+		}
+		if err := s.store.SetHostState(ctx, hostID, "maintenance", "manual_maintenance_on"); err != nil {
+			return model.Host{}, err
+		}
+	} else {
+		if h.State != "maintenance" {
+			return h, nil
+		}
+		if err := s.store.SetHostState(ctx, hostID, "active", "manual_maintenance_off"); err != nil {
+			return model.Host{}, err
+		}
+	}
+	return s.store.GetHostByID(ctx, hostID)
 }
 
 func normalizeTrafficHours(hours int) int {

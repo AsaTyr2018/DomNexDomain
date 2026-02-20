@@ -129,6 +129,10 @@ function App() {
   const [selfCurrentPassword, setSelfCurrentPassword] = useState('');
   const [selfNewPassword, setSelfNewPassword] = useState('');
   const [selfConfirmPassword, setSelfConfirmPassword] = useState('');
+  const [deleteHostDialogOpen, setDeleteHostDialogOpen] = useState(false);
+  const [deleteHostID, setDeleteHostID] = useState<number | null>(null);
+  const [deleteHostLabel, setDeleteHostLabel] = useState('');
+  const [deleteHostConfirmText, setDeleteHostConfirmText] = useState('');
 
   const csrf = useMemo(() => getCookie('domnex_csrf'), [identity, loading]);
 
@@ -498,21 +502,30 @@ function App() {
   const activeHosts = hosts.filter((h) => h.state === 'active').length;
   const errorHosts = hosts.filter((h) => h.state === 'error').length;
   const diagnostics = Object.values(hostDiagnostics);
-  const monitoredHosts = diagnostics.length;
+  const hostStateByFQDN = useMemo(() => {
+    const out: Record<string, string> = {};
+    hosts.forEach((h) => { out[h.fqdn] = (h.state || '').toLowerCase(); });
+    return out;
+  }, [hosts]);
+  const diagnosticsForHealth = diagnostics.filter((d) => {
+    const st = hostStateByFQDN[d.fqdn];
+    return st !== 'maintenance' && st !== 'disabled';
+  });
+  const monitoredHosts = diagnosticsForHealth.length;
   const safeBase = monitoredHosts > 0 ? monitoredHosts : 1;
-  const dnsHealthy = diagnostics.filter((d) => (d.dnsRecords || []).length > 0).length;
-  const tlsHealthy = diagnostics.filter((d) => d.tlsOk).length;
-  const httpHealthy = diagnostics.filter((d) => d.httpStatus >= 200 && d.httpStatus < 400).length;
-  const httpsHealthy = diagnostics.filter((d) => d.httpsStatus >= 200 && d.httpsStatus < 500).length;
-  const certKnown = diagnostics.filter((d) => d.certDaysLeft > 0);
+  const dnsHealthy = diagnosticsForHealth.filter((d) => (d.dnsRecords || []).length > 0).length;
+  const tlsHealthy = diagnosticsForHealth.filter((d) => d.tlsOk).length;
+  const httpHealthy = diagnosticsForHealth.filter((d) => d.httpStatus >= 200 && d.httpStatus < 400).length;
+  const httpsHealthy = diagnosticsForHealth.filter((d) => d.httpsStatus >= 200 && d.httpsStatus < 500).length;
+  const certKnown = diagnosticsForHealth.filter((d) => d.certDaysLeft > 0);
   const certExpiringSoon = certKnown.filter((d) => d.certDaysLeft <= 14).length;
   const avgCertDays = certKnown.length > 0
     ? Math.round(certKnown.reduce((sum, d) => sum + d.certDaysLeft, 0) / certKnown.length)
     : 0;
-  const avgHTTPSStatus = diagnostics.filter((d) => d.httpsStatus > 0).length > 0
+  const avgHTTPSStatus = diagnosticsForHealth.filter((d) => d.httpsStatus > 0).length > 0
     ? Math.round(
-      diagnostics.filter((d) => d.httpsStatus > 0).reduce((sum, d) => sum + d.httpsStatus, 0)
-      / diagnostics.filter((d) => d.httpsStatus > 0).length,
+      diagnosticsForHealth.filter((d) => d.httpsStatus > 0).reduce((sum, d) => sum + d.httpsStatus, 0)
+      / diagnosticsForHealth.filter((d) => d.httpsStatus > 0).length,
     )
     : 0;
   const dnsHealthPct = Math.round((dnsHealthy / safeBase) * 100);
@@ -769,6 +782,63 @@ function App() {
     setError('');
     try {
       await api(`/api/v1/hosts/${id}`, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const openDeleteHostDialog = (h: Host) => {
+    setDeleteHostID(h.id);
+    setDeleteHostLabel(h.fqdn);
+    setDeleteHostConfirmText('');
+    setDeleteHostDialogOpen(true);
+  };
+
+  const closeDeleteHostDialog = () => {
+    setDeleteHostDialogOpen(false);
+    setDeleteHostID(null);
+    setDeleteHostLabel('');
+    setDeleteHostConfirmText('');
+  };
+
+  const confirmDeleteHost = async () => {
+    if (!deleteHostID || deleteHostConfirmText.trim() !== 'Remove') {
+      setError('Deletion confirmation failed. Type exactly "Remove".');
+      return;
+    }
+    await deleteHost(deleteHostID);
+    closeDeleteHostDialog();
+  };
+
+  const setHostDisabled = async (id: number, disabled: boolean) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/hosts/${id}/disable`, {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ disabled }),
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const setHostMaintenance = async (id: number, enabled: boolean) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/hosts/${id}/maintenance`, {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ enabled }),
+      });
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -1156,14 +1226,72 @@ function App() {
             selectedHost ? (
               <section className="entity-page">
                 <div className="entity-main">
-                  <section className="card">
-                    <div className="card-head">
-                      <h3>Subdomain Settings</h3>
-                      <button className="btn" onClick={() => setSelectedHostID(null)}>Back To List</button>
+                  <section className="card cc-hero">
+                    <div className="cc-head">
+                      <div>
+                        <h3>Subdomain Command Center</h3>
+                        <div className="muted">Operational controls and security policy for this endpoint.</div>
+                      </div>
+                      <div className="top-actions">
+                        <a className="btn ghost" href={`https://${selectedHost.fqdn}`} target="_blank" rel="noreferrer">Open Site</a>
+                        <button className="btn" onClick={() => setSelectedHostID(null)}>Back To List</button>
+                      </div>
                     </div>
-                    <div className="muted" style={{ marginBottom: '.6rem' }}>
-                      Host: <strong>{selectedHost.fqdn}</strong> <span className={`badge ${hostStateBadge(selectedHost.state).cls}`} style={{ marginLeft: '.45rem' }}>{hostStateBadge(selectedHost.state).label}</span>
+                    <div className="cc-header-grid">
+                      <div className="cc-title">
+                        <strong>{selectedHost.fqdn}</strong>
+                        <span className={`badge ${hostStateBadge(selectedHost.state).cls}`}>{hostStateBadge(selectedHost.state).label}</span>
+                      </div>
+                      <div className="cc-pills">
+                        <span className={`cc-pill ${selectedHost.authEnabled ? 'ok' : ''}`}>Auth {selectedHost.authEnabled ? 'On' : 'Off'}</span>
+                        <span className={`cc-pill ${selectedHost.haEnabled ? 'ok' : ''}`}>HA {selectedHost.haEnabled ? (selectedHost.haMode || 'failover') : 'Off'}</span>
+                        <span className={`cc-pill ${selectedHost.state === 'maintenance' ? 'warn' : 'ok'}`}>Maintenance {selectedHost.state === 'maintenance' ? 'On' : 'Off'}</span>
+                        <span className={`cc-pill ${selectedHost.insecureTls ? 'warn' : 'ok'}`}>TLS Verify {selectedHost.insecureTls ? 'Off' : 'On'}</span>
+                        <span className={`cc-pill ${(selectedHost.geoMode || '') ? 'warn' : ''}`}>Geo {(selectedHost.geoMode || 'off').toUpperCase()}</span>
+                      </div>
                     </div>
+                    <div className="cc-kpi-strip">
+                      <div className="cc-kpi">
+                        <span>Requests (24h)</span>
+                        <strong>{selectedHostTraffic ? String(selectedHostTraffic.requests || 0) : '-'}</strong>
+                      </div>
+                      <div className="cc-kpi">
+                        <span>Unique Visitors</span>
+                        <strong>{selectedHostTraffic ? String(selectedHostTraffic.uniqueVisitors || 0) : '-'}</strong>
+                      </div>
+                      <div className="cc-kpi">
+                        <span>Traffic Out</span>
+                        <strong>{selectedHostTraffic ? formatBytes(selectedHostTraffic.bytesOut || 0) : '-'}</strong>
+                      </div>
+                      <div className="cc-kpi">
+                        <span>Blocked (24h)</span>
+                        <strong>{selectedHostTraffic ? String(selectedHostTraffic.blocked || 0) : '-'}</strong>
+                      </div>
+                    </div>
+                    <div className="cc-diag-inline">
+                      {hostDiagnostics[selectedHost.fqdn] ? (
+                        <div className="diag">
+                          <span className={`badge ${hostDiagnostics[selectedHost.fqdn].dnsRecords?.length ? 'ok' : 'err'}`}>DNS {hostDiagnostics[selectedHost.fqdn].dnsRecords?.length ? 'ok' : 'fail'}</span>
+                          {selectedHost.state === 'maintenance' ? (
+                            <>
+                              <span className="badge warn">HTTP MAINT</span>
+                              <span className="badge warn">HTTPS MAINT</span>
+                              <span className="badge warn">TLS MAINT</span>
+                            </>
+                          ) : (
+                            <>
+                              <span className={`badge ${hostDiagnostics[selectedHost.fqdn].httpStatus >= 200 && hostDiagnostics[selectedHost.fqdn].httpStatus < 400 ? 'ok' : 'warn'}`}>HTTP {hostDiagnostics[selectedHost.fqdn].httpStatus || '-'}</span>
+                              <span className={`badge ${hostDiagnostics[selectedHost.fqdn].httpsStatus >= 200 && hostDiagnostics[selectedHost.fqdn].httpsStatus < 500 ? 'ok' : 'warn'}`}>HTTPS {hostDiagnostics[selectedHost.fqdn].httpsStatus || '-'}</span>
+                              <span className={`badge ${hostDiagnostics[selectedHost.fqdn].tlsOk ? 'ok' : 'err'}`}>TLS {hostDiagnostics[selectedHost.fqdn].tlsOk ? 'ok' : 'fail'}</span>
+                            </>
+                          )}
+                        </div>
+                      ) : <div className="muted">Diagnostics initializing...</div>}
+                    </div>
+                  </section>
+                  <div className="cc-section-label">Operations</div>
+                  <section className="card cc-block cc-panel">
+                    <div className="card-head"><h3>Routing Control</h3></div>
                     <div className="row">
                       <label className="check"><input type="checkbox" checked={detailHAEnabled} onChange={(e) => setDetailHAEnabled(e.target.checked)} /> Enable HA</label>
                     </div>
@@ -1197,67 +1325,58 @@ function App() {
                     <div className="muted">Use this section to adjust upstream routing for this specific subdomain.</div>
                   </section>
 
-                  <section className="card">
-                    <div className="card-head"><h3>Auth Page Settings</h3></div>
-                    <div className="row">
-                      <label className="check"><input type="checkbox" checked={detailAuthEnabled} onChange={(e) => setDetailAuthEnabled(e.target.checked)} /> Enable Auth Page</label>
-                    </div>
-                    <div className="row">
-                      <input value={detailAuthUser} onChange={(e) => setDetailAuthUser(e.target.value)} placeholder="Auth username (this host only)" />
-                      <input type="password" value={detailAuthPass} onChange={(e) => setDetailAuthPass(e.target.value)} placeholder={selectedHost.authEnabled ? 'New password (leave empty = keep current)' : 'Auth password'} />
-                      <button className="btn" onClick={saveHostAuth} disabled={detailSavingAuth}>{detailSavingAuth ? 'Saving...' : 'Save Auth'}</button>
-                    </div>
-                    <div className="muted">Credentials are dedicated to this single subdomain and are not shared with others.</div>
-                  </section>
-
-                  <section className="card">
-                    <div className="card-head"><h3>GeoIP Access Policy</h3></div>
-                    <div className="row">
-                      <select value={detailGeoMode} onChange={(e) => setDetailGeoMode(e.target.value as 'off' | 'allow' | 'deny')}>
-                        <option value="off">Off</option>
-                        <option value="allow">Allow List Countries</option>
-                        <option value="deny">Deny List Countries</option>
-                      </select>
-                      <button className="btn" onClick={saveHostGeo} disabled={detailSavingGeo}>{detailSavingGeo ? 'Saving...' : 'Save Geo Policy'}</button>
-                    </div>
-                    {detailGeoMode !== 'off' ? (
-                      <>
-                        <div className="domain-pills">
-                          {Object.entries(GEO_PRESETS).map(([label, codes]) => (
-                            <button key={label} type="button" className="wiz" onClick={() => setDetailGeoCountries(codes.join(', '))}>{label}</button>
-                          ))}
-                          <button type="button" className="wiz" onClick={() => setDetailGeoCountries(mergeCountryCodes(detailGeoCountries, GEO_PRESETS.EU))}>+ EU</button>
-                          <button type="button" className="wiz" onClick={() => setDetailGeoCountries('')}>Clear</button>
-                        </div>
-                        <div className="row">
-                          <input
-                            value={detailGeoCountries}
-                            onChange={(e) => setDetailGeoCountries(e.target.value.toUpperCase())}
-                            placeholder="Country codes, e.g. DE,AT,CH or US,CA"
-                          />
-                        </div>
-                        <div className="muted">Use ISO country codes. Requests outside this policy are blocked before upstream/auth.</div>
-                      </>
-                    ) : (
-                      <div className="muted">No country filtering. All countries are allowed.</div>
-                    )}
-                  </section>
-
-                  <section className="card">
-                    <div className="card-head"><h3>Host Diagnostics</h3></div>
-                    {hostDiagnostics[selectedHost.fqdn] ? (
-                      <div className="diag">
-                        <span className={`badge ${hostDiagnostics[selectedHost.fqdn].dnsRecords?.length ? 'ok' : 'err'}`}>DNS {hostDiagnostics[selectedHost.fqdn].dnsRecords?.length ? 'ok' : 'fail'}</span>
-                        <span className={`badge ${hostDiagnostics[selectedHost.fqdn].httpStatus >= 200 && hostDiagnostics[selectedHost.fqdn].httpStatus < 400 ? 'ok' : 'warn'}`}>HTTP {hostDiagnostics[selectedHost.fqdn].httpStatus || '-'}</span>
-                        <span className={`badge ${hostDiagnostics[selectedHost.fqdn].httpsStatus >= 200 && hostDiagnostics[selectedHost.fqdn].httpsStatus < 500 ? 'ok' : 'warn'}`}>HTTPS {hostDiagnostics[selectedHost.fqdn].httpsStatus || '-'}</span>
-                        <span className={`badge ${hostDiagnostics[selectedHost.fqdn].tlsOk ? 'ok' : 'err'}`}>TLS {hostDiagnostics[selectedHost.fqdn].tlsOk ? 'ok' : 'fail'}</span>
+                  <div className="cc-section-label">Access & Security</div>
+                  <div className="cc-split">
+                    <section className="card cc-block cc-panel">
+                      <div className="card-head"><h3>Auth Page Settings</h3></div>
+                      <div className="row">
+                        <label className="check"><input type="checkbox" checked={detailAuthEnabled} onChange={(e) => setDetailAuthEnabled(e.target.checked)} /> Enable Auth Page</label>
                       </div>
-                    ) : <div className="muted">No diagnostics available yet.</div>}
-                  </section>
+                      <div className="row">
+                        <input value={detailAuthUser} onChange={(e) => setDetailAuthUser(e.target.value)} placeholder="Auth username (this host only)" />
+                        <input type="password" value={detailAuthPass} onChange={(e) => setDetailAuthPass(e.target.value)} placeholder={selectedHost.authEnabled ? 'New password (leave empty = keep current)' : 'Auth password'} />
+                        <button className="btn" onClick={saveHostAuth} disabled={detailSavingAuth}>{detailSavingAuth ? 'Saving...' : 'Save Auth'}</button>
+                      </div>
+                      <div className="muted">Credentials are dedicated to this single subdomain and are not shared with others.</div>
+                    </section>
+
+                    <section className="card cc-block cc-panel">
+                      <div className="card-head"><h3>GeoIP Access Policy</h3></div>
+                      <div className="row">
+                        <select value={detailGeoMode} onChange={(e) => setDetailGeoMode(e.target.value as 'off' | 'allow' | 'deny')}>
+                          <option value="off">Off</option>
+                          <option value="allow">Allow List Countries</option>
+                          <option value="deny">Deny List Countries</option>
+                        </select>
+                        <button className="btn" onClick={saveHostGeo} disabled={detailSavingGeo}>{detailSavingGeo ? 'Saving...' : 'Save Geo Policy'}</button>
+                      </div>
+                      {detailGeoMode !== 'off' ? (
+                        <>
+                          <div className="domain-pills">
+                            {Object.entries(GEO_PRESETS).map(([label, codes]) => (
+                              <button key={label} type="button" className="wiz" onClick={() => setDetailGeoCountries(codes.join(', '))}>{label}</button>
+                            ))}
+                            <button type="button" className="wiz" onClick={() => setDetailGeoCountries(mergeCountryCodes(detailGeoCountries, GEO_PRESETS.EU))}>+ EU</button>
+                            <button type="button" className="wiz" onClick={() => setDetailGeoCountries('')}>Clear</button>
+                          </div>
+                          <div className="row">
+                            <input
+                              value={detailGeoCountries}
+                              onChange={(e) => setDetailGeoCountries(e.target.value.toUpperCase())}
+                              placeholder="Country codes, e.g. DE,AT,CH or US,CA"
+                            />
+                          </div>
+                          <div className="muted">Use ISO country codes. Requests outside this policy are blocked before upstream/auth.</div>
+                        </>
+                      ) : (
+                        <div className="muted">No country filtering. All countries are allowed.</div>
+                      )}
+                    </section>
+                  </div>
 
                 </div>
                 <aside className="entity-side">
-                  <section className="card">
+                  <section className="card cc-block cc-panel">
                     <div className="card-head"><h3>Subdomain Summary</h3></div>
                     <div className="metric-grid">
                       <MetricTile label="State" value={hostStateBadge(selectedHost.state).label} hint="Current lifecycle state" />
@@ -1267,7 +1386,7 @@ function App() {
                       <MetricTile label="Geo Policy" value={selectedHost.geoMode ? `${selectedHost.geoMode} (${(selectedHost.geoCountries || []).length})` : 'off'} hint="Country access filter" />
                     </div>
                   </section>
-                  <section className="card">
+                  <section className="card cc-block cc-panel">
                     <div className="card-head"><h3>Traffic & Visits (24h)</h3></div>
                     {selectedHostTraffic ? (
                       <>
@@ -1286,11 +1405,17 @@ function App() {
                       <div className="muted">No traffic stats yet. Generate traffic and refresh.</div>
                     )}
                   </section>
-                  <section className="card">
+                  <section className="card cc-danger">
                     <div className="card-head"><h3>Danger Zone</h3></div>
                     <div className="row">
+                      <button className="btn" onClick={() => setHostMaintenance(selectedHost.id, selectedHost.state !== 'maintenance')} disabled={loading}>
+                        {selectedHost.state === 'maintenance' ? 'Disable Maintenance' : 'Enable Maintenance'}
+                      </button>
+                      <button className="btn" onClick={() => setHostDisabled(selectedHost.id, selectedHost.state !== 'disabled')} disabled={loading}>
+                        {selectedHost.state === 'disabled' ? 'Enable Host' : 'Disable Host'}
+                      </button>
                       {selectedHost.state === 'error' ? <button className="btn" onClick={() => retryHost(selectedHost.id)}>Retry</button> : null}
-                      <button className="btn danger" onClick={() => deleteHost(selectedHost.id)} disabled={loading}>Delete Subdomain</button>
+                      <button className="btn danger" onClick={() => openDeleteHostDialog(selectedHost)} disabled={loading}>Delete Subdomain</button>
                     </div>
                   </section>
                 </aside>
@@ -1399,6 +1524,7 @@ function App() {
                           {h.haEnabled ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>HA {h.haMode || 'failover'}</span> : null}
                           {h.insecureTls ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>insecure TLS</span> : null}
                           {h.authEnabled ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>auth page enabled</span> : null}
+                          <span className={`badge ${hostStateBadge(h.state).cls}`} style={{ marginLeft: '.45rem' }}>{hostStateBadge(h.state).label}</span>
                           {requestsByHostID[h.id] ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>24h req {requestsByHostID[h.id]}</span> : null}
                           {h.haEnabled && hostDiagnostics[h.fqdn]?.haTotal ? (
                             <span className={`badge ${(hostDiagnostics[h.fqdn].haOnline || 0) === hostDiagnostics[h.fqdn].haTotal ? 'ok' : (hostDiagnostics[h.fqdn].haOnline || 0) > 0 ? 'warn' : 'err'}`} style={{ marginLeft: '.45rem' }}>
@@ -1414,16 +1540,32 @@ function App() {
                           {hostDiagnostics[h.fqdn] ? (
                             <div className="diag">
                               <span className={`badge ${hostDiagnostics[h.fqdn].dnsRecords?.length ? 'ok' : 'err'}`}>DNS {hostDiagnostics[h.fqdn].dnsRecords?.length ? 'ok' : 'fail'}</span>
-                              <span className={`badge ${hostDiagnostics[h.fqdn].httpStatus >= 200 && hostDiagnostics[h.fqdn].httpStatus < 400 ? 'ok' : 'warn'}`}>HTTP {hostDiagnostics[h.fqdn].httpStatus || '-'}</span>
-                              <span className={`badge ${hostDiagnostics[h.fqdn].httpsStatus >= 200 && hostDiagnostics[h.fqdn].httpsStatus < 500 ? 'ok' : 'warn'}`}>HTTPS {hostDiagnostics[h.fqdn].httpsStatus || '-'}</span>
-                              <span className={`badge ${hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'err'}`}>TLS {hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'fail'}</span>
+                              {h.state === 'maintenance' ? (
+                                <>
+                                  <span className="badge warn">HTTP MAINT</span>
+                                  <span className="badge warn">HTTPS MAINT</span>
+                                  <span className="badge warn">TLS MAINT</span>
+                                </>
+                              ) : (
+                                <>
+                                  <span className={`badge ${hostDiagnostics[h.fqdn].httpStatus >= 200 && hostDiagnostics[h.fqdn].httpStatus < 400 ? 'ok' : 'warn'}`}>HTTP {hostDiagnostics[h.fqdn].httpStatus || '-'}</span>
+                                  <span className={`badge ${hostDiagnostics[h.fqdn].httpsStatus >= 200 && hostDiagnostics[h.fqdn].httpsStatus < 500 ? 'ok' : 'warn'}`}>HTTPS {hostDiagnostics[h.fqdn].httpsStatus || '-'}</span>
+                                  <span className={`badge ${hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'err'}`}>TLS {hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'fail'}</span>
+                                </>
+                              )}
                             </div>
                           ) : null}
                         </div>
                         <div className="row" style={{ marginBottom: 0 }}>
                           <button className="btn" onClick={() => openHostDetail(h)}>Edit</button>
+                          <button className="btn" onClick={() => setHostMaintenance(h.id, h.state !== 'maintenance')} disabled={loading}>
+                            {h.state === 'maintenance' ? 'Maintenance Off' : 'Maintenance On'}
+                          </button>
+                          <button className="btn" onClick={() => setHostDisabled(h.id, h.state !== 'disabled')} disabled={loading}>
+                            {h.state === 'disabled' ? 'Enable' : 'Disable'}
+                          </button>
                           {h.state === 'error' ? <button className="btn" onClick={() => retryHost(h.id)}>Retry</button> : null}
-                          <button className="btn danger" onClick={() => deleteHost(h.id)} disabled={loading}>Delete</button>
+                          <button className="btn danger" onClick={() => openDeleteHostDialog(h)} disabled={loading}>Delete</button>
                         </div>
                       </div>
                     ))}
@@ -1879,6 +2021,22 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         </div>
       ) : null}
 
+      {identity && deleteHostDialogOpen ? (
+        <div className="overlay">
+          <div className="login-card">
+            <h3>Delete Subdomain</h3>
+            <p className="muted">This action is permanent for <strong>{deleteHostLabel}</strong>. Type <strong>Remove</strong> to confirm.</p>
+            <div className="col">
+              <input value={deleteHostConfirmText} onChange={(e) => setDeleteHostConfirmText(e.target.value)} placeholder='Type "Remove"' />
+              <div className="row" style={{ marginBottom: 0 }}>
+                <button className="btn danger" onClick={confirmDeleteHost} disabled={loading || deleteHostConfirmText.trim() !== 'Remove'}>Delete Now</button>
+                <button className="btn" onClick={closeDeleteHostDialog} disabled={loading}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <style>{`
         :root { --bg:#0f0f11; --surface:#16161a; --border:#222229; --text:#e0e0e5; --text-dim:#9ca3af; --accent:#6366f1; --accent-dark:#4f46e5; --green:#10b981; --red:#ef4444; --radius:12px; }
         * { box-sizing: border-box; }
@@ -1901,6 +2059,31 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .entity-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
         .entity-main { display:grid; gap:1rem; }
         .entity-side { display:grid; gap:1rem; }
+        .cc-hero { background:
+          radial-gradient(900px 300px at 88% -35%, rgba(56,189,248,.15), transparent 58%),
+          radial-gradient(900px 300px at 12% -45%, rgba(99,102,241,.2), transparent 58%),
+          var(--surface);
+        }
+        .cc-head { display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; margin-bottom:.85rem; }
+        .cc-head h3 { margin:0 0 .25rem; }
+        .btn.ghost { background:#121219; border:1px solid #2b2b39; color:var(--text); text-decoration:none; display:inline-flex; align-items:center; }
+        .btn.ghost:hover { background:#171722; }
+        .cc-header-grid { display:grid; gap:.65rem; margin-bottom:.75rem; }
+        .cc-title { display:flex; align-items:center; gap:.6rem; font-size:1.02rem; margin-bottom:.65rem; }
+        .cc-pills { display:flex; flex-wrap:wrap; gap:.45rem; }
+        .cc-pill { border:1px solid var(--border); background:#111118; color:var(--text-dim); border-radius:999px; padding:.28rem .62rem; font-size:.76rem; }
+        .cc-pill.ok { border-color:#1d5a45; color:#9df3cb; background:#103227; }
+        .cc-pill.warn { border-color:#6b4d19; color:#ffd89a; background:#3a2a0f; }
+        .cc-kpi-strip { display:grid; gap:.6rem; grid-template-columns:repeat(4,minmax(0,1fr)); }
+        .cc-kpi { border:1px solid #2b2b39; border-radius:10px; padding:.55rem .65rem; background:#111118; display:grid; gap:.2rem; }
+        .cc-kpi span { color:var(--text-dim); font-size:.73rem; }
+        .cc-kpi strong { font-size:1rem; }
+        .cc-diag-inline { margin-top:.7rem; padding-top:.55rem; border-top:1px solid #2a2a35; }
+        .cc-section-label { color:var(--text-dim); font-size:.72rem; text-transform:uppercase; letter-spacing:.09em; margin-top:.15rem; margin-bottom:-.45rem; padding-left:.15rem; }
+        .cc-block { border-color:#2a2a35; }
+        .cc-panel { background:linear-gradient(180deg, rgba(18,18,24,.95), rgba(22,22,26,.95)); }
+        .cc-split { display:grid; gap:1rem; grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .cc-danger { border-color:#7f1d1d; background:linear-gradient(180deg, rgba(127,29,29,.12), rgba(22,22,26,.85)); }
         .gauge-grid { display:grid; gap:.8rem; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
         .gauge-card { background:#121219; border:1px solid var(--border); border-radius:11px; padding:.75rem; display:grid; justify-items:center; gap:.45rem; }
         .gauge-ring { width:92px; height:92px; border-radius:999px; display:grid; place-items:center; }
@@ -1957,7 +2140,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .login-card { width:min(420px,100%); background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1rem; }
         .login-card h3 { margin-top:0; }
         .col { display:grid; gap:.6rem; }
-        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} }
+        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} }
         @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} }
       `}</style>
     </>
@@ -1988,6 +2171,8 @@ function classifyAuditLevel(action: string, target: string): 'critical' | 'warn'
 function hostStateBadge(state: string): { cls: 'ok' | 'warn' | 'err'; label: string } {
   const s = (state || '').toLowerCase();
   if (s === 'active') return { cls: 'ok', label: 'Active' };
+  if (s === 'maintenance') return { cls: 'warn', label: 'Maintenance' };
+  if (s === 'disabled') return { cls: 'warn', label: 'Disabled' };
   if (s === 'error') return { cls: 'err', label: 'Error' };
   if (s === 'cert_manager_async') return { cls: 'warn', label: 'Provisioning' };
   if (s === 'cert_pending') return { cls: 'warn', label: 'Cert Pending' };

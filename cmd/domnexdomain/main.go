@@ -109,7 +109,7 @@ func main() {
 		ErrorLog:          logx.StdLogger(log),
 	}
 
-	px := proxy.New(st, log, m, tr)
+	px := proxy.New(appSvc, log, m, tr)
 	if err := px.Refresh(context.Background()); err != nil {
 		log.Warn("initial proxy refresh failed", map[string]any{"err": err.Error()})
 	}

@@ -80,12 +80,14 @@ func (s *Server) Router() http.Handler {
 		pr.Use(s.requireCSRF)
 		pr.Post("/api/v1/hosts/preflight", s.handleHostPreflight)
 		pr.Post("/api/v1/hosts", s.handleCreateHost)
-		pr.Put("/api/v1/hosts/{id}", s.handleUpdateHostRouting)
-		pr.Put("/api/v1/hosts/{id}/auth", s.handleSetHostAuth)
-		pr.Put("/api/v1/hosts/{id}/geo", s.handleSetHostGeoPolicy)
-		pr.Post("/api/v1/hosts/{id}/retry", s.handleRetryHost)
-		pr.Delete("/api/v1/hosts/{id}", s.handleDeleteHost)
-	})
+			pr.Put("/api/v1/hosts/{id}", s.handleUpdateHostRouting)
+			pr.Put("/api/v1/hosts/{id}/auth", s.handleSetHostAuth)
+			pr.Put("/api/v1/hosts/{id}/geo", s.handleSetHostGeoPolicy)
+			pr.Post("/api/v1/hosts/{id}/disable", s.handleSetHostDisabled)
+			pr.Post("/api/v1/hosts/{id}/maintenance", s.handleSetHostMaintenance)
+			pr.Post("/api/v1/hosts/{id}/retry", s.handleRetryHost)
+			pr.Delete("/api/v1/hosts/{id}", s.handleDeleteHost)
+		})
 
 	r.Group(func(pr chi.Router) {
 		pr.Use(s.requireAuth(model.RoleAdmin, ""))
@@ -709,6 +711,90 @@ func (s *Server) handleRetryHost(w http.ResponseWriter, r *http.Request) {
 	actor := id.Username
 	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "host.retry", Target: strconv.FormatInt(hostID, 10), Meta: ""})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleSetHostDisabled(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "hosts:write") {
+		return
+	}
+	hostID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	h, err := s.app.Store().GetHostByID(r.Context(), hostID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if id.Role == model.RoleDomainAdmin || tokenHasDomainRestriction(id) {
+		if !containsInt64(id.DomainIDs, h.DomainID) {
+			writeErr(w, http.StatusForbidden, "host domain not assigned to this admin")
+			return
+		}
+	}
+	var in struct {
+		Disabled bool `json:"disabled"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := s.app.SetHostDisabled(r.Context(), hostID, in.Disabled)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	action := "host.enable"
+	if in.Disabled {
+		action = "host.disable"
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: action,
+		Target: updated.FQDN,
+		Meta:   updated.State,
+	})
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleSetHostMaintenance(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "hosts:write") {
+		return
+	}
+	hostID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	h, err := s.app.Store().GetHostByID(r.Context(), hostID)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if id.Role == model.RoleDomainAdmin || tokenHasDomainRestriction(id) {
+		if !containsInt64(id.DomainIDs, h.DomainID) {
+			writeErr(w, http.StatusForbidden, "host domain not assigned to this admin")
+			return
+		}
+	}
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := s.app.SetHostMaintenance(r.Context(), hostID, in.Enabled)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	action := "host.maintenance.off"
+	if in.Enabled {
+		action = "host.maintenance.on"
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: action,
+		Target: updated.FQDN,
+		Meta:   updated.State,
+	})
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (s *Server) handleDeleteHost(w http.ResponseWriter, r *http.Request) {
