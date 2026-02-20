@@ -45,6 +45,9 @@ logs/
 *.swp
 *.swo
 
+# Local documentation (keep local only)
+docs/
+
 # Local runtime config overrides
 config/*.env
 config/*.local
