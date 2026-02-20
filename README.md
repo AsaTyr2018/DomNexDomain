@@ -44,8 +44,10 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
   - Live checks for DNS and reachability
     - Verifies DNS resolution, target matching, and endpoint reachability from the control plane perspective.
 - Access control:
-  - Roles: `admin`, `domain-admin`, `operator`, `read-only`
+  - User account roles: `admin`, `domain-admin`
     - Supports global administration and domain-scoped delegation for multi-tenant or team-based operations.
+  - API token roles: `admin`, `operator`, `read-only`
+    - Enables scoped automation identities separate from human UI users.
   - API tokens with scoped permissions and optional domain scoping
     - Enables automation clients with least-privilege access instead of sharing admin session credentials.
 - Security and operations:
@@ -260,7 +262,8 @@ Use it for endpoint descriptions, permission context, and ready-to-run request e
 
 ### Role + Scope Model
 
-- Roles: `admin`, `domain-admin`, `operator`, `read-only`
+- User roles (Web UI accounts): `admin`, `domain-admin`
+- API token roles: `admin`, `operator`, `read-only`
 - Tokens can be constrained by:
   - scope strings (e.g. `hosts:write`, `domains:write`, `users:write`)
   - optional domain scoping (`domainIds`)
