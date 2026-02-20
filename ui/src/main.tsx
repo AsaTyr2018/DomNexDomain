@@ -8,7 +8,8 @@ type Host = { id: number; fqdn: string; upstreamUrl: string; insecureTls?: boole
 type HostDiagnostic = { fqdn: string; dnsRecords: string[]; httpStatus: number; httpsStatus: number; tlsOk: boolean; certSubject: string; certIssuer: string; certNotAfter: string; certDaysLeft: number; haEnabled?: boolean; haMode?: string; haOnline?: number; haTotal?: number; haOffline?: string[]; error?: string };
 type HostLiveCheck = { fqdn: string; dnsOk: boolean; dnsPointsToServer: boolean; httpReachable: boolean; httpsReachable: boolean; tlsOk: boolean; certDaysLeft: number; cloudflareRecordFound: boolean; error?: string };
 type DomainLiveCheck = { domain: string; dnsMode: string; provider: string; serverIpv4?: string; apexDnsOk: boolean; apexPointsToServer: boolean; cloudflareApiOk: boolean; cloudflareZoneId?: string; cloudflareError?: string; hosts: HostLiveCheck[]; warnings?: string[]; overallOk: boolean };
-type Audit = { id: number; actor: string; action: string; target: string; createdAt: string };
+type Audit = { id: number; actor: string; action: string; target: string; meta?: string; sourceIp?: string; createdAt: string };
+type BlockedIP = { ip: string; reason?: string; createdAt: string; updatedAt: string };
 type APIToken = { id: number; name: string; tokenPrefix: string; scopes: string; role: string; expiresAt: string; lastUsedAt?: string };
 type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string };
 type ManagedUser = { id: number; username: string; role: string; domainIds: number[]; createdAt: string; updatedAt: string };
@@ -20,8 +21,11 @@ type TrafficHostSummary = { hostId: number; fqdn: string; requests: number; byte
 type TrafficOverview = { hours: number; generatedAt: string; totalRequests: number; totalBytesIn: number; totalBytesOut: number; totalBlocked: number; uniqueVisitors: number; hosts: TrafficHostSummary[] };
 type TrafficPoint = { bucketStart: string; requests: number; bytesIn: number; bytesOut: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number };
 type HostTrafficDetails = { hours: number; hostId: number; fqdn: string; requests: number; bytesIn: number; bytesOut: number; blocked: number; uniqueVisitors: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; series: TrafficPoint[] };
+type CountryTraffic = { country: string; requests: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; bytesOut: number };
+type HostCountryTraffic = { hostId: number; fqdn: string; requests: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; bytesOut: number };
+type TrafficCountryOverview = { hours: number; generatedAt: string; hostId?: number; hostFqdn?: string; totalRequests: number; totalBlocked: number; totalBytesOut: number; countries: CountryTraffic[]; unknownBreakdown?: HostCountryTraffic[] };
 
-type Tab = 'dashboard' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'audit';
+type Tab = 'dashboard' | 'metricCenter' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'audit';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -55,11 +59,15 @@ function App() {
   const [hosts, setHosts] = useState<Host[]>([]);
   const [hostDiagnostics, setHostDiagnostics] = useState<Record<string, HostDiagnostic>>({});
   const [audit, setAudit] = useState<Audit[]>([]);
+  const [blockedIPs, setBlockedIPs] = useState<BlockedIP[]>([]);
   const [tokens, setTokens] = useState<APIToken[]>([]);
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [domainChecks, setDomainChecks] = useState<Record<number, DomainLiveCheck>>({});
   const [trafficOverview, setTrafficOverview] = useState<TrafficOverview | null>(null);
   const [selectedHostTraffic, setSelectedHostTraffic] = useState<HostTrafficDetails | null>(null);
+  const [metricCountryOverview, setMetricCountryOverview] = useState<TrafficCountryOverview | null>(null);
+  const [metricHostFilter, setMetricHostFilter] = useState('all');
+  const [metricHours, setMetricHours] = useState(24);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -114,6 +122,7 @@ function App() {
   const [logQuery, setLogQuery] = useState('');
   const [logActionFilter, setLogActionFilter] = useState('all');
   const [logActorFilter, setLogActorFilter] = useState('all');
+  const [logIPFilter, setLogIPFilter] = useState('all');
   const [settings, setSettings] = useState<RuntimeSettings | null>(null);
   const [settingsAcmeEmail, setSettingsAcmeEmail] = useState('');
   const [settingsAcmeStaging, setSettingsAcmeStaging] = useState(false);
@@ -151,6 +160,12 @@ function App() {
       setDomains(d.items || []);
       setHosts(h.items || []);
       setAudit(a.items || []);
+      try {
+        const bl = await api<{ items: BlockedIP[] }>('/api/v1/security/ip-blocks');
+        setBlockedIPs(bl.items || []);
+      } catch {
+        setBlockedIPs([]);
+      }
       try {
         const hd = await api<{ items: HostDiagnostic[] }>('/api/v1/hosts/diagnostics');
         const byFqdn: Record<string, HostDiagnostic> = {};
@@ -241,6 +256,11 @@ function App() {
     }
     void loadHostTraffic(selectedHostID);
   }, [selectedHostID]);
+
+  useEffect(() => {
+    if (tab !== 'metricCenter') return;
+    void loadMetricCenter();
+  }, [tab, metricHostFilter, metricHours, hosts]);
 
   const login = async () => {
     setLoading(true);
@@ -499,6 +519,16 @@ function App() {
     }
   };
 
+  const loadMetricCenter = async () => {
+    try {
+      const hostIdPart = metricHostFilter !== 'all' ? `&hostId=${encodeURIComponent(metricHostFilter)}` : '';
+      const out = await api<TrafficCountryOverview>(`/api/v1/traffic/countries?hours=${metricHours}${hostIdPart}`);
+      setMetricCountryOverview(out);
+    } catch {
+      setMetricCountryOverview(null);
+    }
+  };
+
   const activeHosts = hosts.filter((h) => h.state === 'active').length;
   const errorHosts = hosts.filter((h) => h.state === 'error').length;
   const diagnostics = Object.values(hostDiagnostics);
@@ -535,12 +565,15 @@ function App() {
   const certWindowPct = certKnown.length > 0 ? Math.max(0, Math.min(100, Math.round((1 - (certExpiringSoon / certKnown.length)) * 100))) : 0;
   const logActions = Array.from(new Set(audit.map((e) => e.action))).sort();
   const logActors = Array.from(new Set(audit.map((e) => e.actor))).sort();
+  const logIPs = Array.from(new Set(audit.map((e) => extractSourceIP(e)).filter(Boolean))).sort();
   const filteredAudit = audit.filter((e) => {
     if (logActionFilter !== 'all' && e.action !== logActionFilter) return false;
     if (logActorFilter !== 'all' && e.actor !== logActorFilter) return false;
+    const src = extractSourceIP(e);
+    if (logIPFilter !== 'all' && src !== logIPFilter) return false;
     if (!logQuery.trim()) return true;
     const q = logQuery.trim().toLowerCase();
-    return `${e.action} ${e.actor} ${e.target}`.toLowerCase().includes(q);
+    return `${e.action} ${e.actor} ${e.target} ${src}`.toLowerCase().includes(q);
   });
   const criticalLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'critical').length;
   const warningLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'warn').length;
@@ -598,6 +631,10 @@ function App() {
   const hostTrafficErrRate = hostTrafficReq > 0 ? Math.round((((selectedHostTraffic?.status4xx || 0) + (selectedHostTraffic?.status5xx || 0)) / hostTrafficReq) * 100) : 0;
   const hostTrafficBlockRate = hostTrafficReq > 0 ? Math.round(((selectedHostTraffic?.blocked || 0) / hostTrafficReq) * 100) : 0;
   const hostVisitorRatio = hostTrafficReq > 0 ? Math.round(((selectedHostTraffic?.uniqueVisitors || 0) / hostTrafficReq) * 100) : 0;
+  const metricCountries = [...(metricCountryOverview?.countries || [])].sort((a, b) => (b.requests || 0) - (a.requests || 0));
+  const metricTopReq = metricCountries.length > 0 ? metricCountries[0].requests || 1 : 1;
+  const metricUnknownTotal = metricCountries.find((c) => (c.country || '').toUpperCase() === 'ZZ')?.requests || 0;
+  const metricUnknownBreakdown = [...(metricCountryOverview?.unknownBreakdown || [])].sort((a, b) => (b.requests || 0) - (a.requests || 0));
 
   const domainProviderGuide: Record<DomainProvider, { title: string; steps: string[]; records: string[] }> = {
     cloudflare: {
@@ -960,6 +997,40 @@ function App() {
     }
   };
 
+  const blockIP = async (ip: string, reason = 'manual block from audit') => {
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/security/ip-blocks', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ ip, reason }),
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const unblockIP = async (ip: string) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/security/ip-blocks/remove', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ ip }),
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const toggleNewUserDomain = (id: number) => {
     setNewUserDomainIDs((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
   };
@@ -999,6 +1070,7 @@ function App() {
           <div className="logo">DomNexDomain</div>
           <nav className="menu">
             <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
+            <button className={tab === 'metricCenter' ? 'active' : ''} onClick={() => setTab('metricCenter')}>MetricCenter</button>
             <button className={tab === 'domains' ? 'active' : ''} onClick={() => setTab('domains')}>Domains</button>
             <button className={tab === 'hosts' ? 'active' : ''} onClick={() => setTab('hosts')}>Subdomains</button>
             {identity?.role === 'admin' ? <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button> : null}
@@ -1094,6 +1166,103 @@ function App() {
                   </div>
                 </div>
               </div>
+            </section>
+          ) : null}
+
+          {tab === 'metricCenter' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>MetricCenter</h3></div>
+                  <div className="row">
+                    <select value={metricHostFilter} onChange={(e) => setMetricHostFilter(e.target.value)}>
+                      <option value="all">All Subdomains</option>
+                      {hosts.map((h) => (
+                        <option key={h.id} value={String(h.id)}>{h.fqdn}</option>
+                      ))}
+                    </select>
+                    <select value={String(metricHours)} onChange={(e) => setMetricHours(Number(e.target.value) || 24)}>
+                      <option value="1">Last 1h</option>
+                      <option value="6">Last 6h</option>
+                      <option value="24">Last 24h</option>
+                      <option value="168">Last 7d</option>
+                    </select>
+                    <button className="btn" onClick={loadMetricCenter} disabled={loading}>Refresh</button>
+                  </div>
+                  <div className="metric-grid">
+                    <MetricTile label="Requests" value={String(metricCountryOverview?.totalRequests || 0)} hint="Within selected time window" />
+                    <MetricTile label="Blocked" value={String(metricCountryOverview?.totalBlocked || 0)} hint="Geo/Auth/Policy blocked requests" />
+                    <MetricTile label="Traffic Out" value={formatBytes(metricCountryOverview?.totalBytesOut || 0)} hint="Response bytes" />
+                    <MetricTile label="Countries" value={String(metricCountries.length)} hint="Distinct country buckets" />
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Geo Request Map</h3></div>
+                  <GeoScatterMap countries={metricCountries} />
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Country Breakdown</h3></div>
+                  {metricCountries.length === 0 ? (
+                    <div className="muted">No traffic data for this filter yet.</div>
+                  ) : (
+                    <div className="event-list">
+                      {metricCountries.map((c) => {
+                        const pct = Math.max(1, Math.round(((c.requests || 0) / metricTopReq) * 100));
+                        return (
+                          <div key={c.country} className="event-item">
+                            <div className="event-top">
+                              <strong>{c.country || 'UNK'}</strong>
+                              <span className="muted">{c.requests} req</span>
+                            </div>
+                            <div style={{ height: 8, borderRadius: 8, background: '#0f1117', border: '1px solid #2a2a35', overflow: 'hidden' }}>
+                              <div style={{ width: `${pct}%`, height: '100%', background: 'linear-gradient(90deg,#0ea5e9,#22c55e)' }} />
+                            </div>
+                            <div className="muted" style={{ marginTop: '.3rem' }}>
+                              2xx: {c.status2xx || 0} · 3xx: {c.status3xx || 0} · 4xx: {c.status4xx || 0} · 5xx: {c.status5xx || 0} · blocked: {c.blocked || 0}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              </div>
+              <aside className="entity-side">
+                <section className="card">
+                  <div className="card-head"><h3>Top Countries</h3></div>
+                  {(metricCountries.slice(0, 8)).map((c) => (
+                    <div key={`top-${c.country}`} className="host">
+                      <div>
+                        <strong>{c.country || 'UNK'}</strong>
+                        <div className="muted">{Math.round(((c.requests || 0) / Math.max(1, metricCountryOverview?.totalRequests || 1)) * 100)}%</div>
+                      </div>
+                      <div className="muted">{c.requests}</div>
+                    </div>
+                  ))}
+                  {metricCountries.length === 0 ? <div className="muted">No country data.</div> : null}
+                </section>
+                {metricUnknownTotal > 0 ? (
+                  <section className="card">
+                    <div className="card-head"><h3>ZZ Breakdown</h3></div>
+                    <div className="muted" style={{ marginBottom: '.45rem' }}>
+                      Unknown country traffic: <strong>{metricUnknownTotal}</strong> requests
+                    </div>
+                    {metricUnknownBreakdown.length === 0 ? (
+                      <div className="muted">No subdomain split available.</div>
+                    ) : (
+                      metricUnknownBreakdown.slice(0, 12).map((it) => (
+                        <div key={`zz-${it.hostId}`} className="host">
+                          <div>
+                            <strong>{it.fqdn}</strong>
+                            <div className="muted">{Math.round(((it.requests || 0) / Math.max(1, metricUnknownTotal)) * 100)}%</div>
+                          </div>
+                          <div className="muted">{it.requests}</div>
+                        </div>
+                      ))
+                    )}
+                  </section>
+                ) : null}
+              </aside>
             </section>
           ) : null}
 
@@ -1929,6 +2098,10 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                     <option value="all">All actors</option>
                     {logActors.map((a) => <option key={a} value={a}>{a}</option>)}
                   </select>
+                  <select value={logIPFilter} onChange={(e) => setLogIPFilter(e.target.value)}>
+                    <option value="all">All source IPs</option>
+                    {logIPs.map((ip) => <option key={ip} value={ip}>{ip}</option>)}
+                  </select>
                 </div>
                 <div className="muted" style={{ marginBottom: '.6rem' }}>
                   Showing {filteredAudit.length} of {audit.length} events.
@@ -1939,6 +2112,8 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                   ) : (
                     filteredAudit.map((e) => {
                       const level = classifyAuditLevel(e.action, e.target);
+                      const src = extractSourceIP(e);
+                      const canBlock = identity?.role === 'admin' && !!src && !blockedIPs.some((b) => b.ip === src);
                       return (
                         <div className="event-item" key={e.id}>
                           <div className="event-top">
@@ -1949,6 +2124,14 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                             <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
                           </div>
                           <div className="muted">{e.actor} {'->'} {e.target}</div>
+                          <div className="muted" style={{ marginTop: '.2rem' }}>
+                            Source IP: <strong>{src || '-'}</strong>
+                            {canBlock ? (
+                              <button className="btn danger" style={{ marginLeft: '.6rem', padding: '.35rem .6rem' }} onClick={() => blockIP(src, `from audit event ${e.id}`)} disabled={loading}>
+                                Block IP
+                              </button>
+                            ) : null}
+                          </div>
                         </div>
                       );
                     })
@@ -1982,6 +2165,22 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                       </div>
                     </div>
                   ) : null}
+                  <div className="card" style={{ marginTop: '.8rem', marginBottom: 0 }}>
+                    <div className="muted" style={{ marginBottom: '.45rem' }}>Blocked Source IPs</div>
+                    {blockedIPs.length === 0 ? (
+                      <div className="muted">No blocked IPs.</div>
+                    ) : (
+                      blockedIPs.map((b) => (
+                        <div key={b.ip} className="host" style={{ paddingTop: '.45rem', paddingBottom: '.45rem' }}>
+                          <div>
+                            <strong>{b.ip}</strong>
+                            {b.reason ? <div className="muted">{b.reason}</div> : null}
+                          </div>
+                          <button className="btn" onClick={() => unblockIP(b.ip)} disabled={loading}>Unblock</button>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </div>
               </div>
             </section>
@@ -2098,6 +2297,16 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .event-list { display:grid; gap:.55rem; max-height:360px; overflow:auto; }
         .event-item { padding:.55rem .6rem; border:1px solid var(--border); border-radius:9px; background:#121219; }
         .event-top { display:flex; justify-content:space-between; align-items:center; gap:.6rem; margin-bottom:.2rem; }
+        .geo-map-wrap { border:1px solid #2a2a35; border-radius:12px; background:
+          radial-gradient(700px 200px at 95% -45%, rgba(14,165,233,.2), transparent 55%),
+          radial-gradient(700px 200px at 5% -45%, rgba(34,197,94,.16), transparent 55%),
+          #0f1117;
+          padding:.65rem;
+        }
+        .geo-map-svg { width:100%; height:auto; display:block; }
+        .geo-map-grid { stroke:#2b3140; stroke-width:1; opacity:.75; }
+        .geo-map-bubble { fill:#22c55e; stroke:#a7f3d0; stroke-width:1.5; }
+        .geo-map-label { fill:#d1d5db; font-size:11px; font-weight:600; }
         .logs-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.75fr) minmax(300px,1fr); align-items:start; }
         .logs-side { display:grid; gap:1rem; }
         .logs-list { max-height:620px; }
@@ -2166,6 +2375,17 @@ function classifyAuditLevel(action: string, target: string): 'critical' | 'warn'
   if (s.includes('delete') || s.includes('revoke') || s.includes('password-reset') || s.includes('reset')) return 'critical';
   if (s.includes('update') || s.includes('upsert') || s.includes('retry') || s.includes('reload')) return 'warn';
   return 'info';
+}
+
+function extractSourceIP(e: Audit): string {
+  const direct = (e.sourceIp || '').trim();
+  if (direct) return direct;
+  const meta = (e.meta || '').trim();
+  if (!meta) return '';
+  const parts = meta.split(';').map((p) => p.trim());
+  const src = parts.find((p) => p.startsWith('source='));
+  if (!src) return '';
+  return src.slice('source='.length).trim();
 }
 
 function hostStateBadge(state: string): { cls: 'ok' | 'warn' | 'err'; label: string } {
@@ -2241,6 +2461,51 @@ function Gauge({ title, value, subtitle }: { title: string; value: number; subti
       </div>
       <div className="gauge-title">{title}</div>
       <div className="gauge-sub">{subtitle}</div>
+    </div>
+  );
+}
+
+const COUNTRY_COORDS: Record<string, { x: number; y: number }> = {
+  US: { x: 206, y: 130 }, CA: { x: 185, y: 86 }, MX: { x: 198, y: 173 },
+  BR: { x: 280, y: 250 }, AR: { x: 268, y: 312 }, CL: { x: 246, y: 292 }, CO: { x: 244, y: 211 },
+  GB: { x: 428, y: 95 }, IE: { x: 416, y: 100 }, FR: { x: 438, y: 117 }, ES: { x: 426, y: 136 }, PT: { x: 415, y: 142 },
+  DE: { x: 451, y: 106 }, NL: { x: 442, y: 103 }, BE: { x: 440, y: 109 }, IT: { x: 463, y: 132 }, CH: { x: 452, y: 119 },
+  AT: { x: 460, y: 116 }, PL: { x: 470, y: 103 }, SE: { x: 466, y: 76 }, NO: { x: 452, y: 67 }, FI: { x: 486, y: 76 },
+  DK: { x: 452, y: 92 }, CZ: { x: 461, y: 110 }, RO: { x: 489, y: 123 }, HU: { x: 472, y: 117 }, GR: { x: 490, y: 147 },
+  TR: { x: 518, y: 136 }, UA: { x: 499, y: 104 }, RU: { x: 575, y: 86 },
+  MA: { x: 413, y: 172 }, DZ: { x: 444, y: 173 }, EG: { x: 502, y: 169 }, NG: { x: 458, y: 223 }, ZA: { x: 492, y: 320 }, KE: { x: 503, y: 251 },
+  SA: { x: 544, y: 186 }, AE: { x: 565, y: 184 }, IL: { x: 516, y: 163 }, IN: { x: 595, y: 197 }, PK: { x: 575, y: 179 },
+  CN: { x: 666, y: 141 }, JP: { x: 744, y: 145 }, KR: { x: 718, y: 137 }, TW: { x: 721, y: 164 }, HK: { x: 705, y: 166 },
+  SG: { x: 647, y: 227 }, ID: { x: 679, y: 249 }, AU: { x: 723, y: 312 }, NZ: { x: 784, y: 338 },
+};
+
+function GeoScatterMap({ countries }: { countries: CountryTraffic[] }) {
+  const normalized = (countries || [])
+    .map((c) => ({ ...c, code: String(c.country || '').trim().toUpperCase() }))
+    .filter((c) => c.code && COUNTRY_COORDS[c.code]);
+  if (normalized.length === 0) {
+    return <div className="muted">No mappable country data yet.</div>;
+  }
+  const topReq = Math.max(1, ...normalized.map((c) => c.requests || 0));
+  return (
+    <div className="geo-map-wrap">
+      <svg className="geo-map-svg" viewBox="0 0 900 380" role="img" aria-label="Request geo map">
+        {[70, 130, 190, 250, 310].map((y) => <line key={`h-${y}`} x1="20" y1={y} x2="880" y2={y} className="geo-map-grid" />)}
+        {[120, 240, 360, 480, 600, 720].map((x) => <line key={`v-${x}`} x1={x} y1="36" x2={x} y2="344" className="geo-map-grid" />)}
+        {normalized.map((c) => {
+          const p = COUNTRY_COORDS[c.code];
+          const radius = 4 + Math.round(((c.requests || 0) / topReq) * 14);
+          return (
+            <g key={c.code}>
+              <circle cx={p.x} cy={p.y} r={radius} className="geo-map-bubble" style={{ opacity: 0.2 + ((c.requests || 0) / topReq) * 0.8 }} />
+              <text x={p.x + radius + 3} y={p.y + 3} className="geo-map-label">{c.code}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <div className="muted" style={{ marginTop: '.45rem' }}>
+        Bubble size = request volume in selected window.
+      </div>
     </div>
   );
 }

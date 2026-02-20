@@ -7,9 +7,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/oschwald/maxminddb-golang"
 )
 
 type Resolver struct {
@@ -17,6 +20,7 @@ type Resolver struct {
 	cache map[string]cacheItem
 	http  *http.Client
 	ttl   time.Duration
+	mmdb  *maxminddb.Reader
 }
 
 type cacheItem struct {
@@ -28,10 +32,12 @@ func New(ttl time.Duration) *Resolver {
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
+	reader, _ := openLocalMMDB()
 	return &Resolver{
 		cache: map[string]cacheItem{},
 		http:  &http.Client{Timeout: 1200 * time.Millisecond},
 		ttl:   ttl,
+		mmdb:  reader,
 	}
 }
 
@@ -53,7 +59,13 @@ func (r *Resolver) CountryCode(ctx context.Context, ip string) string {
 		return cached.country
 	}
 
-	country := r.lookupCountryCode(ctx, ip)
+	country := ""
+	if r.mmdb != nil {
+		country = r.lookupCountryCodeMMDB(parsed)
+	}
+	if country == "" {
+		country = r.lookupCountryCode(ctx, ip)
+	}
 	if country == "" {
 		country = "ZZ"
 	}
@@ -63,24 +75,142 @@ func (r *Resolver) CountryCode(ctx context.Context, ip string) string {
 	return country
 }
 
-func (r *Resolver) lookupCountryCode(ctx context.Context, ip string) string {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://ipapi.co/%s/json/", ip), nil)
-	resp, err := r.http.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+func (r *Resolver) lookupCountryCodeMMDB(ip net.IP) string {
+	if r.mmdb == nil || ip == nil {
 		return ""
 	}
 	var payload struct {
-		CountryCode string `json:"country_code"`
+		Country struct {
+			ISOCode     string `maxminddb:"iso_code"`
+			CountryCode string `maxminddb:"country_code"`
+		} `maxminddb:"country"`
+		RegisteredCountry struct {
+			ISOCode     string `maxminddb:"iso_code"`
+			CountryCode string `maxminddb:"country_code"`
+		} `maxminddb:"registered_country"`
+		CountryCode string `maxminddb:"country_code"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&payload); err != nil {
+	if err := r.mmdb.Lookup(ip, &payload); err != nil {
 		return ""
 	}
-	code := strings.ToUpper(strings.TrimSpace(payload.CountryCode))
+	if code := normalizeCountryCode(payload.Country.ISOCode); code != "" {
+		return code
+	}
+	if code := normalizeCountryCode(payload.Country.CountryCode); code != "" {
+		return code
+	}
+	if code := normalizeCountryCode(payload.RegisteredCountry.ISOCode); code != "" {
+		return code
+	}
+	if code := normalizeCountryCode(payload.RegisteredCountry.CountryCode); code != "" {
+		return code
+	}
+	return normalizeCountryCode(payload.CountryCode)
+}
+
+func openLocalMMDB() (*maxminddb.Reader, string) {
+	paths := []string{}
+	if env := strings.TrimSpace(os.Getenv("DOMNEX_GEOIP_MMDB")); env != "" {
+		paths = append(paths, env)
+	}
+	paths = append(paths,
+		"/var/lib/domnexdomain/geoip/IP2LOCATION-LITE-DB1.MMDB",
+		"/var/lib/domnexdomain/geoip/GeoLite2-Country.mmdb",
+		"/etc/domnexdomain/IP2LOCATION-LITE-DB1.MMDB",
+		"/media/i2l/IP2LOCATION-LITE-DB1.MMDB",
+	)
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		reader, err := maxminddb.Open(p)
+		if err == nil {
+			return reader, p
+		}
+	}
+	return nil, ""
+}
+
+func (r *Resolver) lookupCountryCode(ctx context.Context, ip string) string {
+	type provider struct {
+		url     string
+		extract func([]byte) string
+	}
+	providers := []provider{
+		{
+			url: fmt.Sprintf("https://ipapi.co/%s/json/", ip),
+			extract: func(body []byte) string {
+				var payload struct {
+					CountryCode string `json:"country_code"`
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					return ""
+				}
+				return normalizeCountryCode(payload.CountryCode)
+			},
+		},
+		{
+			url: fmt.Sprintf("https://ipwho.is/%s", ip),
+			extract: func(body []byte) string {
+				var payload struct {
+					Success     bool   `json:"success"`
+					CountryCode string `json:"country_code"`
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					return ""
+				}
+				if !payload.Success {
+					return ""
+				}
+				return normalizeCountryCode(payload.CountryCode)
+			},
+		},
+		{
+			url: fmt.Sprintf("https://ipinfo.io/%s/json", ip),
+			extract: func(body []byte) string {
+				var payload struct {
+					Country string `json:"country"`
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					return ""
+				}
+				return normalizeCountryCode(payload.Country)
+			},
+		},
+	}
+
+	for _, p := range providers {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
+		resp, err := r.http.Do(req)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		_ = resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			continue
+		}
+		if code := p.extract(body); code != "" {
+			return code
+		}
+	}
+	return ""
+}
+
+func normalizeCountryCode(raw string) string {
+	code := strings.ToUpper(strings.TrimSpace(raw))
 	if len(code) != 2 {
+		return ""
+	}
+	// provider placeholders or anonymized values
+	if code == "XX" || code == "T1" {
 		return ""
 	}
 	return code

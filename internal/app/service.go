@@ -191,6 +191,41 @@ type HostTrafficDetails struct {
 	Series         []TrafficPoint `json:"series"`
 }
 
+type CountryTraffic struct {
+	Country   string `json:"country"`
+	Requests  int64  `json:"requests"`
+	Blocked   int64  `json:"blocked"`
+	Status2xx int64  `json:"status2xx"`
+	Status3xx int64  `json:"status3xx"`
+	Status4xx int64  `json:"status4xx"`
+	Status5xx int64  `json:"status5xx"`
+	BytesOut  int64  `json:"bytesOut"`
+}
+
+type TrafficCountryOverview struct {
+	Hours            int                  `json:"hours"`
+	GeneratedAt      string               `json:"generatedAt"`
+	HostID           int64                `json:"hostId,omitempty"`
+	HostFQDN         string               `json:"hostFqdn,omitempty"`
+	TotalRequests    int64                `json:"totalRequests"`
+	TotalBlocked     int64                `json:"totalBlocked"`
+	TotalBytesOut    int64                `json:"totalBytesOut"`
+	Countries        []CountryTraffic     `json:"countries"`
+	UnknownBreakdown []HostCountryTraffic `json:"unknownBreakdown,omitempty"`
+}
+
+type HostCountryTraffic struct {
+	HostID    int64  `json:"hostId"`
+	FQDN      string `json:"fqdn"`
+	Requests  int64  `json:"requests"`
+	Blocked   int64  `json:"blocked"`
+	Status2xx int64  `json:"status2xx"`
+	Status3xx int64  `json:"status3xx"`
+	Status4xx int64  `json:"status4xx"`
+	Status5xx int64  `json:"status5xx"`
+	BytesOut  int64  `json:"bytesOut"`
+}
+
 func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dns.Provider, log *logx.Logger) *Service {
 	return &Service{cfg: cfg, store: st, keystore: ks, dns: dnsProvider, log: log, backoff: map[int64]time.Time{}}
 }
@@ -668,6 +703,65 @@ func (s *Service) GetHostTraffic(ctx context.Context, hostID int64, hours int) (
 		out.Status3xx += p.Status3xx
 		out.Status4xx += p.Status4xx
 		out.Status5xx += p.Status5xx
+	}
+	return out, nil
+}
+
+func (s *Service) GetTrafficCountries(ctx context.Context, hostID int64, hours int) (TrafficCountryOverview, error) {
+	hours = normalizeTrafficHours(hours)
+	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	out := TrafficCountryOverview{
+		Hours:            hours,
+		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
+		Countries:        []CountryTraffic{},
+		UnknownBreakdown: []HostCountryTraffic{},
+	}
+	if hostID > 0 {
+		h, err := s.store.GetHostByID(ctx, hostID)
+		if err != nil {
+			return out, err
+		}
+		out.HostID = h.ID
+		out.HostFQDN = h.FQDN
+	}
+	rows, err := s.store.ListTrafficCountries(ctx, since, hostID)
+	if err != nil {
+		return out, err
+	}
+	for _, r := range rows {
+		if strings.EqualFold(strings.TrimSpace(r.Country), "LOCAL") {
+			continue
+		}
+		item := CountryTraffic{
+			Country:   r.Country,
+			Requests:  r.Requests,
+			Blocked:   r.Blocked,
+			Status2xx: r.Status2xx,
+			Status3xx: r.Status3xx,
+			Status4xx: r.Status4xx,
+			Status5xx: r.Status5xx,
+			BytesOut:  r.BytesOut,
+		}
+		out.Countries = append(out.Countries, item)
+		out.TotalRequests += item.Requests
+		out.TotalBlocked += item.Blocked
+		out.TotalBytesOut += item.BytesOut
+	}
+	zzRows, err := s.store.ListHostCountryTraffic(ctx, since, "ZZ", hostID)
+	if err == nil {
+		for _, r := range zzRows {
+			out.UnknownBreakdown = append(out.UnknownBreakdown, HostCountryTraffic{
+				HostID:    r.HostID,
+				FQDN:      r.FQDN,
+				Requests:  r.Requests,
+				Blocked:   r.Blocked,
+				Status2xx: r.Status2xx,
+				Status3xx: r.Status3xx,
+				Status4xx: r.Status4xx,
+				Status5xx: r.Status5xx,
+				BytesOut:  r.BytesOut,
+			})
+		}
 	}
 	return out, nil
 }

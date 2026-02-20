@@ -83,5 +83,13 @@ type AuditEvent struct {
 	Action    string    `json:"action"`
 	Target    string    `json:"target"`
 	Meta      string    `json:"meta"`
+	SourceIP  string    `json:"sourceIp,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+type BlockedIP struct {
+	IP        string    `json:"ip"`
+	Reason    string    `json:"reason"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }

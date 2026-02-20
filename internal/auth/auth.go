@@ -30,6 +30,7 @@ type Store interface {
 	RegisterLoginFailure(ctx context.Context, username string) (failedCount int, lockUntil time.Time, err error)
 	ClearLoginFailures(ctx context.Context, username string) error
 	GetUserDomainIDs(ctx context.Context, userID int64) ([]int64, error)
+	IsIPBlocked(ctx context.Context, ip string) (bool, error)
 }
 
 type Service struct {
@@ -62,6 +63,10 @@ func New(store Store, sessionTTL time.Duration, allowedCIDRs []string) (*Service
 func (s *Service) AuthenticatePassword(ctx context.Context, username, password, source string) (string, model.User, error) {
 	if strings.TrimSpace(source) == "" {
 		source = "n/a"
+	}
+	if blocked, err := s.store.IsIPBlocked(ctx, source); err == nil && blocked {
+		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.blocked_ip", Target: "user", Meta: "source=" + source})
+		return "", model.User{}, errors.New("source ip blocked")
 	}
 	failed, lockUntil, err := s.store.GetLoginAttempt(ctx, username)
 	if err != nil {
@@ -139,11 +144,12 @@ func (s *Service) LogoutAll(ctx context.Context, userID int64, actor string) err
 }
 
 func (s *Service) CheckAdminNetwork(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
+	source := requestIP(r)
+	if blocked, err := s.store.IsIPBlocked(r.Context(), source); err == nil && blocked {
+		_ = s.store.AddAuditEvent(r.Context(), model.AuditEvent{Actor: "system", Action: "auth.admin_network.blocked_ip", Target: "admin_api", Meta: "source=" + source})
+		return false
 	}
-	ip := net.ParseIP(host)
+	ip := net.ParseIP(source)
 	if ip == nil {
 		return false
 	}
@@ -153,6 +159,25 @@ func (s *Service) CheckAdminNetwork(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+func requestIP(r *http.Request) string {
+	if cfip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfip != "" {
+		return cfip
+	}
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		if p := strings.TrimSpace(strings.Split(xff, ",")[0]); p != "" {
+			return p
+		}
+	}
+	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+		return xrip
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
 }
 
 func RoleAllows(role model.Role, need model.Role) bool {

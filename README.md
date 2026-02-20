@@ -63,6 +63,9 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
     - Captures login failures and high-impact configuration actions for forensic traceability.
   - Prometheus metrics endpoint
     - Exposes operational telemetry for alerting and dashboard integration.
+  - MetricCenter traffic analytics
+    - Global or per-subdomain request analysis with selectable windows (`1h`, `6h`, `24h`, `7d`), country heat map, and country-level status breakdown.
+    - Includes unknown-country (`ZZ`) breakdown by subdomain to identify noisy or unresolved traffic sources quickly.
   - Per-subdomain GeoIP policy (allow/deny country lists)
     - Evaluates client IP to ISO country code and enforces optional country-based access rules before proxy upstream/auth flow.
   - Destructive action confirmation for host deletion
@@ -200,6 +203,13 @@ GeoIP implementation note:
 - Country detection is IP-based and mapped to ISO-3166-1 alpha-2 codes.
 - UI presets (for example `EU`, `DACH`, `North America`) are static code lists for predictable behavior.
 - Local/private client addresses are treated as `LOCAL` and are not blocked by Geo policy.
+
+GeoIP database setup (recommended):
+- Source: `https://download.ip2location.com/lite/`
+- Download: `IP2LOCATION-LITE-DB1.MMDB.ZIP`
+- Target directory on server: `/var/lib/domnexdomain/geoip/`
+- Required runtime file path: `/var/lib/domnexdomain/geoip/IP2LOCATION-LITE-DB1.MMDB`
+- The MMDB file is runtime data and must not be committed to git.
 
 ## API Overview (Technical)
 

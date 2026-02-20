@@ -149,6 +149,13 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   lock_until TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS blocked_ips (
+  ip TEXT PRIMARY KEY,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
   token_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL,
@@ -674,8 +681,75 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]model.AuditEv
 		if err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.Target, &e.Meta, &created); err != nil {
 			return nil, err
 		}
+		e.SourceIP = parseSourceFromMeta(e.Meta)
 		e.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func parseSourceFromMeta(meta string) string {
+	meta = strings.TrimSpace(meta)
+	if meta == "" {
+		return ""
+	}
+	parts := strings.Split(meta, ";")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if strings.HasPrefix(p, "source=") {
+			return strings.TrimSpace(strings.TrimPrefix(p, "source="))
+		}
+	}
+	return ""
+}
+
+func (s *Store) IsIPBlocked(ctx context.Context, ip string) (bool, error) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return false, nil
+	}
+	var c int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM blocked_ips WHERE ip=?`, ip).Scan(&c); err != nil {
+		return false, err
+	}
+	return c > 0, nil
+}
+
+func (s *Store) UpsertBlockedIP(ctx context.Context, ip, reason string) error {
+	ip = strings.TrimSpace(ip)
+	reason = strings.TrimSpace(reason)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO blocked_ips(ip, reason, created_at, updated_at)
+VALUES(?,?,?,?)
+ON CONFLICT(ip) DO UPDATE SET reason=excluded.reason, updated_at=excluded.updated_at`, ip, reason, now, now)
+	return err
+}
+
+func (s *Store) RemoveBlockedIP(ctx context.Context, ip string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM blocked_ips WHERE ip=?`, strings.TrimSpace(ip))
+	return err
+}
+
+func (s *Store) ListBlockedIPs(ctx context.Context, limit int) ([]model.BlockedIP, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT ip, reason, created_at, updated_at FROM blocked_ips ORDER BY updated_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.BlockedIP{}
+	for rows.Next() {
+		var b model.BlockedIP
+		var created, updated string
+		if err := rows.Scan(&b.IP, &b.Reason, &created, &updated); err != nil {
+			return nil, err
+		}
+		b.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		b.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		out = append(out, b)
 	}
 	return out, rows.Err()
 }
@@ -798,6 +872,29 @@ type HostTrafficPointRow struct {
 	Status5xx   int64
 }
 
+type CountryTrafficRow struct {
+	Country   string
+	Requests  int64
+	Blocked   int64
+	Status2xx int64
+	Status3xx int64
+	Status4xx int64
+	Status5xx int64
+	BytesOut  int64
+}
+
+type HostCountryTrafficRow struct {
+	HostID    int64
+	FQDN      string
+	Requests  int64
+	Blocked   int64
+	Status2xx int64
+	Status3xx int64
+	Status4xx int64
+	Status5xx int64
+	BytesOut  int64
+}
+
 func (s *Store) ListHostTrafficSummaries(ctx context.Context, since time.Time) ([]HostTrafficSummaryRow, error) {
 	sinceBucket := since.UTC().Format(time.RFC3339)
 	sinceDay := since.UTC().Format("2006-01-02")
@@ -861,6 +958,94 @@ func (s *Store) CountHostUniqueVisitors(ctx context.Context, hostID int64, since
 	var c int64
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT ip_hash) FROM host_visitors_daily WHERE host_id=? AND day>=?`, hostID, sinceDay).Scan(&c)
 	return c, err
+}
+
+func (s *Store) ListTrafficCountries(ctx context.Context, since time.Time, hostID int64) ([]CountryTrafficRow, error) {
+	sinceBucket := since.UTC().Format(time.RFC3339)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if hostID > 0 {
+		rows, err = s.db.QueryContext(ctx, `
+SELECT country,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_minute
+WHERE bucket_start>=? AND host_id=?
+GROUP BY country
+ORDER BY SUM(requests) DESC`, sinceBucket, hostID)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+SELECT country,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_minute
+WHERE bucket_start>=?
+GROUP BY country
+ORDER BY SUM(requests) DESC`, sinceBucket)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CountryTrafficRow{}
+	for rows.Next() {
+		var r CountryTrafficRow
+		if err := rows.Scan(&r.Country, &r.Requests, &r.Blocked, &r.Status2xx, &r.Status3xx, &r.Status4xx, &r.Status5xx, &r.BytesOut); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListHostCountryTraffic(ctx context.Context, since time.Time, country string, hostID int64) ([]HostCountryTrafficRow, error) {
+	sinceBucket := since.UTC().Format(time.RFC3339)
+	country = strings.ToUpper(strings.TrimSpace(country))
+	if country == "" {
+		return nil, fmt.Errorf("country is required")
+	}
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if hostID > 0 {
+		rows, err = s.db.QueryContext(ctx, `
+SELECT host_id, fqdn,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_minute
+WHERE bucket_start>=? AND country=? AND host_id=?
+GROUP BY host_id, fqdn
+ORDER BY SUM(requests) DESC`, sinceBucket, country, hostID)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+SELECT host_id, fqdn,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_minute
+WHERE bucket_start>=? AND country=?
+GROUP BY host_id, fqdn
+ORDER BY SUM(requests) DESC`, sinceBucket, country)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []HostCountryTrafficRow{}
+	for rows.Next() {
+		var r HostCountryTrafficRow
+		if err := rows.Scan(&r.HostID, &r.FQDN, &r.Requests, &r.Blocked, &r.Status2xx, &r.Status3xx, &r.Status4xx, &r.Status5xx, &r.BytesOut); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func encodeBackends(in []model.HABackend) (string, error) {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -64,7 +65,9 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/hosts/diagnostics", s.handleHostsDiagnostics)
 		pr.Get("/api/v1/traffic/overview", s.handleTrafficOverview)
 		pr.Get("/api/v1/traffic/hosts/{id}", s.handleHostTraffic)
+		pr.Get("/api/v1/traffic/countries", s.handleTrafficCountries)
 		pr.Get("/api/v1/audit", s.handleListAudit)
+		pr.Get("/api/v1/security/ip-blocks", s.handleListBlockedIPs)
 		pr.Get("/api/v1/settings", s.handleGetSettings)
 		pr.Get("/api/v1/users", s.handleListUsers)
 	})
@@ -80,14 +83,14 @@ func (s *Server) Router() http.Handler {
 		pr.Use(s.requireCSRF)
 		pr.Post("/api/v1/hosts/preflight", s.handleHostPreflight)
 		pr.Post("/api/v1/hosts", s.handleCreateHost)
-			pr.Put("/api/v1/hosts/{id}", s.handleUpdateHostRouting)
-			pr.Put("/api/v1/hosts/{id}/auth", s.handleSetHostAuth)
-			pr.Put("/api/v1/hosts/{id}/geo", s.handleSetHostGeoPolicy)
-			pr.Post("/api/v1/hosts/{id}/disable", s.handleSetHostDisabled)
-			pr.Post("/api/v1/hosts/{id}/maintenance", s.handleSetHostMaintenance)
-			pr.Post("/api/v1/hosts/{id}/retry", s.handleRetryHost)
-			pr.Delete("/api/v1/hosts/{id}", s.handleDeleteHost)
-		})
+		pr.Put("/api/v1/hosts/{id}", s.handleUpdateHostRouting)
+		pr.Put("/api/v1/hosts/{id}/auth", s.handleSetHostAuth)
+		pr.Put("/api/v1/hosts/{id}/geo", s.handleSetHostGeoPolicy)
+		pr.Post("/api/v1/hosts/{id}/disable", s.handleSetHostDisabled)
+		pr.Post("/api/v1/hosts/{id}/maintenance", s.handleSetHostMaintenance)
+		pr.Post("/api/v1/hosts/{id}/retry", s.handleRetryHost)
+		pr.Delete("/api/v1/hosts/{id}", s.handleDeleteHost)
+	})
 
 	r.Group(func(pr chi.Router) {
 		pr.Use(s.requireAuth(model.RoleAdmin, ""))
@@ -108,6 +111,8 @@ func (s *Server) Router() http.Handler {
 		pr.Put("/api/v1/users/{id}/password", s.handleSetUserPassword)
 		pr.Delete("/api/v1/users/{id}", s.handleDeleteUser)
 		pr.Post("/api/v1/logout-all", s.handleLogoutAll)
+		pr.Post("/api/v1/security/ip-blocks", s.handleAddBlockedIP)
+		pr.Post("/api/v1/security/ip-blocks/remove", s.handleRemoveBlockedIP)
 	})
 
 	r.Get("/*", func(w http.ResponseWriter, req *http.Request) {
@@ -234,7 +239,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	sid, user, err := s.auth.AuthenticatePassword(r.Context(), in.Username, in.Password, clientIP(r))
+	source := clientIP(r)
+	if blocked, err := s.app.Store().IsIPBlocked(r.Context(), source); err == nil && blocked {
+		s.metrics.Failures.WithLabelValues("auth").Inc()
+		writeErr(w, http.StatusForbidden, "source ip blocked")
+		return
+	}
+	sid, user, err := s.auth.AuthenticatePassword(r.Context(), in.Username, in.Password, source)
 	if err != nil {
 		s.metrics.Failures.WithLabelValues("auth").Inc()
 		writeErr(w, http.StatusUnauthorized, err.Error())
@@ -484,6 +495,110 @@ func (s *Server) handleHostTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
 	out, err := s.app.GetHostTraffic(r.Context(), hostID, hours)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleTrafficCountries(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "hosts:read") {
+		return
+	}
+	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
+	hostID, _ := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("hostId")), 10, 64)
+	if hours <= 0 {
+		hours = 24
+	}
+
+	if id.Role == model.RoleDomainAdmin || tokenHasDomainRestriction(id) {
+		allowedHosts, err := s.app.ListHosts(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		allowedHosts = filterHostsByDomainIDs(allowedHosts, id.DomainIDs)
+		allowed := map[int64]app.TrafficCountryOverview{}
+		if hostID > 0 {
+			ok := false
+			for _, h := range allowedHosts {
+				if h.ID == hostID {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				writeErr(w, http.StatusForbidden, "host domain not assigned to this admin")
+				return
+			}
+			out, err := s.app.GetTrafficCountries(r.Context(), hostID, hours)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		for _, h := range allowedHosts {
+			out, err := s.app.GetTrafficCountries(r.Context(), h.ID, hours)
+			if err != nil {
+				continue
+			}
+			allowed[h.ID] = out
+		}
+		merged := app.TrafficCountryOverview{
+			Hours:            hours,
+			GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
+			Countries:        []app.CountryTraffic{},
+			UnknownBreakdown: []app.HostCountryTraffic{},
+		}
+		byCountry := map[string]app.CountryTraffic{}
+		byUnknownHost := map[int64]app.HostCountryTraffic{}
+		for _, ov := range allowed {
+			merged.TotalRequests += ov.TotalRequests
+			merged.TotalBlocked += ov.TotalBlocked
+			merged.TotalBytesOut += ov.TotalBytesOut
+			for _, c := range ov.Countries {
+				curr := byCountry[c.Country]
+				curr.Country = c.Country
+				curr.Requests += c.Requests
+				curr.Blocked += c.Blocked
+				curr.Status2xx += c.Status2xx
+				curr.Status3xx += c.Status3xx
+				curr.Status4xx += c.Status4xx
+				curr.Status5xx += c.Status5xx
+				curr.BytesOut += c.BytesOut
+				byCountry[c.Country] = curr
+			}
+			for _, h := range ov.UnknownBreakdown {
+				curr := byUnknownHost[h.HostID]
+				curr.HostID = h.HostID
+				curr.FQDN = h.FQDN
+				curr.Requests += h.Requests
+				curr.Blocked += h.Blocked
+				curr.Status2xx += h.Status2xx
+				curr.Status3xx += h.Status3xx
+				curr.Status4xx += h.Status4xx
+				curr.Status5xx += h.Status5xx
+				curr.BytesOut += h.BytesOut
+				byUnknownHost[h.HostID] = curr
+			}
+		}
+		for _, c := range byCountry {
+			merged.Countries = append(merged.Countries, c)
+		}
+		for _, h := range byUnknownHost {
+			merged.UnknownBreakdown = append(merged.UnknownBreakdown, h)
+		}
+		sort.Slice(merged.Countries, func(i, j int) bool { return merged.Countries[i].Requests > merged.Countries[j].Requests })
+		sort.Slice(merged.UnknownBreakdown, func(i, j int) bool { return merged.UnknownBreakdown[i].Requests > merged.UnknownBreakdown[j].Requests })
+		writeJSON(w, http.StatusOK, merged)
+		return
+	}
+
+	out, err := s.app.GetTrafficCountries(r.Context(), hostID, hours)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1043,7 +1158,99 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	ipFilter := strings.TrimSpace(r.URL.Query().Get("ip"))
+	actionFilter := strings.TrimSpace(r.URL.Query().Get("action"))
+	actorFilter := strings.TrimSpace(r.URL.Query().Get("actor"))
+	if ipFilter != "" || actionFilter != "" || actorFilter != "" {
+		filtered := make([]model.AuditEvent, 0, len(items))
+		for _, it := range items {
+			if ipFilter != "" && !strings.EqualFold(strings.TrimSpace(it.SourceIP), ipFilter) {
+				continue
+			}
+			if actionFilter != "" && !strings.EqualFold(strings.TrimSpace(it.Action), actionFilter) {
+				continue
+			}
+			if actorFilter != "" && !strings.EqualFold(strings.TrimSpace(it.Actor), actorFilter) {
+				continue
+			}
+			filtered = append(filtered, it)
+		}
+		items = filtered
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleListBlockedIPs(w http.ResponseWriter, r *http.Request) {
+	if !requireTokenScope(w, identityFrom(r.Context()), "audit:read") {
+		return
+	}
+	items, err := s.app.Store().ListBlockedIPs(r.Context(), 500)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleAddBlockedIP(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	var in struct {
+		IP     string `json:"ip"`
+		Reason string `json:"reason"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ip := net.ParseIP(strings.TrimSpace(in.IP))
+	if ip == nil {
+		writeErr(w, http.StatusBadRequest, "invalid ip")
+		return
+	}
+	if err := s.app.Store().UpsertBlockedIP(r.Context(), ip.String(), strings.TrimSpace(in.Reason)); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "security.ip_block.add",
+		Target: ip.String(),
+		Meta:   strings.TrimSpace(in.Reason),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleRemoveBlockedIP(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	var in struct {
+		IP string `json:"ip"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ip := net.ParseIP(strings.TrimSpace(in.IP))
+	if ip == nil {
+		writeErr(w, http.StatusBadRequest, "invalid ip")
+		return
+	}
+	if err := s.app.Store().RemoveBlockedIP(r.Context(), ip.String()); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "security.ip_block.remove",
+		Target: ip.String(),
+		Meta:   "",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {

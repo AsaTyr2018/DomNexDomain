@@ -34,15 +34,15 @@ type HostSource interface {
 }
 
 type Engine struct {
-	source HostSource
-	log    *logx.Logger
-	m      *metrics.Collector
-	geo    *geoip.Resolver
-	tr     *traffic.Recorder
+	source   HostSource
+	log      *logx.Logger
+	m        *metrics.Collector
+	geo      *geoip.Resolver
+	tr       *traffic.Recorder
 	publicIP string
-	mu     sync.RWMutex
-	routes map[string]*routeEntry
-	auth   map[string]authSession
+	mu       sync.RWMutex
+	routes   map[string]*routeEntry
+	auth     map[string]authSession
 }
 
 func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.Recorder) *Engine {
@@ -193,7 +193,10 @@ func (e *Engine) Handler() http.Handler {
 			e.renderHostMaintenancePage(route.host, sw, r)
 			return
 		}
-		country = e.geo.CountryCode(r.Context(), clientIP)
+		country = countryFromHeaders(r)
+		if country == "" {
+			country = e.geo.CountryCode(r.Context(), clientIP)
+		}
 		if deny, mode := e.isGeoBlocked(country, route.host); deny {
 			blocked = true
 			traceID, _ := randomHex(8)
@@ -268,23 +271,62 @@ func (e *Engine) isGeoBlocked(country string, h model.Host) (bool, string) {
 }
 
 func clientIPFromRequest(r *http.Request) string {
-	if cfip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfip != "" {
+	if cfip := parseCandidateIP(r.Header.Get("CF-Connecting-IP")); cfip != "" {
 		return cfip
 	}
 	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		if idx := strings.Index(xff, ","); idx >= 0 {
-			return strings.TrimSpace(xff[:idx])
+		for _, part := range strings.Split(xff, ",") {
+			if ip := parseCandidateIP(part); ip != "" {
+				return ip
+			}
 		}
-		return xff
 	}
-	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+	if xrip := parseCandidateIP(r.Header.Get("X-Real-IP")); xrip != "" {
 		return xrip
 	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil {
-		return host
+	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
+		if ip := parseCandidateIP(host); ip != "" {
+			return ip
+		}
 	}
-	return strings.TrimSpace(r.RemoteAddr)
+	return parseCandidateIP(strings.TrimSpace(r.RemoteAddr))
+}
+
+func parseCandidateIP(raw string) string {
+	raw = strings.TrimSpace(strings.Trim(raw, `"`))
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "[") && strings.Contains(raw, "]") {
+		raw = strings.TrimPrefix(raw, "[")
+		if idx := strings.Index(raw, "]"); idx >= 0 {
+			raw = raw[:idx]
+		}
+	}
+	if ip := net.ParseIP(raw); ip != nil {
+		return ip.String()
+	}
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
+func countryFromHeaders(r *http.Request) string {
+	candidates := []string{
+		r.Header.Get("CF-IPCountry"),
+		r.Header.Get("X-Country-Code"),
+		r.Header.Get("X-Appengine-Country"),
+	}
+	for _, c := range candidates {
+		cc := strings.ToUpper(strings.TrimSpace(c))
+		if len(cc) == 2 && cc != "XX" && cc != "T1" {
+			return cc
+		}
+	}
+	return ""
 }
 
 func isLANClient(raw, publicIP string) bool {

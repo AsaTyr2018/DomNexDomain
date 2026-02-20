@@ -38,6 +38,13 @@ ui/.env.*
 *.kdbx
 keystore.key
 
+# GeoIP / MMDB data files (local runtime assets, never commit)
+*.mmdb
+*.MMDB
+*.mmdb.*
+IP2LOCATION-LITE-DB1.*
+GeoLite2-*.mmdb
+
 # Logs / local dumps
 *.log
 logs/
