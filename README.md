@@ -4,6 +4,8 @@ Security-first edge control plane for self-hosters and operators who want one ha
 
 DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, API tokens, audit logging, and Web UI/API management in a single process.
 
+<img width="1906" height="814" alt="grafik" src="https://github.com/user-attachments/assets/8b9b1547-dc8d-4b60-a21c-c1f4562cbdc7" />
+
 ## Why DomNexDomain
 
 - Single statically linked Go binary
