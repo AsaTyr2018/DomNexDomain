@@ -509,6 +509,12 @@ func (s *Server) handleTrafficCountries(w http.ResponseWriter, r *http.Request) 
 	}
 	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
 	hostID, _ := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("hostId")), 10, 64)
+	class := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("class")))
+	switch class {
+	case "", "all", "crawler", "human", "unknown":
+	default:
+		class = "all"
+	}
 	if hours <= 0 {
 		hours = 24
 	}
@@ -533,7 +539,7 @@ func (s *Server) handleTrafficCountries(w http.ResponseWriter, r *http.Request) 
 				writeErr(w, http.StatusForbidden, "host domain not assigned to this admin")
 				return
 			}
-			out, err := s.app.GetTrafficCountries(r.Context(), hostID, hours)
+			out, err := s.app.GetTrafficCountries(r.Context(), hostID, hours, class)
 			if err != nil {
 				writeErr(w, http.StatusInternalServerError, err.Error())
 				return
@@ -542,7 +548,7 @@ func (s *Server) handleTrafficCountries(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		for _, h := range allowedHosts {
-			out, err := s.app.GetTrafficCountries(r.Context(), h.ID, hours)
+			out, err := s.app.GetTrafficCountries(r.Context(), h.ID, hours, class)
 			if err != nil {
 				continue
 			}
@@ -551,6 +557,7 @@ func (s *Server) handleTrafficCountries(w http.ResponseWriter, r *http.Request) 
 		merged := app.TrafficCountryOverview{
 			Hours:            hours,
 			GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
+			RequestClass:     class,
 			Countries:        []app.CountryTraffic{},
 			UnknownBreakdown: []app.HostCountryTraffic{},
 		}
@@ -598,7 +605,7 @@ func (s *Server) handleTrafficCountries(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	out, err := s.app.GetTrafficCountries(r.Context(), hostID, hours)
+	out, err := s.app.GetTrafficCountries(r.Context(), hostID, hours, class)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

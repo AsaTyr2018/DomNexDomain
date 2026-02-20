@@ -23,7 +23,7 @@ type TrafficPoint = { bucketStart: string; requests: number; bytesIn: number; by
 type HostTrafficDetails = { hours: number; hostId: number; fqdn: string; requests: number; bytesIn: number; bytesOut: number; blocked: number; uniqueVisitors: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; series: TrafficPoint[] };
 type CountryTraffic = { country: string; requests: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; bytesOut: number };
 type HostCountryTraffic = { hostId: number; fqdn: string; requests: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; bytesOut: number };
-type TrafficCountryOverview = { hours: number; generatedAt: string; hostId?: number; hostFqdn?: string; totalRequests: number; totalBlocked: number; totalBytesOut: number; countries: CountryTraffic[]; unknownBreakdown?: HostCountryTraffic[] };
+type TrafficCountryOverview = { hours: number; generatedAt: string; requestClass?: string; hostId?: number; hostFqdn?: string; totalRequests: number; totalBlocked: number; totalBytesOut: number; countries: CountryTraffic[]; unknownBreakdown?: HostCountryTraffic[] };
 
 type Tab = 'dashboard' | 'metricCenter' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'audit';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
@@ -68,6 +68,7 @@ function App() {
   const [metricCountryOverview, setMetricCountryOverview] = useState<TrafficCountryOverview | null>(null);
   const [metricHostFilter, setMetricHostFilter] = useState('all');
   const [metricHours, setMetricHours] = useState(24);
+  const [metricClass, setMetricClass] = useState<'all' | 'human' | 'crawler' | 'unknown'>('all');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -260,7 +261,7 @@ function App() {
   useEffect(() => {
     if (tab !== 'metricCenter') return;
     void loadMetricCenter();
-  }, [tab, metricHostFilter, metricHours, hosts]);
+  }, [tab, metricHostFilter, metricHours, metricClass, hosts]);
 
   const login = async () => {
     setLoading(true);
@@ -522,7 +523,8 @@ function App() {
   const loadMetricCenter = async () => {
     try {
       const hostIdPart = metricHostFilter !== 'all' ? `&hostId=${encodeURIComponent(metricHostFilter)}` : '';
-      const out = await api<TrafficCountryOverview>(`/api/v1/traffic/countries?hours=${metricHours}${hostIdPart}`);
+      const classPart = `&class=${encodeURIComponent(metricClass)}`;
+      const out = await api<TrafficCountryOverview>(`/api/v1/traffic/countries?hours=${metricHours}${hostIdPart}${classPart}`);
       setMetricCountryOverview(out);
     } catch {
       setMetricCountryOverview(null);
@@ -1187,6 +1189,12 @@ function App() {
                       <option value="6">Last 6h</option>
                       <option value="24">Last 24h</option>
                       <option value="168">Last 7d</option>
+                    </select>
+                    <select value={metricClass} onChange={(e) => setMetricClass(e.target.value as 'all' | 'human' | 'crawler' | 'unknown')}>
+                      <option value="all">All Traffic</option>
+                      <option value="human">Human</option>
+                      <option value="crawler">Crawler</option>
+                      <option value="unknown">Unknown UA</option>
                     </select>
                     <button className="btn" onClick={loadMetricCenter} disabled={loading}>Refresh</button>
                   </div>

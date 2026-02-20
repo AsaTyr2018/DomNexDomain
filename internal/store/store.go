@@ -197,6 +197,24 @@ CREATE TABLE IF NOT EXISTS host_traffic_minute (
   FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS host_traffic_class_minute (
+  host_id INTEGER NOT NULL,
+  fqdn TEXT NOT NULL,
+  country TEXT NOT NULL,
+  class TEXT NOT NULL,
+  bucket_start TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  bytes_in INTEGER NOT NULL DEFAULT 0,
+  bytes_out INTEGER NOT NULL DEFAULT 0,
+  blocked INTEGER NOT NULL DEFAULT 0,
+  status_2xx INTEGER NOT NULL DEFAULT 0,
+  status_3xx INTEGER NOT NULL DEFAULT 0,
+  status_4xx INTEGER NOT NULL DEFAULT 0,
+  status_5xx INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(host_id, country, class, bucket_start),
+  FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS host_visitors_daily (
   host_id INTEGER NOT NULL,
   day TEXT NOT NULL,
@@ -207,6 +225,8 @@ CREATE TABLE IF NOT EXISTS host_visitors_daily (
 
 CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_bucket ON host_traffic_minute(bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_host_bucket ON host_traffic_minute(host_id, bucket_start);
+CREATE INDEX IF NOT EXISTS idx_host_traffic_class_minute_bucket ON host_traffic_class_minute(bucket_start);
+CREATE INDEX IF NOT EXISTS idx_host_traffic_class_minute_host_bucket ON host_traffic_class_minute(host_id, bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_visitors_daily_day ON host_visitors_daily(day);
 `
 	_, err := s.db.ExecContext(ctx, schema)
@@ -838,6 +858,28 @@ ON CONFLICT(host_id, country, bucket_start) DO UPDATE SET
 	return err
 }
 
+func (s *Store) UpsertHostTrafficClassMinute(ctx context.Context, hostID int64, fqdn, country, class, bucketStart string, requests, bytesIn, bytesOut, blocked, status2xx, status3xx, status4xx, status5xx int64) error {
+	class = strings.ToLower(strings.TrimSpace(class))
+	if class == "" {
+		class = "unknown"
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO host_traffic_class_minute(host_id, fqdn, country, class, bucket_start, requests, bytes_in, bytes_out, blocked, status_2xx, status_3xx, status_4xx, status_5xx)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(host_id, country, class, bucket_start) DO UPDATE SET
+  fqdn=excluded.fqdn,
+  requests=host_traffic_class_minute.requests + excluded.requests,
+  bytes_in=host_traffic_class_minute.bytes_in + excluded.bytes_in,
+  bytes_out=host_traffic_class_minute.bytes_out + excluded.bytes_out,
+  blocked=host_traffic_class_minute.blocked + excluded.blocked,
+  status_2xx=host_traffic_class_minute.status_2xx + excluded.status_2xx,
+  status_3xx=host_traffic_class_minute.status_3xx + excluded.status_3xx,
+  status_4xx=host_traffic_class_minute.status_4xx + excluded.status_4xx,
+  status_5xx=host_traffic_class_minute.status_5xx + excluded.status_5xx`,
+		hostID, fqdn, country, class, bucketStart, requests, bytesIn, bytesOut, blocked, status2xx, status3xx, status4xx, status5xx)
+	return err
+}
+
 func (s *Store) UpsertHostVisitorDaily(ctx context.Context, hostID int64, day, ipHash string) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO host_visitors_daily(host_id, day, ip_hash)
@@ -960,32 +1002,69 @@ func (s *Store) CountHostUniqueVisitors(ctx context.Context, hostID int64, since
 	return c, err
 }
 
-func (s *Store) ListTrafficCountries(ctx context.Context, since time.Time, hostID int64) ([]CountryTrafficRow, error) {
+func normalizeTrafficClass(class string) string {
+	c := strings.ToLower(strings.TrimSpace(class))
+	switch c {
+	case "", "all":
+		return "all"
+	case "crawler", "human", "unknown":
+		return c
+	default:
+		return "all"
+	}
+}
+
+func (s *Store) ListTrafficCountries(ctx context.Context, since time.Time, hostID int64, class string) ([]CountryTrafficRow, error) {
 	sinceBucket := since.UTC().Format(time.RFC3339)
+	class = normalizeTrafficClass(class)
 	var (
 		rows *sql.Rows
 		err  error
 	)
 	if hostID > 0 {
-		rows, err = s.db.QueryContext(ctx, `
+		if class == "all" {
+			rows, err = s.db.QueryContext(ctx, `
 SELECT country,
        SUM(requests), SUM(blocked),
        SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
        SUM(bytes_out)
-FROM host_traffic_minute
+FROM host_traffic_class_minute
 WHERE bucket_start>=? AND host_id=?
 GROUP BY country
 ORDER BY SUM(requests) DESC`, sinceBucket, hostID)
-	} else {
-		rows, err = s.db.QueryContext(ctx, `
+		} else {
+			rows, err = s.db.QueryContext(ctx, `
 SELECT country,
        SUM(requests), SUM(blocked),
        SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
        SUM(bytes_out)
-FROM host_traffic_minute
+FROM host_traffic_class_minute
+WHERE bucket_start>=? AND host_id=? AND class=?
+GROUP BY country
+ORDER BY SUM(requests) DESC`, sinceBucket, hostID, class)
+		}
+	} else {
+		if class == "all" {
+			rows, err = s.db.QueryContext(ctx, `
+SELECT country,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_class_minute
 WHERE bucket_start>=?
 GROUP BY country
 ORDER BY SUM(requests) DESC`, sinceBucket)
+		} else {
+			rows, err = s.db.QueryContext(ctx, `
+SELECT country,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_class_minute
+WHERE bucket_start>=? AND class=?
+GROUP BY country
+ORDER BY SUM(requests) DESC`, sinceBucket, class)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -999,12 +1078,55 @@ ORDER BY SUM(requests) DESC`, sinceBucket)
 		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 && class == "all" {
+		// Backward-compatible fallback for historical data before class-based tracking existed.
+		if hostID > 0 {
+			rows, err = s.db.QueryContext(ctx, `
+SELECT country,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_minute
+WHERE bucket_start>=? AND host_id=?
+GROUP BY country
+ORDER BY SUM(requests) DESC`, sinceBucket, hostID)
+		} else {
+			rows, err = s.db.QueryContext(ctx, `
+SELECT country,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_minute
+WHERE bucket_start>=?
+GROUP BY country
+ORDER BY SUM(requests) DESC`, sinceBucket)
+		}
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out = []CountryTrafficRow{}
+		for rows.Next() {
+			var r CountryTrafficRow
+			if err := rows.Scan(&r.Country, &r.Requests, &r.Blocked, &r.Status2xx, &r.Status3xx, &r.Status4xx, &r.Status5xx, &r.BytesOut); err != nil {
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
-func (s *Store) ListHostCountryTraffic(ctx context.Context, since time.Time, country string, hostID int64) ([]HostCountryTrafficRow, error) {
+func (s *Store) ListHostCountryTraffic(ctx context.Context, since time.Time, country string, hostID int64, class string) ([]HostCountryTrafficRow, error) {
 	sinceBucket := since.UTC().Format(time.RFC3339)
 	country = strings.ToUpper(strings.TrimSpace(country))
+	class = normalizeTrafficClass(class)
 	if country == "" {
 		return nil, fmt.Errorf("country is required")
 	}
@@ -1013,25 +1135,49 @@ func (s *Store) ListHostCountryTraffic(ctx context.Context, since time.Time, cou
 		err  error
 	)
 	if hostID > 0 {
-		rows, err = s.db.QueryContext(ctx, `
+		if class == "all" {
+			rows, err = s.db.QueryContext(ctx, `
 SELECT host_id, fqdn,
        SUM(requests), SUM(blocked),
        SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
        SUM(bytes_out)
-FROM host_traffic_minute
+FROM host_traffic_class_minute
 WHERE bucket_start>=? AND country=? AND host_id=?
 GROUP BY host_id, fqdn
 ORDER BY SUM(requests) DESC`, sinceBucket, country, hostID)
-	} else {
-		rows, err = s.db.QueryContext(ctx, `
+		} else {
+			rows, err = s.db.QueryContext(ctx, `
 SELECT host_id, fqdn,
        SUM(requests), SUM(blocked),
        SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
        SUM(bytes_out)
-FROM host_traffic_minute
+FROM host_traffic_class_minute
+WHERE bucket_start>=? AND country=? AND host_id=? AND class=?
+GROUP BY host_id, fqdn
+ORDER BY SUM(requests) DESC`, sinceBucket, country, hostID, class)
+		}
+	} else {
+		if class == "all" {
+			rows, err = s.db.QueryContext(ctx, `
+SELECT host_id, fqdn,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_class_minute
 WHERE bucket_start>=? AND country=?
 GROUP BY host_id, fqdn
 ORDER BY SUM(requests) DESC`, sinceBucket, country)
+		} else {
+			rows, err = s.db.QueryContext(ctx, `
+SELECT host_id, fqdn,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_class_minute
+WHERE bucket_start>=? AND country=? AND class=?
+GROUP BY host_id, fqdn
+ORDER BY SUM(requests) DESC`, sinceBucket, country, class)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -1045,7 +1191,48 @@ ORDER BY SUM(requests) DESC`, sinceBucket, country)
 		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 && class == "all" {
+		if hostID > 0 {
+			rows, err = s.db.QueryContext(ctx, `
+SELECT host_id, fqdn,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_minute
+WHERE bucket_start>=? AND country=? AND host_id=?
+GROUP BY host_id, fqdn
+ORDER BY SUM(requests) DESC`, sinceBucket, country, hostID)
+		} else {
+			rows, err = s.db.QueryContext(ctx, `
+SELECT host_id, fqdn,
+       SUM(requests), SUM(blocked),
+       SUM(status_2xx), SUM(status_3xx), SUM(status_4xx), SUM(status_5xx),
+       SUM(bytes_out)
+FROM host_traffic_minute
+WHERE bucket_start>=? AND country=?
+GROUP BY host_id, fqdn
+ORDER BY SUM(requests) DESC`, sinceBucket, country)
+		}
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out = []HostCountryTrafficRow{}
+		for rows.Next() {
+			var r HostCountryTrafficRow
+			if err := rows.Scan(&r.HostID, &r.FQDN, &r.Requests, &r.Blocked, &r.Status2xx, &r.Status3xx, &r.Status4xx, &r.Status5xx, &r.BytesOut); err != nil {
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func encodeBackends(in []model.HABackend) (string, error) {

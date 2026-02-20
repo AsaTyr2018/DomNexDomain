@@ -157,6 +157,7 @@ func (e *Engine) Handler() http.Handler {
 					HostID:    selectedRoute.host.ID,
 					FQDN:      selectedRoute.host.FQDN,
 					Country:   country,
+					UserAgent: r.UserAgent(),
 					ClientIP:  clientIP,
 					Status:    sw.StatusCode(),
 					BytesIn:   contentIn,

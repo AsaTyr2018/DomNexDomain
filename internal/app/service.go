@@ -205,6 +205,7 @@ type CountryTraffic struct {
 type TrafficCountryOverview struct {
 	Hours            int                  `json:"hours"`
 	GeneratedAt      string               `json:"generatedAt"`
+	RequestClass     string               `json:"requestClass"`
 	HostID           int64                `json:"hostId,omitempty"`
 	HostFQDN         string               `json:"hostFqdn,omitempty"`
 	TotalRequests    int64                `json:"totalRequests"`
@@ -224,6 +225,18 @@ type HostCountryTraffic struct {
 	Status4xx int64  `json:"status4xx"`
 	Status5xx int64  `json:"status5xx"`
 	BytesOut  int64  `json:"bytesOut"`
+}
+
+func normalizeRequestClass(class string) string {
+	c := strings.ToLower(strings.TrimSpace(class))
+	switch c {
+	case "", "all":
+		return "all"
+	case "crawler", "human", "unknown":
+		return c
+	default:
+		return "all"
+	}
 }
 
 func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dns.Provider, log *logx.Logger) *Service {
@@ -707,12 +720,14 @@ func (s *Service) GetHostTraffic(ctx context.Context, hostID int64, hours int) (
 	return out, nil
 }
 
-func (s *Service) GetTrafficCountries(ctx context.Context, hostID int64, hours int) (TrafficCountryOverview, error) {
+func (s *Service) GetTrafficCountries(ctx context.Context, hostID int64, hours int, class string) (TrafficCountryOverview, error) {
 	hours = normalizeTrafficHours(hours)
+	class = normalizeRequestClass(class)
 	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
 	out := TrafficCountryOverview{
 		Hours:            hours,
 		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
+		RequestClass:     class,
 		Countries:        []CountryTraffic{},
 		UnknownBreakdown: []HostCountryTraffic{},
 	}
@@ -724,7 +739,7 @@ func (s *Service) GetTrafficCountries(ctx context.Context, hostID int64, hours i
 		out.HostID = h.ID
 		out.HostFQDN = h.FQDN
 	}
-	rows, err := s.store.ListTrafficCountries(ctx, since, hostID)
+	rows, err := s.store.ListTrafficCountries(ctx, since, hostID, class)
 	if err != nil {
 		return out, err
 	}
@@ -747,7 +762,7 @@ func (s *Service) GetTrafficCountries(ctx context.Context, hostID int64, hours i
 		out.TotalBlocked += item.Blocked
 		out.TotalBytesOut += item.BytesOut
 	}
-	zzRows, err := s.store.ListHostCountryTraffic(ctx, since, "ZZ", hostID)
+	zzRows, err := s.store.ListHostCountryTraffic(ctx, since, "ZZ", hostID, class)
 	if err == nil {
 		for _, r := range zzRows {
 			out.UnknownBreakdown = append(out.UnknownBreakdown, HostCountryTraffic{
