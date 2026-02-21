@@ -6,6 +6,12 @@
 
 DomNexDomain combines reverse proxy, TLS automation, DNS automation, access control, observability, and security policy in one Linux-native service.
 
+## Connectivity Prerequisite
+
+DomNexDomain is the gatekeeper, not the connectivity provider.
+
+It assumes your edge is reachable from the internet on the intended entry points. Provider constraints (CGNAT, IPv6-only edge gaps, tunnel strategy) are currently out of product scope and tracked separately in roadmap guidance (`P11`).
+
 ## Why It Stands Out
 
 - One statically linked Go binary
@@ -15,6 +21,15 @@ DomNexDomain combines reverse proxy, TLS automation, DNS automation, access cont
 - Built-in Threat Intel, WAF baseline, and audit visibility
 - HA routing and SSH Bastion in the same platform
 - SQLite persistence with encrypted secrets
+
+## Operating Profiles
+
+Two official operations profiles help teams ramp from simple to hardened setups:
+
+- `Quickstart Gate` (default): TLS, admin CIDR gate, baseline threat controls, single upstream, logs enabled.
+- `Warden Gate` (hardening): Threat Intel auto mode, geo policy, HA routing, external SIEM, stricter admin/API posture.
+
+Details and rollout guidance are documented in the wiki.
 
 ## Built For
 
