@@ -119,3 +119,142 @@ type SSHBastionKeyAuth struct {
 	Key    SSHBastionKey
 	Routes []SSHBastionRoute
 }
+
+type ThreatIntelConfig struct {
+	Enabled   bool   `json:"enabled"`
+	Mode      string `json:"mode"`
+	SyncHours int    `json:"syncHours"`
+}
+
+type ThreatIntelFeed struct {
+	ID         int64     `json:"id"`
+	Name       string    `json:"name"`
+	URL        string    `json:"url"`
+	Enabled    bool      `json:"enabled"`
+	IsDefault  bool      `json:"isDefault"`
+	EntryCount int64     `json:"entryCount"`
+	LastSyncAt time.Time `json:"lastSyncAt"`
+	LastError  string    `json:"lastError"`
+	LastHash   string    `json:"lastHash"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+type ThreatIntelSnapshot struct {
+	Enabled   bool
+	Mode      string
+	Allowlist map[string]bool
+	FeedByIP  map[string][]string
+}
+
+type ThreatIntelMatchEvent struct {
+	IP          string
+	Feed        string
+	Host        string
+	Path        string
+	Country     string
+	Mode        string
+	Decision    string
+	TraceID     string
+	SourceScope string
+	XPDelta     int
+	XPAfter     int
+	LevelAfter  int
+	TierAfter   string
+}
+
+type ThreatIntelMatch struct {
+	ID          int64     `json:"id"`
+	IP          string    `json:"ip"`
+	Feed        string    `json:"feed"`
+	Host        string    `json:"host"`
+	Path        string    `json:"path"`
+	TargetCount int64     `json:"targetCount"`
+	Country     string    `json:"country"`
+	Mode        string    `json:"mode"`
+	Decision    string    `json:"decision"`
+	Hits        int64     `json:"hits"`
+	FirstSeenAt time.Time `json:"firstSeenAt"`
+	LastSeenAt  time.Time `json:"lastSeenAt"`
+	LastTraceID string    `json:"lastTraceId"`
+	SourceScope string    `json:"sourceScope"`
+	XP          int       `json:"xp"`
+	Level       int       `json:"level"`
+	Tier        string    `json:"tier"`
+	RiskState   string    `json:"riskState"`
+}
+
+type ThreatIntelTarget struct {
+	Host       string    `json:"host"`
+	Path       string    `json:"path"`
+	Feed       string    `json:"feed"`
+	Decision   string    `json:"decision"`
+	Hits       int64     `json:"hits"`
+	LastSeenAt time.Time `json:"lastSeenAt"`
+}
+
+type ThreatIntelOffender struct {
+	IP            string    `json:"ip"`
+	TotalHits     int64     `json:"totalHits"`
+	DistinctFeeds int64     `json:"distinctFeeds"`
+	DistinctHosts int64     `json:"distinctHosts"`
+	Decisions     string    `json:"decisions"`
+	LastSeenAt    time.Time `json:"lastSeenAt"`
+	Blocked       bool      `json:"blocked"`
+	Allowlisted   bool      `json:"allowlisted"`
+	XP            int       `json:"xp"`
+	Level         int       `json:"level"`
+	Tier          string    `json:"tier"`
+	RiskState     string    `json:"riskState"`
+}
+
+type ThreatIntelBlocked struct {
+	IP            string    `json:"ip"`
+	Reason        string    `json:"reason"`
+	History       string    `json:"history"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+	TotalHits     int64     `json:"totalHits"`
+	DistinctFeeds int64     `json:"distinctFeeds"`
+	DistinctHosts int64     `json:"distinctHosts"`
+	LastSeenAt    time.Time `json:"lastSeenAt"`
+	XP            int       `json:"xp"`
+	Level         int       `json:"level"`
+	Tier          string    `json:"tier"`
+	RiskState     string    `json:"riskState"`
+}
+
+type ThreatIntelIPState struct {
+	IP             string
+	XP             int
+	Level          int
+	RiskState      string
+	BanUntil       time.Time
+	PermBlocked    bool
+	TempBlockCount int
+	LastSeenAt     time.Time
+	TopSignal      string
+	SignalCounts   map[string]int
+}
+
+type ThreatIntelEventInput struct {
+	IP          string
+	Host        string
+	Path        string
+	Country     string
+	SourceScope string
+	TraceID     string
+	Signals     []string
+	Mode        string
+}
+
+type ThreatIntelEventResult struct {
+	Decision  string
+	Blocked   bool
+	HardBlock bool
+	BanUntil  time.Time
+	XPDelta   int
+	XPAfter   int
+	Level     int
+	Tier      string
+	RiskState string
+}

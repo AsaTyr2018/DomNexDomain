@@ -190,6 +190,7 @@ func main() {
 	go acmeManager.StartRefresher(ctx, 15*time.Minute)
 	go pruneSessions(ctx, st, log)
 	go tr.Start(ctx)
+	go appSvc.StartThreatIntelSync(ctx)
 
 	if cfg.SSHBastionOn {
 		sshBastion := bastion.New(cfg.SSHBastionAddr, cfg.SSHBastionKey, appSvc, log)

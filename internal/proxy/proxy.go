@@ -31,9 +31,14 @@ import (
 
 type HostSource interface {
 	ListHosts(ctx context.Context) ([]model.Host, error)
+	ListDomains(ctx context.Context) ([]model.Domain, error)
 	PublicIPv4(ctx context.Context) string
 	AddAuditEvent(ctx context.Context, e model.AuditEvent) error
 	GetStyleSettings(ctx context.Context) (string, string, error)
+	GetThreatIntelSnapshot(ctx context.Context) (model.ThreatIntelSnapshot, error)
+	ApplyThreatIntelEvent(ctx context.Context, in model.ThreatIntelEventInput) (model.ThreatIntelEventResult, error)
+	IsIPBlocked(ctx context.Context, ip string) (bool, error)
+	UpsertBlockedIP(ctx context.Context, ip, reason string) error
 }
 
 type Engine struct {
@@ -45,11 +50,14 @@ type Engine struct {
 	publicIP string
 	mu       sync.RWMutex
 	routes   map[string]*routeEntry
+	managed  map[string]bool
 	auth     map[string]authSession
 	theme    edgeTheme
 	wafMu    sync.Mutex
 	wafCount map[string]wafCounter
 	wafBlock map[string]time.Time
+	wafWhy   map[string]string
+	tiSnap   model.ThreatIntelSnapshot
 }
 
 type wafCounter struct {
@@ -79,10 +87,17 @@ func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.
 		geo:      geoip.New(1 * time.Hour),
 		tr:       tr,
 		routes:   map[string]*routeEntry{},
+		managed:  map[string]bool{},
 		auth:     map[string]authSession{},
 		theme:    monolithEdgeTheme(),
 		wafCount: map[string]wafCounter{},
 		wafBlock: map[string]time.Time{},
+		wafWhy:   map[string]string{},
+		tiSnap: model.ThreatIntelSnapshot{
+			Mode:      "monitor_only",
+			Allowlist: map[string]bool{},
+			FeedByIP:  map[string][]string{},
+		},
 	}
 }
 
@@ -211,10 +226,25 @@ func (e *Engine) Refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	domains, err := e.source.ListDomains(ctx)
+	if err != nil {
+		return err
+	}
 	publicIP := strings.TrimSpace(e.source.PublicIPv4(ctx))
 	styleProfile, styleCustom, _ := e.source.GetStyleSettings(ctx)
+	tiSnap, _ := e.source.GetThreatIntelSnapshot(ctx)
 	theme := parseEdgeTheme(styleProfile, styleCustom)
 	routes := map[string]*routeEntry{}
+	managed := map[string]bool{}
+	for _, d := range domains {
+		if strings.EqualFold(strings.TrimSpace(d.Status), "inactive") {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(d.Name))
+		if name != "" {
+			managed[name] = true
+		}
+	}
 	for _, h := range hosts {
 		if h.State != "active" && h.State != "disabled" && h.State != "maintenance" {
 			continue
@@ -254,10 +284,12 @@ func (e *Engine) Refresh(ctx context.Context) error {
 	}
 	e.mu.Lock()
 	e.routes = routes
+	e.managed = managed
 	e.publicIP = publicIP
 	e.theme = theme
+	e.tiSnap = tiSnap
 	e.mu.Unlock()
-	e.log.Info("proxy routes refreshed", map[string]any{"count": len(routes), "publicIP": publicIP})
+	e.log.Info("proxy routes refreshed", map[string]any{"count": len(routes), "managedApex": len(managed), "publicIP": publicIP})
 	return nil
 }
 
@@ -315,9 +347,78 @@ func (e *Engine) Handler() http.Handler {
 		e.mu.RLock()
 		publicIP := e.publicIP
 		route, ok := e.routes[host]
+		managedApex := e.managed[host]
+		tiSnap := e.tiSnap
 		e.mu.RUnlock()
 		selectedRoute = route
-		if isBlocked, until := e.wafIsBlocked(clientIP, publicIP); isBlocked {
+		if isBlockedIP, _ := e.source.IsIPBlocked(r.Context(), clientIP); isBlockedIP {
+			blocked = true
+			traceID, _ := randomHex(8)
+			e.auditProxyEvent(r.Context(), "proxy.block.hard_drop", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";reason=blocked_ip")
+			dropConnection(sw)
+			return
+		}
+		matchFeeds := append([]string{}, tiSnap.FeedByIP[clientIP]...)
+		behaviorFeeds := detectBehaviorThreatSignals(host, ok, r.URL.Path, r.UserAgent())
+		if tiSnap.Allowlist[clientIP] {
+			matchFeeds = nil
+			behaviorFeeds = nil
+		}
+		allFeeds := uniqueThreatFeeds(append(matchFeeds, behaviorFeeds...))
+		hasThreatSignal := len(allFeeds) > 0 && !isLANClient(clientIP, publicIP)
+		threatIntelRecognized := hasThreatSignal
+		if hasThreatSignal {
+			if country == "" {
+				country = countryFromHeaders(r)
+				if country == "" {
+					country = e.geo.CountryCode(r.Context(), clientIP)
+				}
+			}
+			traceID, _ := randomHex(8)
+			scope := requestScope(clientIP, publicIP)
+			mode := strings.ToLower(strings.TrimSpace(tiSnap.Mode))
+			if mode == "" {
+				mode = "monitor_only"
+			}
+			if !tiSnap.Enabled {
+				mode = "monitor_only"
+			}
+			recordPath := normalizeThreatPath(r.URL.Path)
+			out, err := e.source.ApplyThreatIntelEvent(r.Context(), model.ThreatIntelEventInput{
+				IP:          clientIP,
+				Host:        host,
+				Path:        recordPath,
+				Country:     country,
+				SourceScope: scope,
+				TraceID:     traceID,
+				Signals:     allFeeds,
+				Mode:        mode,
+			})
+			if err != nil {
+				e.log.Warn("threat intel apply failed", map[string]any{"ip": clientIP, "err": err.Error()})
+			}
+			if out.Blocked {
+				if out.HardBlock {
+					blocked = true
+					e.auditProxyEvent(r.Context(), "proxy.block.hard_drop", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";reason=threat_intel_hardblock")
+					dropConnection(sw)
+					return
+				}
+				e.renderSmartErrorPage(sw, r, smartErrorPage{
+					HTTPStatus:   http.StatusTooManyRequests,
+					Title:        "Temporarily Blocked",
+					Description:  "Threat intelligence policy triggered temporary protection for this source.",
+					Code:         "DNX-TI-429",
+					FailurePoint: "threat-intel: xp/level soft block",
+					Host:         host,
+					TraceID:      traceID,
+					Theme:        "warn",
+					Scope:        scope,
+				})
+				return
+			}
+		}
+		if isBlocked, until, _ := e.wafIsBlocked(clientIP, publicIP); isBlocked {
 			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.waf.temp_block.hit", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";until="+until.UTC().Format(time.RFC3339))
 			e.renderSmartErrorPage(sw, r, smartErrorPage{
@@ -334,6 +435,25 @@ func (e *Engine) Handler() http.Handler {
 			return
 		}
 		if !ok {
+			if managedApex {
+				traceID, _ := randomHex(8)
+				e.renderManagedDomainPage(host, traceID, sw, r)
+				return
+			}
+			if threatIntelRecognized {
+				traceID, _ := randomHex(8)
+				e.renderSmartErrorPage(sw, r, smartErrorPage{
+					HTTPStatus:   http.StatusNotFound,
+					Title:        "Nothing here yet",
+					Description:  "This subdomain is not active yet. Check back later, something might appear soon.",
+					Code:         "DNX-ROUTE-404",
+					FailurePoint: "routing: host not configured (yet)",
+					Host:         host,
+					TraceID:      traceID,
+					Theme:        "ok",
+				})
+				return
+			}
 			triggered, until, hits := e.wafTrackUnknownHost(clientIP, publicIP)
 			traceID, _ := randomHex(8)
 			if triggered {
@@ -572,10 +692,75 @@ func normalizeHostHeader(host string) string {
 	return strings.ToLower(strings.TrimSpace(host))
 }
 
+func uniqueThreatFeeds(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, v := range in {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+func normalizeThreatPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "/"
+	}
+	if idx := strings.Index(p, "?"); idx >= 0 {
+		p = p[:idx]
+	}
+	if len(p) > 96 {
+		p = p[:96]
+	}
+	return p
+}
+
+func detectBehaviorThreatSignals(host string, routeKnown bool, path, ua string) []string {
+	signals := []string{}
+	lp := strings.ToLower(normalizeThreatPath(path))
+	lua := strings.ToLower(strings.TrimSpace(ua))
+	if !routeKnown {
+		signals = append(signals, "behavior.unknown_host")
+	}
+	pathNeedles := []string{
+		"/.env", "/wp-admin", "/wp-login", "/xmlrpc.php", "/vendor/phpunit",
+		"/boaform/admin", "/actuator", "/cgi-bin", "/.git", "/etc/passwd",
+		"/api/v1/namespaces", "/hudson", "/jenkins", "/manager/html",
+	}
+	for _, n := range pathNeedles {
+		if strings.Contains(lp, n) {
+			signals = append(signals, "behavior.path_scan")
+			break
+		}
+	}
+	uaNeedles := []string{
+		"zgrab", "masscan", "nmap", "sqlmap", "nikto", "nuclei", "dirbuster", "gobuster", "curl/",
+	}
+	for _, n := range uaNeedles {
+		if strings.Contains(lua, n) {
+			signals = append(signals, "behavior.ua_scanner")
+			break
+		}
+	}
+	if strings.TrimSpace(host) == "" {
+		signals = append(signals, "behavior.invalid_host")
+	}
+	return uniqueThreatFeeds(signals)
+}
+
 func (e *Engine) wafPrune(now time.Time) {
 	for ip, until := range e.wafBlock {
 		if !until.After(now) {
 			delete(e.wafBlock, ip)
+			delete(e.wafWhy, ip)
 		}
 	}
 	staleCutoff := now.Add(-(wafUnknownWindow + wafTempBlockTTL))
@@ -586,9 +771,9 @@ func (e *Engine) wafPrune(now time.Time) {
 	}
 }
 
-func (e *Engine) wafIsBlocked(clientIP, publicIP string) (bool, time.Time) {
+func (e *Engine) wafIsBlocked(clientIP, publicIP string) (bool, time.Time, string) {
 	if clientIP == "" || isLANClient(clientIP, publicIP) {
-		return false, time.Time{}
+		return false, time.Time{}, ""
 	}
 	now := time.Now().UTC()
 	e.wafMu.Lock()
@@ -596,9 +781,9 @@ func (e *Engine) wafIsBlocked(clientIP, publicIP string) (bool, time.Time) {
 	e.wafPrune(now)
 	until, ok := e.wafBlock[clientIP]
 	if !ok || !until.After(now) {
-		return false, time.Time{}
+		return false, time.Time{}, ""
 	}
-	return true, until
+	return true, until, strings.TrimSpace(e.wafWhy[clientIP])
 }
 
 func (e *Engine) wafTrackUnknownHost(clientIP, publicIP string) (bool, time.Time, int) {
@@ -624,6 +809,7 @@ func (e *Engine) wafTrackUnknownHost(clientIP, publicIP string) (bool, time.Time
 	}
 	until := now.Add(wafTempBlockTTL)
 	e.wafBlock[clientIP] = until
+	e.wafWhy[clientIP] = "unknown_host_flood"
 	delete(e.wafCount, clientIP)
 	return true, until, c.count
 }
@@ -633,6 +819,8 @@ type statusWriter struct {
 	status int
 	bytes  int64
 }
+
+const droppedStatusCode = 444
 
 func newStatusWriter(w http.ResponseWriter) *statusWriter {
 	return &statusWriter{ResponseWriter: w}
@@ -701,6 +889,20 @@ func (w *statusWriter) Push(target string, opts *http.PushOptions) error {
 
 func (w *statusWriter) BytesWritten() int64 {
 	return w.bytes
+}
+
+func dropConnection(w *statusWriter) {
+	if w != nil {
+		w.status = droppedStatusCode
+		w.Header().Set("Connection", "close")
+		w.Header().Set("X-DomNex-Edge-Error", "1")
+	}
+	conn, _, err := w.Hijack()
+	if err == nil && conn != nil {
+		_ = conn.Close()
+		return
+	}
+	panic(http.ErrAbortHandler)
 }
 
 func newReverseProxy(e *Engine, u *url.URL, h model.Host, upstreamRef string) *httputil.ReverseProxy {
@@ -1057,6 +1259,25 @@ func (e *Engine) renderHostMaintenancePage(h model.Host, traceID string, w http.
 		TraceID:      traceID,
 		Theme:        "warn",
 	})
+}
+
+func (e *Engine) renderManagedDomainPage(host, traceID string, w http.ResponseWriter, r *http.Request) {
+	repo := "https://github.com/AsaTyr2018/DomNexDomain"
+	discord := "https://discord.gg/GnAUmXhfeG"
+	desc := "This apex domain is managed by DomNexDomain."
+	htmlBody := `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>` + html.EscapeString(host) + `</title><style>
+:root{--bg:#0b0c12;--surface:#13141c;--border:#2a2d3a;--text:#f3f4f6;--dim:#9ca3af;--accent:#6366f1}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,sans-serif;background:radial-gradient(900px 320px at 85% -20%,rgba(99,102,241,.18),transparent 56%),radial-gradient(900px 300px at 10% -20%,rgba(14,165,233,.12),transparent 56%),var(--bg);color:var(--text)}
+.wrap{min-height:100vh;display:grid;place-items:center;padding:1rem}.card{width:min(820px,100%);background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.2rem;text-align:center}
+.brand{display:grid;place-items:center;margin-bottom:.6rem}.brand img{width:100%;max-width:280px;height:auto;display:block;border-radius:16px;filter:drop-shadow(0 3px 10px rgba(0,0,0,.28))}
+h1{margin:.35rem 0 .2rem;font-size:1.45rem}.lead{margin:.35rem 0;color:var(--dim)}.lead strong{color:var(--text)}.k{display:grid;gap:.45rem;margin:.9rem 0;text-align:left}.k div{border:1px solid var(--border);border-radius:10px;padding:.55rem .65rem;background:#10121a;color:var(--dim)}
+.pill-row{display:flex;gap:.45rem;justify-content:center;flex-wrap:wrap;margin:.7rem 0}.pill{border:1px solid var(--border);border-radius:999px;padding:.22rem .55rem;color:var(--dim);background:#10121a;font-size:.82rem}
+.cta-row{display:flex;gap:.6rem;justify-content:center;flex-wrap:wrap;margin-top:.95rem}.cta{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;padding:.6rem .9rem;border-radius:10px}.cta.alt{background:#1f2937}.trace{margin-top:.7rem;color:var(--dim);font-size:.8rem}
+</style></head><body><main class="wrap"><section class="card"><div class="brand"><img src="` + edgeLogoPath + `" alt="DomNexDomain"></div><h1>Managed by DomNexDomain</h1><p class="lead">` + html.EscapeString(desc) + `</p><p class="lead">Domain: <strong>` + html.EscapeString(host) + `</strong></p><div class="pill-row"><span class="pill">Edge Proxy</span><span class="pill">TLS Automation</span><span class="pill">DNS Control</span><span class="pill">Threat Defense</span><span class="pill">HA Routing</span></div><div class="k"><div><strong>Built for secure public self-hosting:</strong> expose your services with HTTPS, policy controls, and production-style observability.</div><div><strong>Operations in one place:</strong> domain onboarding, subdomain routing, cert lifecycle, logs, metrics, and role-based access.</div><div><strong>Deployment that stays simple:</strong> one Linux binary, systemd-ready runtime, and no Node.js requirement in production.</div><div><strong>Enterprise mindset for homelabs and SMEs:</strong> defense-first defaults, guided workflows, and transparent traceability for every edge response.</div></div><div class="cta-row"><a class="cta" href="` + html.EscapeString(repo) + `" target="_blank" rel="noopener noreferrer">Explore on GitHub</a><a class="cta alt" href="` + html.EscapeString(discord) + `" target="_blank" rel="noopener noreferrer">Join Discord Support</a></div><div class="trace">Trace ID: ` + html.EscapeString(traceID) + `</div></section></main></body></html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-DomNex-Edge-Error", "1")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, htmlBody)
 }
 
 func randomHex(n int) (string, error) {

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -14,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +23,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/domnexdomain/domnexdomain/internal/config"
@@ -40,9 +43,27 @@ type Service struct {
 	log      *logx.Logger
 	publicIP string
 	backoff  map[int64]time.Time
+	tiMu     sync.RWMutex
+	tiSnap   model.ThreatIntelSnapshot
+	tiWinMu  sync.Mutex
+	tiWin    map[string]tiWindow
+}
+
+type tiWindow struct {
+	start      time.Time
+	perSignal  map[string]int
+	categories map[string]bool
 }
 
 const settingPublicIPv4 = "network.public_ipv4"
+const defaultThreatIntelFeedURL = "https://lists.blocklist.de/lists/all.txt"
+
+const (
+	tiMonitorMaxLevel = 2
+	tiSoftMinLevel    = 3
+	tiSoftMaxLevel    = 5
+	tiHardLevel       = 6
+)
 
 type RuntimeSettings struct {
 	Domain       string `json:"domain"`
@@ -242,6 +263,27 @@ type SSHBastionKeyCreateResult struct {
 	PPKError         string              `json:"ppkError,omitempty"`
 }
 
+type ThreatIntelMatchesPage struct {
+	Items    []model.ThreatIntelMatch `json:"items"`
+	Total    int64                    `json:"total"`
+	Page     int                      `json:"page"`
+	PageSize int                      `json:"pageSize"`
+}
+
+type ThreatIntelOffendersPage struct {
+	Items    []model.ThreatIntelOffender `json:"items"`
+	Total    int64                       `json:"total"`
+	Page     int                         `json:"page"`
+	PageSize int                         `json:"pageSize"`
+}
+
+type ThreatIntelBlockedPage struct {
+	Items    []model.ThreatIntelBlocked `json:"items"`
+	Total    int64                      `json:"total"`
+	Page     int                        `json:"page"`
+	PageSize int                        `json:"pageSize"`
+}
+
 func normalizeRequestClass(class string) string {
 	c := strings.ToLower(strings.TrimSpace(class))
 	switch c {
@@ -255,12 +297,31 @@ func normalizeRequestClass(class string) string {
 }
 
 func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dns.Provider, log *logx.Logger) *Service {
-	return &Service{cfg: cfg, store: st, keystore: ks, dns: dnsProvider, log: log, backoff: map[int64]time.Time{}}
+	return &Service{
+		cfg:      cfg,
+		store:    st,
+		keystore: ks,
+		dns:      dnsProvider,
+		log:      log,
+		backoff:  map[int64]time.Time{},
+		tiSnap: model.ThreatIntelSnapshot{
+			Mode:      "monitor_only",
+			Allowlist: map[string]bool{},
+			FeedByIP:  map[string][]string{},
+		},
+		tiWin: map[string]tiWindow{},
+	}
 }
 
 func (s *Service) Store() *store.Store { return s.store }
 
 func (s *Service) Bootstrap(ctx context.Context, bootstrapUser, bootstrapPass string) error {
+	if err := s.store.EnsureThreatIntelDefaultFeed(ctx, defaultThreatIntelFeedURL); err != nil {
+		s.log.Warn("threat intel default feed setup failed", map[string]any{"err": err.Error()})
+	}
+	if _, err := s.GetThreatIntelSnapshot(ctx); err != nil {
+		s.log.Warn("threat intel snapshot init failed", map[string]any{"err": err.Error()})
+	}
 	hash, err := crypto.HashPassword(bootstrapPass, crypto.DefaultArgonConfig())
 	if err != nil {
 		return err
@@ -312,10 +373,29 @@ func (s *Service) ListFQDNs(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(hosts))
+	domains, err := s.store.ListDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(hosts)+len(domains))
+	seen := map[string]bool{}
+	for _, d := range domains {
+		if strings.EqualFold(strings.TrimSpace(d.Status), "inactive") {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(d.Name))
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
 	for _, h := range hosts {
 		if h.State == "active" || h.State == "cert_pending" || h.State == "maintenance" || h.State == "disabled" {
-			out = append(out, h.FQDN)
+			fqdn := strings.ToLower(strings.TrimSpace(h.FQDN))
+			if fqdn != "" && !seen[fqdn] {
+				seen[fqdn] = true
+				out = append(out, fqdn)
+			}
 		}
 	}
 	return out, nil
@@ -2164,4 +2244,628 @@ func (s *Service) ChangeOwnPassword(ctx context.Context, userID int64, currentPa
 		return err
 	}
 	return s.store.SetUserPasswordHashByID(ctx, userID, newHash)
+}
+
+func normalizeThreatIntelMode(mode string) string {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case "monitor_only", "auto_mode":
+		return m
+	case "log_only":
+		return "monitor_only"
+	case "hard_check", "soft_block", "hard_block":
+		return "auto_mode"
+	default:
+		return "monitor_only"
+	}
+}
+
+func (s *Service) GetThreatIntelConfig(ctx context.Context) (model.ThreatIntelConfig, error) {
+	return s.store.GetThreatIntelConfig(ctx)
+}
+
+func (s *Service) SetThreatIntelConfig(ctx context.Context, cfg model.ThreatIntelConfig) error {
+	cfg.Mode = normalizeThreatIntelMode(cfg.Mode)
+	if err := s.store.SetThreatIntelConfig(ctx, cfg); err != nil {
+		return err
+	}
+	if cfg.Enabled && cfg.Mode == "auto_mode" {
+		if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, tiHardLevel); err != nil {
+			s.log.Warn("threat intel hard-block reconcile failed", map[string]any{"err": err.Error()})
+		}
+	}
+	_, err := s.RefreshThreatIntelSnapshot(ctx)
+	return err
+}
+
+func (s *Service) ListThreatIntelFeeds(ctx context.Context) ([]model.ThreatIntelFeed, error) {
+	return s.store.ListThreatIntelFeeds(ctx)
+}
+
+func (s *Service) UpsertThreatIntelFeed(ctx context.Context, in model.ThreatIntelFeed) (model.ThreatIntelFeed, error) {
+	if in.ID == 0 && strings.TrimSpace(in.URL) == defaultThreatIntelFeedURL && strings.TrimSpace(in.Name) == "" {
+		in.Name = "blocklist.de all"
+	}
+	f, err := s.store.UpsertThreatIntelFeed(ctx, in)
+	if err != nil {
+		return model.ThreatIntelFeed{}, err
+	}
+	_, _ = s.RefreshThreatIntelSnapshot(ctx)
+	return f, nil
+}
+
+func (s *Service) DeleteThreatIntelFeed(ctx context.Context, id int64) error {
+	if err := s.store.DeleteThreatIntelFeed(ctx, id); err != nil {
+		return err
+	}
+	_, _ = s.RefreshThreatIntelSnapshot(ctx)
+	return nil
+}
+
+func (s *Service) SyncThreatIntelFeeds(ctx context.Context) (map[string]any, error) {
+	feeds, err := s.store.ListThreatIntelFeeds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 25 * time.Second}
+	summary := map[string]any{
+		"feeds":       len(feeds),
+		"synced":      0,
+		"errors":      0,
+		"totalIPs":    0,
+		"generatedAt": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	synced := 0
+	errs := 0
+	totalIPs := 0
+	for _, f := range feeds {
+		if !f.Enabled {
+			continue
+		}
+		ips, hash, fetchErr := fetchThreatIntelFeed(ctx, client, f.URL)
+		if fetchErr != nil {
+			errs++
+			_ = s.store.ReplaceThreatIntelFeedEntries(ctx, f.ID, nil, "", fetchErr.Error())
+			s.log.Warn("threat intel sync failed", map[string]any{"feed": f.Name, "url": f.URL, "err": fetchErr.Error()})
+			continue
+		}
+		if err := s.store.ReplaceThreatIntelFeedEntries(ctx, f.ID, ips, hash, ""); err != nil {
+			errs++
+			s.log.Warn("threat intel feed replace failed", map[string]any{"feed": f.Name, "err": err.Error()})
+			continue
+		}
+		synced++
+		totalIPs += len(ips)
+	}
+	summary["synced"] = synced
+	summary["errors"] = errs
+	summary["totalIPs"] = totalIPs
+	_, _ = s.RefreshThreatIntelSnapshot(ctx)
+	return summary, nil
+}
+
+func fetchThreatIntelFeed(ctx context.Context, client *http.Client, rawURL string) ([]string, string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, "", fmt.Errorf("empty feed URL")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, "", fmt.Errorf("http status %d", res.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(res.Body, 32<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(b)
+	hash := hex.EncodeToString(sum[:])
+	ips := []string{}
+	seen := map[string]bool{}
+	sc := bufio.NewScanner(strings.NewReader(string(b)))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.Fields(line)[0]
+		if ip := net.ParseIP(line); ip != nil {
+			n := ip.String()
+			if !seen[n] {
+				seen[n] = true
+				ips = append(ips, n)
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, "", err
+	}
+	return ips, hash, nil
+}
+
+func (s *Service) RefreshThreatIntelSnapshot(ctx context.Context) (model.ThreatIntelSnapshot, error) {
+	cfg, err := s.store.GetThreatIntelConfig(ctx)
+	if err != nil {
+		return model.ThreatIntelSnapshot{}, err
+	}
+	if cfg.Enabled && normalizeThreatIntelMode(cfg.Mode) == "auto_mode" {
+		if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, tiHardLevel); err != nil {
+			s.log.Warn("threat intel hard-block reconcile failed", map[string]any{"err": err.Error()})
+		}
+	}
+	feedByIP, err := s.store.ListThreatIntelEntriesByIP(ctx)
+	if err != nil {
+		return model.ThreatIntelSnapshot{}, err
+	}
+	allowEntries, err := s.store.ListThreatIntelAllowIPs(ctx)
+	if err != nil {
+		return model.ThreatIntelSnapshot{}, err
+	}
+	allow := map[string]bool{}
+	for _, b := range allowEntries {
+		allow[strings.TrimSpace(b.IP)] = true
+	}
+	snap := model.ThreatIntelSnapshot{
+		Enabled:   cfg.Enabled,
+		Mode:      normalizeThreatIntelMode(cfg.Mode),
+		Allowlist: allow,
+		FeedByIP:  feedByIP,
+	}
+	s.tiMu.Lock()
+	s.tiSnap = snap
+	s.tiMu.Unlock()
+	return snap, nil
+}
+
+func (s *Service) GetThreatIntelSnapshot(ctx context.Context) (model.ThreatIntelSnapshot, error) {
+	s.tiMu.RLock()
+	snap := s.tiSnap
+	s.tiMu.RUnlock()
+	if snap.FeedByIP != nil && snap.Allowlist != nil {
+		return snap, nil
+	}
+	return s.RefreshThreatIntelSnapshot(ctx)
+}
+
+func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatIntelEventInput) (model.ThreatIntelEventResult, error) {
+	res := model.ThreatIntelEventResult{
+		Decision:  "monitor_observe",
+		RiskState: "monitoring",
+		Tier:      "tier0",
+	}
+	in.IP = strings.TrimSpace(in.IP)
+	if in.IP == "" {
+		return res, nil
+	}
+	in.Mode = normalizeThreatIntelMode(in.Mode)
+	if in.Mode == "" {
+		in.Mode = "monitor_only"
+	}
+	now := time.Now().UTC()
+
+	st, err := s.store.GetThreatIntelIPState(ctx, in.IP)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return res, err
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		st = model.ThreatIntelIPState{
+			IP:           in.IP,
+			RiskState:    "monitoring",
+			SignalCounts: map[string]int{},
+		}
+	}
+	if st.SignalCounts == nil {
+		st.SignalCounts = map[string]int{}
+	}
+
+	decayThreatState(&st, now)
+	baseXP, topSignal := calcThreatBaseXP(in.Signals)
+	xpDelta := applyThreatMultipliers(baseXP, s.bumpThreatWindow(in.IP, topSignal, in.Signals, now), in.Signals)
+	if xpDelta < 0 {
+		xpDelta = 0
+	}
+	st.XP += xpDelta
+	st.TopSignal = topSignal
+	if topSignal != "" {
+		st.SignalCounts[topSignal] = st.SignalCounts[topSignal] + 1
+	}
+	for {
+		req := threatLevelThreshold(st.Level)
+		if st.Level >= tiHardLevel || st.XP < req {
+			break
+		}
+		st.XP -= req
+		st.Level++
+	}
+	// Keep XP bounded once max level is reached so UI/analytics scales remain stable.
+	if st.Level >= tiHardLevel {
+		maxXP := threatLevelThreshold(tiHardLevel)
+		if st.XP > maxXP {
+			st.XP = maxXP
+		}
+	}
+	st.RiskState = threatRiskState(st.Level)
+	st.LastSeenAt = now
+	if st.PermBlocked {
+		res.Blocked = true
+		res.HardBlock = true
+		res.Decision = "hard_block_permanent"
+	} else if !st.BanUntil.IsZero() && st.BanUntil.After(now) {
+		res.Blocked = true
+		res.Decision = "soft_block_active"
+	}
+
+	if !res.Blocked {
+		switch in.Mode {
+		case "auto_mode":
+			if st.Level >= tiHardLevel {
+				st.PermBlocked = true
+				st.BanUntil = time.Time{}
+				res.Blocked = true
+				res.HardBlock = true
+				res.Decision = "hard_block_set"
+				_ = s.store.UpsertBlockedIP(ctx, in.IP, "threat_intel_auto:"+topSignal)
+			} else if st.Level >= tiSoftMinLevel {
+				st.TempBlockCount++
+				d := 15 * time.Minute
+				if st.TempBlockCount == 2 {
+					d = 30 * time.Minute
+				}
+				if st.TempBlockCount >= 3 {
+					d = 60 * time.Minute
+				}
+				st.BanUntil = now.Add(d)
+				res.Blocked = true
+				res.BanUntil = st.BanUntil
+				res.Decision = "soft_block_set"
+			} else {
+				res.Decision = "monitor_observe"
+			}
+		default:
+			res.Decision = "monitor_observe"
+		}
+	}
+
+	if err := s.store.UpsertThreatIntelIPState(ctx, st); err != nil {
+		return res, err
+	}
+	res.XPDelta = xpDelta
+	res.XPAfter = st.XP
+	res.Level = st.Level
+	res.Tier = threatTier(st.Level)
+	res.RiskState = st.RiskState
+	if !st.BanUntil.IsZero() && st.BanUntil.After(now) {
+		res.BanUntil = st.BanUntil
+	}
+	_ = s.store.RecordThreatIntelMatch(ctx, model.ThreatIntelMatchEvent{
+		IP:          in.IP,
+		Feed:        strings.Join(uniqueThreatSignals(in.Signals), ","),
+		Host:        in.Host,
+		Path:        in.Path,
+		Country:     in.Country,
+		Mode:        in.Mode,
+		Decision:    res.Decision,
+		TraceID:     in.TraceID,
+		SourceScope: in.SourceScope,
+		XPDelta:     res.XPDelta,
+		XPAfter:     res.XPAfter,
+		LevelAfter:  res.Level,
+		TierAfter:   res.Tier,
+	})
+	return res, nil
+}
+
+func uniqueThreatSignals(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(strings.ToLower(s))
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func calcThreatBaseXP(signals []string) (int, string) {
+	points := map[string]int{
+		"behavior.unknown_host": 1,
+		"behavior.path_scan":    4,
+		"behavior.ua_scanner":   2,
+		"behavior.invalid_host": 2,
+		"behavior.auth_failed":  3,
+	}
+	total := 0
+	top := ""
+	topPts := 0
+	seenExternal := false
+	for _, sig := range uniqueThreatSignals(signals) {
+		p := points[sig]
+		if p == 0 && !strings.HasPrefix(sig, "behavior.") {
+			seenExternal = true
+		}
+		total += p
+		if p > topPts {
+			topPts = p
+			top = sig
+		}
+	}
+	if seenExternal {
+		total += 6
+		if top == "" {
+			top = "external_feed_hit"
+		}
+	}
+	if total <= 0 {
+		total = 1
+	}
+	if top == "" {
+		top = "behavior.unknown_host"
+	}
+	return total, top
+}
+
+func applyThreatMultipliers(base int, burstFactor float64, signals []string) int {
+	xp := int(math.Round(float64(base) * burstFactor))
+	if xp < 1 {
+		xp = 1
+	}
+	if len(uniqueThreatSignals(signals)) >= 3 {
+		xp += 2
+	}
+	return xp
+}
+
+func (s *Service) bumpThreatWindow(ip, primary string, signals []string, now time.Time) float64 {
+	s.tiWinMu.Lock()
+	defer s.tiWinMu.Unlock()
+	for k, v := range s.tiWin {
+		if now.Sub(v.start) > 2*time.Minute {
+			delete(s.tiWin, k)
+		}
+	}
+	w := s.tiWin[ip]
+	if w.start.IsZero() || now.Sub(w.start) > time.Minute {
+		w = tiWindow{start: now, perSignal: map[string]int{}, categories: map[string]bool{}}
+	}
+	if w.perSignal == nil {
+		w.perSignal = map[string]int{}
+	}
+	if w.categories == nil {
+		w.categories = map[string]bool{}
+	}
+	if primary == "" {
+		primary = "behavior.unknown_host"
+	}
+	w.perSignal[primary] = w.perSignal[primary] + 1
+	for _, sig := range uniqueThreatSignals(signals) {
+		w.categories[sig] = true
+	}
+	s.tiWin[ip] = w
+	n := w.perSignal[primary]
+	switch {
+	case n >= 8:
+		return 2.0
+	case n >= 5:
+		return 1.5
+	case n >= 3:
+		return 1.2
+	default:
+		return 1.0
+	}
+}
+
+func decayThreatState(st *model.ThreatIntelIPState, now time.Time) {
+	if st == nil || st.LastSeenAt.IsZero() {
+		return
+	}
+	idle := now.Sub(st.LastSeenAt)
+	if idle >= 10*time.Minute {
+		steps := int(idle / (10 * time.Minute))
+		for i := 0; i < steps; i++ {
+			st.XP = int(math.Floor(float64(st.XP) * 0.85))
+		}
+	}
+	if idle >= 24*time.Hour && st.Level > 0 {
+		down := int(idle / (24 * time.Hour))
+		if down > st.Level {
+			down = st.Level
+		}
+		st.Level -= down
+	}
+}
+
+func threatLevelThreshold(level int) int {
+	if level < 0 {
+		level = 0
+	}
+	return int(math.Round(10 * math.Pow(1.6, float64(level))))
+}
+
+func threatRiskState(level int) string {
+	switch {
+	case level >= tiHardLevel:
+		return "hardblock"
+	case level >= tiSoftMinLevel:
+		return "softblock"
+	default:
+		return "monitoring"
+	}
+}
+
+func threatTier(level int) string {
+	if level < 0 {
+		level = 0
+	}
+	if level > tiHardLevel {
+		level = tiHardLevel
+	}
+	return "tier" + strconv.Itoa(level)
+}
+
+func (s *Service) ListThreatIntelMatches(ctx context.Context, hours int, decision, q string, page, pageSize int) (ThreatIntelMatchesPage, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	if hours > 24*30 {
+		hours = 24 * 30
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	if pageSize > 1000 {
+		pageSize = 1000
+	}
+	offset := (page - 1) * pageSize
+	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	items, total, err := s.store.ListThreatIntelMatches(ctx, since, decision, q, pageSize, offset)
+	if err != nil {
+		return ThreatIntelMatchesPage{}, err
+	}
+	return ThreatIntelMatchesPage{Items: items, Total: total, Page: page, PageSize: pageSize}, nil
+}
+
+func (s *Service) ListThreatIntelOffenders(ctx context.Context, hours int, page, pageSize int) (ThreatIntelOffendersPage, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	if hours > 24*30 {
+		hours = 24 * 30
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	if pageSize > 1000 {
+		pageSize = 1000
+	}
+	offset := (page - 1) * pageSize
+	shortHours := hours
+	if shortHours > 6 {
+		shortHours = 6
+	}
+	since := time.Now().UTC().Add(-time.Duration(shortHours) * time.Hour)
+	items, total, err := s.store.ListThreatIntelOffenders(ctx, since, pageSize, offset)
+	if err != nil {
+		return ThreatIntelOffendersPage{}, err
+	}
+	return ThreatIntelOffendersPage{Items: items, Total: total, Page: page, PageSize: pageSize}, nil
+}
+
+func (s *Service) ListThreatIntelBlocked(ctx context.Context, hours int, q string, page, pageSize int) (ThreatIntelBlockedPage, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	if hours > 24*30 {
+		hours = 24 * 30
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	if pageSize > 1000 {
+		pageSize = 1000
+	}
+	offset := (page - 1) * pageSize
+	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	items, total, err := s.store.ListThreatIntelBlocked(ctx, since, q, pageSize, offset)
+	if err != nil {
+		return ThreatIntelBlockedPage{}, err
+	}
+	return ThreatIntelBlockedPage{Items: items, Total: total, Page: page, PageSize: pageSize}, nil
+}
+
+func (s *Service) ListThreatIntelTargetsByIP(ctx context.Context, hours int, ip string, limit int) ([]model.ThreatIntelTarget, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	if hours > 24*30 {
+		hours = 24 * 30
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+	return s.store.ListThreatIntelTargetsByIP(ctx, since, ip, limit)
+}
+
+func (s *Service) ListThreatIntelAllowlist(ctx context.Context) ([]model.BlockedIP, error) {
+	return s.store.ListThreatIntelAllowIPs(ctx)
+}
+
+func (s *Service) AddThreatIntelAllowIP(ctx context.Context, ip, reason string) error {
+	if err := s.store.UpsertThreatIntelAllowIP(ctx, ip, reason); err != nil {
+		return err
+	}
+	_, _ = s.RefreshThreatIntelSnapshot(ctx)
+	return nil
+}
+
+func (s *Service) RemoveThreatIntelAllowIP(ctx context.Context, ip string) error {
+	if err := s.store.RemoveThreatIntelAllowIP(ctx, ip); err != nil {
+		return err
+	}
+	_, _ = s.RefreshThreatIntelSnapshot(ctx)
+	return nil
+}
+
+func (s *Service) StartThreatIntelSync(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cfg, err := s.store.GetThreatIntelConfig(ctx)
+			if err != nil || !cfg.Enabled {
+				continue
+			}
+			feeds, err := s.store.ListThreatIntelFeeds(ctx)
+			if err != nil {
+				continue
+			}
+			due := false
+			cutoff := time.Now().UTC().Add(-time.Duration(cfg.SyncHours) * time.Hour)
+			for _, f := range feeds {
+				if !f.Enabled {
+					continue
+				}
+				if f.LastSyncAt.IsZero() || f.LastSyncAt.Before(cutoff) {
+					due = true
+					break
+				}
+			}
+			if !due {
+				continue
+			}
+			if _, err := s.SyncThreatIntelFeeds(ctx); err != nil {
+				s.log.Warn("threat intel scheduled sync failed", map[string]any{"err": err.Error()})
+			}
+		}
+	}
+}
+
+func (s *Service) IsIPBlocked(ctx context.Context, ip string) (bool, error) {
+	return s.store.IsIPBlocked(ctx, ip)
+}
+
+func (s *Service) UpsertBlockedIP(ctx context.Context, ip, reason string) error {
+	return s.store.UpsertBlockedIP(ctx, ip, reason)
 }

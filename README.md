@@ -68,6 +68,13 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
   - API tokens with scoped permissions and optional domain scoping
     - Enables automation clients with least-privilege access instead of sharing admin session credentials.
 - Security and operations:
+  - Threat Intel management (allowlist-first, 2-mode model)
+    - `monitor_only`: detect, score, and audit only (no automatic blocking).
+    - `auto_mode`: applies temporary soft blocks and escalates hard-risk sources to permanent hard block.
+    - Allowlist always takes precedence, even in auto mode.
+  - Hard-block edge drop behavior
+    - Hard-blocked source IPs are dropped at app edge level (connection close) instead of receiving a rendered error page.
+    - This reduces response surface for hostile scanners while preserving audit visibility (`proxy.block.hard_drop`).
   - Argon2id password hashing
     - Hardened password storage with memory-hard hashing suitable for exposed admin surfaces.
   - Session + CSRF protections
@@ -308,6 +315,20 @@ curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/me"
   - `POST /users`
   - `PUT /users/{id}/domains`
   - `DELETE /users/{id}`
+- Threat Intel:
+  - `GET /threat-intel/config`
+  - `POST /threat-intel/config`
+  - `GET /threat-intel/feeds`
+  - `POST /threat-intel/feeds`
+  - `DELETE /threat-intel/feeds/{id}`
+  - `POST /threat-intel/sync`
+  - `GET /threat-intel/matches`
+  - `GET /threat-intel/offenders`
+  - `GET /threat-intel/targets`
+  - `GET /threat-intel/blocked`
+  - `GET /threat-intel/allowlist`
+  - `POST /threat-intel/allowlist`
+  - `DELETE /threat-intel/allowlist/{ip}`
 - SSH bastion (admin):
   - `GET /ssh/routes`
   - `POST /ssh/routes`

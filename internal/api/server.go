@@ -69,6 +69,13 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/traffic/countries", s.handleTrafficCountries)
 		pr.Get("/api/v1/audit", s.handleListAudit)
 		pr.Get("/api/v1/security/ip-blocks", s.handleListBlockedIPs)
+		pr.Get("/api/v1/threat-intel/config", s.handleThreatIntelConfigGet)
+		pr.Get("/api/v1/threat-intel/feeds", s.handleThreatIntelFeedsList)
+		pr.Get("/api/v1/threat-intel/matches", s.handleThreatIntelMatchesList)
+		pr.Get("/api/v1/threat-intel/matches/{ip}/targets", s.handleThreatIntelTargetsByIP)
+		pr.Get("/api/v1/threat-intel/offenders", s.handleThreatIntelOffendersList)
+		pr.Get("/api/v1/threat-intel/blocked", s.handleThreatIntelBlockedList)
+		pr.Get("/api/v1/threat-intel/allowlist", s.handleThreatIntelAllowlistList)
 		pr.Get("/api/v1/settings", s.handleGetSettings)
 		pr.Get("/api/v1/users", s.handleListUsers)
 	})
@@ -122,6 +129,13 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/ssh/keys/import", s.handleImportSSHBastionKey)
 		pr.Post("/api/v1/ssh/keys/generate", s.handleGenerateSSHBastionKey)
 		pr.Delete("/api/v1/ssh/keys/{id}", s.handleDeleteSSHBastionKey)
+		pr.Post("/api/v1/threat-intel/config", s.handleThreatIntelConfigSet)
+		pr.Post("/api/v1/threat-intel/feeds", s.handleThreatIntelFeedUpsert)
+		pr.Delete("/api/v1/threat-intel/feeds/{id}", s.handleThreatIntelFeedDelete)
+		pr.Post("/api/v1/threat-intel/sync", s.handleThreatIntelSync)
+		pr.Post("/api/v1/threat-intel/actions/block", s.handleThreatIntelActionBlock)
+		pr.Post("/api/v1/threat-intel/actions/allow", s.handleThreatIntelActionAllow)
+		pr.Post("/api/v1/threat-intel/actions/unallow", s.handleThreatIntelActionUnallow)
 	})
 
 	r.Get("/*", func(w http.ResponseWriter, req *http.Request) {
@@ -1361,6 +1375,312 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 		"restartNeeded": true,
 		"message":       "Settings saved. Please restart the service so ACME and DNS runtime pick them up safely.",
 	})
+}
+
+func (s *Server) handleThreatIntelConfigGet(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:read") {
+		return
+	}
+	cfg, err := s.app.GetThreatIntelConfig(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+func (s *Server) handleThreatIntelConfigSet(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in model.ThreatIntelConfig
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.SetThreatIntelConfig(r.Context(), in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "threatintel.config.update",
+		Target: "threat-intel",
+		Meta:   "mode=" + strings.ToLower(strings.TrimSpace(in.Mode)),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleThreatIntelFeedsList(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:read") {
+		return
+	}
+	items, err := s.app.ListThreatIntelFeeds(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleThreatIntelFeedUpsert(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in model.ThreatIntelFeed
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out, err := s.app.UpsertThreatIntelFeed(r.Context(), in)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "threatintel.feed.upsert",
+		Target: out.Name,
+		Meta:   out.URL,
+	})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleThreatIntelFeedDelete(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	feedID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if feedID <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid feed id")
+		return
+	}
+	if err := s.app.DeleteThreatIntelFeed(r.Context(), feedID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "threatintel.feed.delete",
+		Target: strconv.FormatInt(feedID, 10),
+		Meta:   "",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleThreatIntelSync(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	out, err := s.app.SyncThreatIntelFeeds(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "threatintel.sync.manual",
+		Target: "threat-intel",
+		Meta:   "manual",
+	})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleThreatIntelMatchesList(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "audit:read") {
+		return
+	}
+	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
+	decision := strings.TrimSpace(r.URL.Query().Get("decision"))
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	page, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page")))
+	pageSize, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("pageSize")))
+	items, err := s.app.ListThreatIntelMatches(r.Context(), hours, decision, q, page, pageSize)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleThreatIntelOffendersList(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "audit:read") {
+		return
+	}
+	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
+	page, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page")))
+	pageSize, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("pageSize")))
+	items, err := s.app.ListThreatIntelOffenders(r.Context(), hours, page, pageSize)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleThreatIntelBlockedList(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "audit:read") {
+		return
+	}
+	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	page, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page")))
+	pageSize, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("pageSize")))
+	items, err := s.app.ListThreatIntelBlocked(r.Context(), hours, q, page, pageSize)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleThreatIntelTargetsByIP(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "audit:read") {
+		return
+	}
+	hours, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("hours")))
+	limit, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit")))
+	ip := strings.TrimSpace(chi.URLParam(r, "ip"))
+	items, err := s.app.ListThreatIntelTargetsByIP(r.Context(), hours, ip, limit)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleThreatIntelAllowlistList(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:read") {
+		return
+	}
+	items, err := s.app.ListThreatIntelAllowlist(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleThreatIntelActionBlock(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		IP     string `json:"ip"`
+		Reason string `json:"reason"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.UpsertBlockedIP(r.Context(), strings.TrimSpace(in.IP), "threat_intel_manual:"+strings.TrimSpace(in.Reason)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "threatintel.action.block",
+		Target: strings.TrimSpace(in.IP),
+		Meta:   strings.TrimSpace(in.Reason),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleThreatIntelActionAllow(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		IP     string `json:"ip"`
+		Reason string `json:"reason"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ip := strings.TrimSpace(in.IP)
+	if ip == "" {
+		writeErr(w, http.StatusBadRequest, "ip required")
+		return
+	}
+	_ = s.app.Store().RemoveBlockedIP(r.Context(), ip)
+	if err := s.app.AddThreatIntelAllowIP(r.Context(), ip, strings.TrimSpace(in.Reason)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "threatintel.action.allow",
+		Target: ip,
+		Meta:   strings.TrimSpace(in.Reason),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleThreatIntelActionUnallow(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		IP string `json:"ip"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.RemoveThreatIntelAllowIP(r.Context(), strings.TrimSpace(in.IP)); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "threatintel.action.unallow",
+		Target: strings.TrimSpace(in.IP),
+		Meta:   "",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleReloadService(w http.ResponseWriter, r *http.Request) {

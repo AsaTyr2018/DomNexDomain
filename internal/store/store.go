@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -252,12 +253,81 @@ CREATE TABLE IF NOT EXISTS ssh_bastion_key_routes (
   FOREIGN KEY(route_id) REFERENCES ssh_bastion_routes(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS threat_intel_feeds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL UNIQUE,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  entry_count INTEGER NOT NULL DEFAULT 0,
+  last_sync_at TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  last_hash TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS threat_intel_entries (
+  feed_id INTEGER NOT NULL,
+  ip TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(feed_id, ip),
+  FOREIGN KEY(feed_id) REFERENCES threat_intel_feeds(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS threat_intel_allowlist (
+  ip TEXT PRIMARY KEY,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS threat_intel_matches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT NOT NULL,
+  feed TEXT NOT NULL,
+  host TEXT NOT NULL,
+  path TEXT NOT NULL,
+  country TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 1,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  last_trace_id TEXT NOT NULL DEFAULT '',
+  source_scope TEXT NOT NULL DEFAULT '',
+  xp_delta INTEGER NOT NULL DEFAULT 0,
+  xp_after INTEGER NOT NULL DEFAULT 0,
+  level_after INTEGER NOT NULL DEFAULT 0,
+  tier_after TEXT NOT NULL DEFAULT 'tier0',
+  UNIQUE(ip, feed, host, path, decision)
+);
+
+CREATE TABLE IF NOT EXISTS threat_intel_ip_state (
+  ip TEXT PRIMARY KEY,
+  xp INTEGER NOT NULL DEFAULT 0,
+  level INTEGER NOT NULL DEFAULT 0,
+  risk_state TEXT NOT NULL DEFAULT 'monitoring',
+  ban_until TEXT NOT NULL DEFAULT '',
+  perm_block INTEGER NOT NULL DEFAULT 0,
+  temp_block_count INTEGER NOT NULL DEFAULT 0,
+  last_seen_at TEXT NOT NULL,
+  top_signal TEXT NOT NULL DEFAULT '',
+  signal_counts TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_bucket ON host_traffic_minute(bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_host_bucket ON host_traffic_minute(host_id, bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_class_minute_bucket ON host_traffic_class_minute(bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_class_minute_host_bucket ON host_traffic_class_minute(host_id, bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_visitors_daily_day ON host_visitors_daily(day);
 CREATE INDEX IF NOT EXISTS idx_ssh_bastion_key_fingerprint ON ssh_bastion_keys(fingerprint);
+CREATE INDEX IF NOT EXISTS idx_threat_intel_entries_ip ON threat_intel_entries(ip);
+CREATE INDEX IF NOT EXISTS idx_threat_intel_matches_ip ON threat_intel_matches(ip);
+CREATE INDEX IF NOT EXISTS idx_threat_intel_matches_last_seen ON threat_intel_matches(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_threat_intel_state_level ON threat_intel_ip_state(level);
 `
 	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
@@ -291,6 +361,18 @@ CREATE INDEX IF NOT EXISTS idx_ssh_bastion_key_fingerprint ON ssh_bastion_keys(f
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE hosts ADD COLUMN geo_countries TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE threat_intel_matches ADD COLUMN xp_delta INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE threat_intel_matches ADD COLUMN xp_after INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE threat_intel_matches ADD COLUMN level_after INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE threat_intel_matches ADD COLUMN tier_after TEXT NOT NULL DEFAULT 'tier0'`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return err
 	}
 	return nil
@@ -1530,6 +1612,713 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 INSERT INTO settings(key, value, updated_at) VALUES(?,?,?)
 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`, key, value, now)
 	return err
+}
+
+func (s *Store) EnsureThreatIntelDefaultFeed(ctx context.Context, defaultURL string) error {
+	defaultURL = strings.TrimSpace(defaultURL)
+	if defaultURL == "" {
+		return fmt.Errorf("default threat intel feed URL required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO threat_intel_feeds(name, url, enabled, is_default, entry_count, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?)
+ON CONFLICT(url) DO UPDATE SET
+  is_default=1,
+  updated_at=excluded.updated_at`,
+		"blocklist.de all", defaultURL, 1, 1, 0, now, now)
+	return err
+}
+
+func (s *Store) GetThreatIntelConfig(ctx context.Context) (model.ThreatIntelConfig, error) {
+	cfg := model.ThreatIntelConfig{
+		Enabled:   false,
+		Mode:      "monitor_only",
+		SyncHours: 24,
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.enabled"); err == nil {
+		cfg.Enabled = strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.mode"); err == nil {
+		mode := strings.ToLower(strings.TrimSpace(v))
+		switch mode {
+		case "monitor_only", "auto_mode":
+			cfg.Mode = mode
+		case "log_only":
+			cfg.Mode = "monitor_only"
+		case "hard_check", "soft_block", "hard_block":
+			cfg.Mode = "auto_mode"
+		}
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.sync_hours"); err == nil {
+		if n, nErr := strconv.Atoi(strings.TrimSpace(v)); nErr == nil && n >= 1 && n <= 168 {
+			cfg.SyncHours = n
+		}
+	}
+	return cfg, nil
+}
+
+func (s *Store) SetThreatIntelConfig(ctx context.Context, cfg model.ThreatIntelConfig) error {
+	if cfg.Mode == "" {
+		cfg.Mode = "monitor_only"
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.Mode))
+	switch mode {
+	case "monitor_only", "auto_mode":
+	default:
+		return fmt.Errorf("invalid threat intel mode")
+	}
+	if cfg.SyncHours <= 0 {
+		cfg.SyncHours = 24
+	}
+	if cfg.SyncHours > 168 {
+		cfg.SyncHours = 168
+	}
+	if err := s.SetSetting(ctx, "threatintel.enabled", strconv.FormatBool(cfg.Enabled)); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, "threatintel.mode", mode); err != nil {
+		return err
+	}
+	return s.SetSetting(ctx, "threatintel.sync_hours", strconv.Itoa(cfg.SyncHours))
+}
+
+func (s *Store) PromoteThreatIntelHardBlocks(ctx context.Context, hardLevel int) (int64, error) {
+	if hardLevel <= 0 {
+		hardLevel = 6
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO blocked_ips(ip, reason, created_at, updated_at)
+SELECT s.ip, ?, ?, ?
+FROM threat_intel_ip_state s
+LEFT JOIN threat_intel_allowlist a ON a.ip = s.ip
+WHERE s.level >= ? AND a.ip IS NULL
+ON CONFLICT(ip) DO UPDATE SET
+  reason=excluded.reason,
+  updated_at=excluded.updated_at`, "threat_intel_auto:level_hard", now, now, hardLevel); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `
+UPDATE threat_intel_ip_state
+SET perm_block=1, ban_until='', risk_state='hardblock', updated_at=?
+WHERE level >= ?
+  AND ip NOT IN (SELECT ip FROM threat_intel_allowlist)`, now, hardLevel)
+	if err != nil {
+		return 0, err
+	}
+	affected, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
+func (s *Store) UpsertThreatIntelFeed(ctx context.Context, in model.ThreatIntelFeed) (model.ThreatIntelFeed, error) {
+	in.Name = strings.TrimSpace(in.Name)
+	in.URL = strings.TrimSpace(in.URL)
+	if in.Name == "" {
+		return model.ThreatIntelFeed{}, fmt.Errorf("feed name required")
+	}
+	if in.URL == "" {
+		return model.ThreatIntelFeed{}, fmt.Errorf("feed URL required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if in.ID > 0 {
+		_, err := s.db.ExecContext(ctx, `
+UPDATE threat_intel_feeds
+SET name=?, url=?, enabled=?, updated_at=?
+WHERE id=?`, in.Name, in.URL, boolToInt(in.Enabled), now, in.ID)
+		if err != nil {
+			return model.ThreatIntelFeed{}, err
+		}
+		return s.GetThreatIntelFeedByID(ctx, in.ID)
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO threat_intel_feeds(name, url, enabled, is_default, entry_count, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?)
+ON CONFLICT(url) DO UPDATE SET
+  name=excluded.name,
+  enabled=excluded.enabled,
+  updated_at=excluded.updated_at`, in.Name, in.URL, boolToInt(in.Enabled), boolToInt(in.IsDefault), 0, now, now)
+	if err != nil {
+		return model.ThreatIntelFeed{}, err
+	}
+	return s.GetThreatIntelFeedByURL(ctx, in.URL)
+}
+
+func (s *Store) DeleteThreatIntelFeed(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM threat_intel_feeds WHERE id=?`, id)
+	return err
+}
+
+func (s *Store) GetThreatIntelFeedByID(ctx context.Context, id int64) (model.ThreatIntelFeed, error) {
+	var out model.ThreatIntelFeed
+	var created, updated string
+	var lastSync sql.NullString
+	var enabled, isDefault int
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, name, url, enabled, is_default, entry_count, last_sync_at, last_error, last_hash, created_at, updated_at
+FROM threat_intel_feeds WHERE id=?`, id).
+		Scan(&out.ID, &out.Name, &out.URL, &enabled, &isDefault, &out.EntryCount, &lastSync, &out.LastError, &out.LastHash, &created, &updated)
+	if err != nil {
+		return out, err
+	}
+	out.Enabled = enabled != 0
+	out.IsDefault = isDefault != 0
+	out.LastSyncAt = parseNullableTime(lastSync)
+	out.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	out.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	return out, nil
+}
+
+func (s *Store) GetThreatIntelFeedByURL(ctx context.Context, url string) (model.ThreatIntelFeed, error) {
+	var out model.ThreatIntelFeed
+	var created, updated string
+	var lastSync sql.NullString
+	var enabled, isDefault int
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, name, url, enabled, is_default, entry_count, last_sync_at, last_error, last_hash, created_at, updated_at
+FROM threat_intel_feeds WHERE url=?`, strings.TrimSpace(url)).
+		Scan(&out.ID, &out.Name, &out.URL, &enabled, &isDefault, &out.EntryCount, &lastSync, &out.LastError, &out.LastHash, &created, &updated)
+	if err != nil {
+		return out, err
+	}
+	out.Enabled = enabled != 0
+	out.IsDefault = isDefault != 0
+	out.LastSyncAt = parseNullableTime(lastSync)
+	out.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	out.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	return out, nil
+}
+
+func (s *Store) ListThreatIntelFeeds(ctx context.Context) ([]model.ThreatIntelFeed, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, name, url, enabled, is_default, entry_count, last_sync_at, last_error, last_hash, created_at, updated_at
+FROM threat_intel_feeds
+ORDER BY is_default DESC, name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.ThreatIntelFeed{}
+	for rows.Next() {
+		var it model.ThreatIntelFeed
+		var created, updated string
+		var lastSync sql.NullString
+		var enabled, isDefault int
+		if err := rows.Scan(&it.ID, &it.Name, &it.URL, &enabled, &isDefault, &it.EntryCount, &lastSync, &it.LastError, &it.LastHash, &created, &updated); err != nil {
+			return nil, err
+		}
+		it.Enabled = enabled != 0
+		it.IsDefault = isDefault != 0
+		it.LastSyncAt = parseNullableTime(lastSync)
+		it.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		it.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ReplaceThreatIntelFeedEntries(ctx context.Context, feedID int64, ips []string, hash, syncErr string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM threat_intel_entries WHERE feed_id=?`, feedID); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO threat_intel_entries(feed_id, ip, created_at) VALUES(?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	count := int64(0)
+	seen := map[string]bool{}
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" || seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		if _, err := stmt.ExecContext(ctx, feedID, ip, now); err != nil {
+			return err
+		}
+		count++
+	}
+	_, err = tx.ExecContext(ctx, `
+UPDATE threat_intel_feeds
+SET entry_count=?, last_sync_at=?, last_error=?, last_hash=?, updated_at=?
+WHERE id=?`, count, now, strings.TrimSpace(syncErr), strings.TrimSpace(hash), now, feedID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListThreatIntelEntriesByIP(ctx context.Context) (map[string][]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT e.ip, f.name
+FROM threat_intel_entries e
+JOIN threat_intel_feeds f ON f.id = e.feed_id
+WHERE f.enabled=1
+ORDER BY e.ip, f.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var ip, name string
+		if err := rows.Scan(&ip, &name); err != nil {
+			return nil, err
+		}
+		out[ip] = append(out[ip], name)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertThreatIntelAllowIP(ctx context.Context, ip, reason string) error {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return fmt.Errorf("ip required")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO threat_intel_allowlist(ip, reason, created_at, updated_at)
+VALUES(?,?,?,?)
+ON CONFLICT(ip) DO UPDATE SET reason=excluded.reason, updated_at=excluded.updated_at`,
+		ip, strings.TrimSpace(reason), now, now)
+	return err
+}
+
+func (s *Store) RemoveThreatIntelAllowIP(ctx context.Context, ip string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM threat_intel_allowlist WHERE ip=?`, strings.TrimSpace(ip))
+	return err
+}
+
+func (s *Store) ListThreatIntelAllowIPs(ctx context.Context) ([]model.BlockedIP, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT ip, reason, created_at, updated_at FROM threat_intel_allowlist ORDER BY updated_at DESC LIMIT 1000`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.BlockedIP{}
+	for rows.Next() {
+		var b model.BlockedIP
+		var created, updated string
+		if err := rows.Scan(&b.IP, &b.Reason, &created, &updated); err != nil {
+			return nil, err
+		}
+		b.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		b.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) RecordThreatIntelMatch(ctx context.Context, in model.ThreatIntelMatchEvent) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	in.IP = strings.TrimSpace(in.IP)
+	in.Feed = strings.TrimSpace(in.Feed)
+	in.Host = strings.TrimSpace(in.Host)
+	in.Path = strings.TrimSpace(in.Path)
+	in.Country = strings.ToUpper(strings.TrimSpace(in.Country))
+	in.Mode = strings.ToLower(strings.TrimSpace(in.Mode))
+	in.Decision = strings.ToLower(strings.TrimSpace(in.Decision))
+	if in.IP == "" || in.Feed == "" {
+		return nil
+	}
+	if in.Host == "" {
+		in.Host = "_unknown"
+	}
+	if in.Path == "" {
+		in.Path = "/"
+	}
+	if in.Country == "" {
+		in.Country = "ZZ"
+	}
+	if strings.TrimSpace(in.TierAfter) == "" {
+		in.TierAfter = "tier0"
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO threat_intel_matches(ip, feed, host, path, country, mode, decision, hits, first_seen_at, last_seen_at, last_trace_id, source_scope, xp_delta, xp_after, level_after, tier_after)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(ip, feed, host, path, decision) DO UPDATE SET
+  country=excluded.country,
+  mode=excluded.mode,
+  hits=threat_intel_matches.hits + 1,
+  last_seen_at=excluded.last_seen_at,
+  last_trace_id=excluded.last_trace_id,
+  source_scope=excluded.source_scope,
+  xp_delta=excluded.xp_delta,
+  xp_after=excluded.xp_after,
+  level_after=excluded.level_after,
+  tier_after=excluded.tier_after`,
+		in.IP, in.Feed, in.Host, in.Path, in.Country, in.Mode, in.Decision, 1, now, now, in.TraceID, in.SourceScope, in.XPDelta, in.XPAfter, in.LevelAfter, in.TierAfter)
+	return err
+}
+
+func (s *Store) GetThreatIntelIPState(ctx context.Context, ip string) (model.ThreatIntelIPState, error) {
+	ip = strings.TrimSpace(ip)
+	var st model.ThreatIntelIPState
+	var banUntil, lastSeen, signalCounts string
+	var permBlocked int
+	err := s.db.QueryRowContext(ctx, `
+SELECT ip, xp, level, risk_state, ban_until, perm_block, temp_block_count, last_seen_at, top_signal, signal_counts
+FROM threat_intel_ip_state
+WHERE ip=?`, ip).Scan(&st.IP, &st.XP, &st.Level, &st.RiskState, &banUntil, &permBlocked, &st.TempBlockCount, &lastSeen, &st.TopSignal, &signalCounts)
+	if err != nil {
+		return st, err
+	}
+	st.PermBlocked = permBlocked != 0
+	st.LastSeenAt = parseTimeOrZero(lastSeen)
+	st.BanUntil = parseTimeOrZero(banUntil)
+	st.SignalCounts = map[string]int{}
+	if strings.TrimSpace(signalCounts) != "" {
+		_ = json.Unmarshal([]byte(signalCounts), &st.SignalCounts)
+	}
+	return st, nil
+}
+
+func (s *Store) UpsertThreatIntelIPState(ctx context.Context, st model.ThreatIntelIPState) error {
+	st.IP = strings.TrimSpace(st.IP)
+	if st.IP == "" {
+		return fmt.Errorf("ip required")
+	}
+	if st.RiskState == "" {
+		st.RiskState = "monitoring"
+	}
+	if st.SignalCounts == nil {
+		st.SignalCounts = map[string]int{}
+	}
+	payload, _ := json.Marshal(st.SignalCounts)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	lastSeen := now
+	if !st.LastSeenAt.IsZero() {
+		lastSeen = st.LastSeenAt.UTC().Format(time.RFC3339Nano)
+	}
+	banUntil := ""
+	if !st.BanUntil.IsZero() {
+		banUntil = st.BanUntil.UTC().Format(time.RFC3339Nano)
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO threat_intel_ip_state(ip, xp, level, risk_state, ban_until, perm_block, temp_block_count, last_seen_at, top_signal, signal_counts, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(ip) DO UPDATE SET
+  xp=excluded.xp,
+  level=excluded.level,
+  risk_state=excluded.risk_state,
+  ban_until=excluded.ban_until,
+  perm_block=excluded.perm_block,
+  temp_block_count=excluded.temp_block_count,
+  last_seen_at=excluded.last_seen_at,
+  top_signal=excluded.top_signal,
+  signal_counts=excluded.signal_counts,
+  updated_at=excluded.updated_at`,
+		st.IP, st.XP, st.Level, st.RiskState, banUntil, boolToInt(st.PermBlocked), st.TempBlockCount, lastSeen, st.TopSignal, string(payload), now, now)
+	return err
+}
+
+func (s *Store) ListThreatIntelMatches(ctx context.Context, since time.Time, decision, q string, limit, offset int) ([]model.ThreatIntelMatch, int64, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	decision = strings.ToLower(strings.TrimSpace(decision))
+	q = strings.TrimSpace(q)
+	baseArgs := []any{since.UTC().Format(time.RFC3339Nano)}
+	where := []string{"m.last_seen_at >= ?", "m.ip NOT IN (SELECT ip FROM blocked_ips)"}
+	if decision != "" && decision != "all" {
+		where = append(where, "m.decision = ?")
+		baseArgs = append(baseArgs, decision)
+	}
+	if q != "" {
+		where = append(where, "(m.ip LIKE ? OR m.host LIKE ? OR m.path LIKE ? OR m.feed LIKE ? OR m.country LIKE ? OR m.decision LIKE ?)")
+		like := "%" + q + "%"
+		baseArgs = append(baseArgs, like, like, like, like, like, like)
+	}
+	countQuery := `SELECT COUNT(1) FROM (SELECT m.ip FROM threat_intel_matches m WHERE ` + strings.Join(where, " AND ") + ` GROUP BY m.ip HAVING SUM(m.hits) >= 2) t`
+	var total int64
+	if err := s.db.QueryRowContext(ctx, countQuery, baseArgs...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	args := append([]any{}, baseArgs...)
+	args = append(args, limit, offset)
+	query := `
+SELECT
+  MIN(m.id) AS id,
+  m.ip,
+  GROUP_CONCAT(DISTINCT m.feed) AS feed,
+  '' AS host,
+  '' AS path,
+  COUNT(DISTINCT m.host || '|' || m.path) AS target_count,
+  MAX(m.country) AS country,
+  GROUP_CONCAT(DISTINCT m.mode) AS mode,
+  GROUP_CONCAT(DISTINCT m.decision) AS decision,
+  SUM(m.hits) AS hits,
+  MIN(m.first_seen_at) AS first_seen_at,
+  MAX(m.last_seen_at) AS last_seen_at,
+  MAX(m.last_trace_id) AS last_trace_id,
+  MAX(m.source_scope) AS source_scope,
+  COALESCE(MAX(s.xp), 0) AS xp,
+  COALESCE(MAX(s.level), 0) AS level,
+  CASE
+    WHEN COALESCE(MAX(s.level), 0) >= 6 THEN 'tier6'
+    WHEN COALESCE(MAX(s.level), 0) >= 5 THEN 'tier5'
+    WHEN COALESCE(MAX(s.level), 0) >= 4 THEN 'tier4'
+    WHEN COALESCE(MAX(s.level), 0) >= 3 THEN 'tier3'
+    WHEN COALESCE(MAX(s.level), 0) >= 2 THEN 'tier2'
+    WHEN COALESCE(MAX(s.level), 0) >= 1 THEN 'tier1'
+    ELSE 'tier0'
+  END AS tier,
+  COALESCE(MAX(s.risk_state), 'monitoring') AS risk_state
+FROM threat_intel_matches m
+LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
+WHERE ` + strings.Join(where, " AND ") + `
+GROUP BY m.ip
+HAVING SUM(m.hits) >= 2
+ORDER BY SUM(m.hits) DESC, MAX(m.last_seen_at) DESC
+LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []model.ThreatIntelMatch{}
+	for rows.Next() {
+		var m model.ThreatIntelMatch
+		var first, last string
+		if err := rows.Scan(&m.ID, &m.IP, &m.Feed, &m.Host, &m.Path, &m.TargetCount, &m.Country, &m.Mode, &m.Decision, &m.Hits, &first, &last, &m.LastTraceID, &m.SourceScope, &m.XP, &m.Level, &m.Tier, &m.RiskState); err != nil {
+			return nil, 0, err
+		}
+		m.FirstSeenAt, _ = time.Parse(time.RFC3339Nano, first)
+		m.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+
+func (s *Store) ListThreatIntelTargetsByIP(ctx context.Context, since time.Time, ip string, limit int) ([]model.ThreatIntelTarget, error) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return nil, fmt.Errorf("ip required")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT host, path, GROUP_CONCAT(DISTINCT feed), GROUP_CONCAT(DISTINCT decision), SUM(hits), MAX(last_seen_at)
+FROM threat_intel_matches
+WHERE ip=? AND last_seen_at>=?
+GROUP BY host, path
+ORDER BY SUM(hits) DESC, MAX(last_seen_at) DESC
+LIMIT ?`, ip, since.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.ThreatIntelTarget{}
+	for rows.Next() {
+		var t model.ThreatIntelTarget
+		var last string
+		if err := rows.Scan(&t.Host, &t.Path, &t.Feed, &t.Decision, &t.Hits, &last); err != nil {
+			return nil, err
+		}
+		t.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListThreatIntelOffenders(ctx context.Context, since time.Time, limit, offset int) ([]model.ThreatIntelOffender, int64, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(1) FROM (
+  SELECT m.ip
+  FROM threat_intel_matches m
+  LEFT JOIN blocked_ips b ON b.ip = m.ip
+  WHERE m.last_seen_at >= ? AND b.ip IS NULL
+  GROUP BY m.ip
+  HAVING SUM(m.hits) > 10
+) t`, since.UTC().Format(time.RFC3339Nano)).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT m.ip,
+       SUM(m.hits) AS total_hits,
+       COUNT(DISTINCT m.feed) AS distinct_feeds,
+       COUNT(DISTINCT m.host) AS distinct_hosts,
+       GROUP_CONCAT(DISTINCT m.decision),
+       MAX(m.last_seen_at),
+       CASE WHEN b.ip IS NULL THEN 0 ELSE 1 END AS blocked,
+       CASE WHEN a.ip IS NULL THEN 0 ELSE 1 END AS allowlisted,
+       COALESCE(MAX(s.xp), 0) AS xp,
+       COALESCE(MAX(s.level), 0) AS level,
+       CASE
+         WHEN COALESCE(MAX(s.level), 0) >= 6 THEN 'tier6'
+         WHEN COALESCE(MAX(s.level), 0) >= 5 THEN 'tier5'
+         WHEN COALESCE(MAX(s.level), 0) >= 4 THEN 'tier4'
+         WHEN COALESCE(MAX(s.level), 0) >= 3 THEN 'tier3'
+         WHEN COALESCE(MAX(s.level), 0) >= 2 THEN 'tier2'
+         WHEN COALESCE(MAX(s.level), 0) >= 1 THEN 'tier1'
+         ELSE 'tier0'
+       END AS tier,
+       COALESCE(MAX(s.risk_state), 'monitoring') AS risk_state
+FROM threat_intel_matches m
+LEFT JOIN blocked_ips b ON b.ip = m.ip
+LEFT JOIN threat_intel_allowlist a ON a.ip = m.ip
+LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
+WHERE m.last_seen_at >= ? AND b.ip IS NULL
+GROUP BY m.ip, b.ip, a.ip
+HAVING SUM(m.hits) > 10
+ORDER BY total_hits DESC, MAX(m.last_seen_at) DESC
+LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []model.ThreatIntelOffender{}
+	for rows.Next() {
+		var o model.ThreatIntelOffender
+		var decisions, last string
+		var blocked, allowlisted int
+		if err := rows.Scan(&o.IP, &o.TotalHits, &o.DistinctFeeds, &o.DistinctHosts, &decisions, &last, &blocked, &allowlisted, &o.XP, &o.Level, &o.Tier, &o.RiskState); err != nil {
+			return nil, 0, err
+		}
+		o.Decisions = decisions
+		o.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
+		o.Blocked = blocked != 0
+		o.Allowlisted = allowlisted != 0
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+
+func (s *Store) ListThreatIntelBlocked(ctx context.Context, since time.Time, q string, limit, offset int) ([]model.ThreatIntelBlocked, int64, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	q = strings.TrimSpace(q)
+	where := []string{"1=1"}
+	args := []any{}
+	if q != "" {
+		where = append(where, "(b.ip LIKE ? OR b.reason LIKE ?)")
+		like := "%" + q + "%"
+		args = append(args, like, like)
+	}
+	countQuery := `SELECT COUNT(1) FROM blocked_ips b WHERE ` + strings.Join(where, " AND ")
+	var total int64
+	if err := s.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	queryArgs := append([]any{}, args...)
+	queryArgs = append(queryArgs, since.UTC().Format(time.RFC3339Nano), limit, offset)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT b.ip,
+       b.reason,
+       COALESCE((
+         SELECT GROUP_CONCAT(x, ' | ') FROM (
+           SELECT (COALESCE(m2.decision, 'unknown') || ' @ ' || COALESCE(m2.host, '_') || COALESCE(m2.path, '/')) AS x
+           FROM threat_intel_matches m2
+           WHERE m2.ip = b.ip
+           ORDER BY m2.last_seen_at DESC
+           LIMIT 3
+         )
+       ), '') AS history_snippet,
+       b.updated_at,
+       COALESCE(SUM(m.hits), 0) AS total_hits,
+       COUNT(DISTINCT m.feed) AS distinct_feeds,
+       COUNT(DISTINCT m.host) AS distinct_hosts,
+       COALESCE(MAX(m.last_seen_at), '') AS last_seen_at,
+       COALESCE(MAX(s.xp), 0) AS xp,
+       COALESCE(MAX(s.level), 0) AS level,
+       CASE
+         WHEN COALESCE(MAX(s.level), 0) >= 6 THEN 'tier6'
+         WHEN COALESCE(MAX(s.level), 0) >= 5 THEN 'tier5'
+         WHEN COALESCE(MAX(s.level), 0) >= 4 THEN 'tier4'
+         WHEN COALESCE(MAX(s.level), 0) >= 3 THEN 'tier3'
+         WHEN COALESCE(MAX(s.level), 0) >= 2 THEN 'tier2'
+         WHEN COALESCE(MAX(s.level), 0) >= 1 THEN 'tier1'
+         ELSE 'tier0'
+       END AS tier,
+       COALESCE(MAX(s.risk_state), 'monitoring') AS risk_state
+FROM blocked_ips b
+LEFT JOIN threat_intel_matches m ON m.ip = b.ip AND m.last_seen_at >= ?
+LEFT JOIN threat_intel_ip_state s ON s.ip = b.ip
+WHERE `+strings.Join(where, " AND ")+`
+GROUP BY b.ip, b.reason, b.updated_at
+ORDER BY b.updated_at DESC, total_hits DESC
+LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []model.ThreatIntelBlocked{}
+	for rows.Next() {
+		var b model.ThreatIntelBlocked
+		var updated, last string
+		if err := rows.Scan(&b.IP, &b.Reason, &b.History, &updated, &b.TotalHits, &b.DistinctFeeds, &b.DistinctHosts, &last, &b.XP, &b.Level, &b.Tier, &b.RiskState); err != nil {
+			return nil, 0, err
+		}
+		b.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		if strings.TrimSpace(last) != "" {
+			b.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+
+func parseNullableTime(v sql.NullString) time.Time {
+	if !v.Valid || strings.TrimSpace(v.String) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, v.String)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+func parseTimeOrZero(v string) time.Time {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, v)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 func (s *Store) UpsertSSHBastionRoute(ctx context.Context, in model.SSHBastionRoute) (model.SSHBastionRoute, error) {

@@ -27,8 +27,17 @@ type TrafficCountryOverview = { hours: number; generatedAt: string; requestClass
 type SSHBastionRoute = { id: number; fqdn: string; targetHost: string; targetPort: number; enabled: boolean; createdAt: string; updatedAt: string };
 type SSHBastionKey = { id: number; name: string; publicKey: string; fingerprint: string; enabled: boolean; routeIds: number[]; createdAt: string; updatedAt: string };
 type SSHBastionGenerate = { key: SSHBastionKey; privateKey?: string; privateKeyPpk?: string; publicKeyRfc4716?: string; ppkError?: string };
+type ThreatIntelConfig = { enabled: boolean; mode: 'monitor_only' | 'auto_mode'; syncHours: number };
+type ThreatIntelFeed = { id: number; name: string; url: string; enabled: boolean; isDefault?: boolean; entryCount?: number; lastSyncAt?: string; lastError?: string; lastHash?: string; createdAt?: string; updatedAt?: string };
+type ThreatIntelMatch = { id: number; ip: string; feed: string; host: string; path: string; targetCount?: number; country: string; mode: string; decision: string; hits: number; firstSeenAt: string; lastSeenAt: string; lastTraceId?: string; sourceScope?: string; xp?: number; level?: number; tier?: string; riskState?: string };
+type ThreatIntelTarget = { host: string; path: string; feed: string; decision: string; hits: number; lastSeenAt: string };
+type ThreatIntelOffender = { ip: string; totalHits: number; distinctFeeds: number; distinctHosts: number; decisions: string; lastSeenAt: string; blocked: boolean; allowlisted: boolean; xp?: number; level?: number; tier?: string; riskState?: string };
+type ThreatIntelBlocked = { ip: string; reason?: string; history?: string; updatedAt: string; totalHits: number; distinctFeeds: number; distinctHosts: number; lastSeenAt?: string; xp?: number; level?: number; tier?: string; riskState?: string };
+type ThreatIntelMatchesPage = { items: ThreatIntelMatch[]; total: number; page: number; pageSize: number };
+type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; page: number; pageSize: number };
+type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
 
-type Tab = 'dashboard' | 'metricCenter' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'ssh' | 'audit';
+type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'ssh' | 'audit';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
 type PublicStyle = { styleProfile?: string; styleCustom?: string };
@@ -184,6 +193,33 @@ function App() {
   const [hostDiagnostics, setHostDiagnostics] = useState<Record<string, HostDiagnostic>>({});
   const [audit, setAudit] = useState<Audit[]>([]);
   const [blockedIPs, setBlockedIPs] = useState<BlockedIP[]>([]);
+  const [tiConfig, setTiConfig] = useState<ThreatIntelConfig>({ enabled: false, mode: 'monitor_only', syncHours: 24 });
+  const [tiFeeds, setTiFeeds] = useState<ThreatIntelFeed[]>([]);
+  const [tiMatches, setTiMatches] = useState<ThreatIntelMatch[]>([]);
+  const [tiOffenders, setTiOffenders] = useState<ThreatIntelOffender[]>([]);
+  const [tiAllowlist, setTiAllowlist] = useState<BlockedIP[]>([]);
+  const [tiHours, setTiHours] = useState(24);
+  const [tiDecision, setTiDecision] = useState('all');
+  const [tiQuery, setTiQuery] = useState('');
+  const [tiView, setTiView] = useState<'events' | 'offenders'>('events');
+  const [tiPage, setTiPage] = useState(1);
+  const [tiPageSize, setTiPageSize] = useState(100);
+  const [tiTotalMatches, setTiTotalMatches] = useState(0);
+  const [tiTotalOffenders, setTiTotalOffenders] = useState(0);
+  const [tiTotalBlocked, setTiTotalBlocked] = useState(0);
+  const [tiFeedsOpen, setTiFeedsOpen] = useState(false);
+  const [tiAllowOpen, setTiAllowOpen] = useState(false);
+  const [tiBlockedOpen, setTiBlockedOpen] = useState(false);
+  const [tiTargetsOpen, setTiTargetsOpen] = useState(false);
+  const [tiTargetsIP, setTiTargetsIP] = useState('');
+  const [tiTargets, setTiTargets] = useState<ThreatIntelTarget[]>([]);
+  const [tiBlocked, setTiBlocked] = useState<ThreatIntelBlocked[]>([]);
+  const [tiFeedName, setTiFeedName] = useState('');
+  const [tiFeedURL, setTiFeedURL] = useState('');
+  const [tiFeedEnabled, setTiFeedEnabled] = useState(true);
+  const [tiAllowIP, setTiAllowIP] = useState('');
+  const [tiAllowReason, setTiAllowReason] = useState('');
+  const [tiConfigSavedAt, setTiConfigSavedAt] = useState('');
   const [tokens, setTokens] = useState<APIToken[]>([]);
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [domainChecks, setDomainChecks] = useState<Record<number, DomainLiveCheck>>({});
@@ -411,6 +447,41 @@ function App() {
     }
   };
 
+  const loadThreatIntel = async () => {
+    try {
+      const [cfg, feeds, allow, blockedSummary] = await Promise.all([
+        api<ThreatIntelConfig>('/api/v1/threat-intel/config'),
+        api<{ items: ThreatIntelFeed[] }>('/api/v1/threat-intel/feeds'),
+        api<{ items: BlockedIP[] }>('/api/v1/threat-intel/allowlist'),
+        api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=&page=1&pageSize=1`),
+      ]);
+      setTiConfig({
+        enabled: !!cfg.enabled,
+        mode: (cfg.mode || 'monitor_only') as 'monitor_only' | 'auto_mode',
+        syncHours: Number(cfg.syncHours || 24),
+      });
+      setTiFeeds(feeds.items || []);
+      setTiAllowlist(allow.items || []);
+      setTiTotalBlocked(Number(blockedSummary.total || 0));
+      if (tiView === 'events') {
+        const matchesPage = await api<ThreatIntelMatchesPage>(`/api/v1/threat-intel/matches?hours=${encodeURIComponent(String(tiHours))}&decision=${encodeURIComponent(tiDecision)}&q=${encodeURIComponent(tiQuery)}&page=${encodeURIComponent(String(tiPage))}&pageSize=${encodeURIComponent(String(tiPageSize))}`);
+        setTiMatches(matchesPage.items || []);
+        setTiTotalMatches(Number(matchesPage.total || 0));
+      } else {
+        const offendersPage = await api<ThreatIntelOffendersPage>(`/api/v1/threat-intel/offenders?hours=${encodeURIComponent(String(tiHours))}&page=${encodeURIComponent(String(tiPage))}&pageSize=${encodeURIComponent(String(tiPageSize))}`);
+        setTiOffenders(offendersPage.items || []);
+        setTiTotalOffenders(Number(offendersPage.total || 0));
+      }
+      if (tiBlockedOpen) {
+        const blockedPage = await api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=${encodeURIComponent(tiQuery)}&page=1&pageSize=500`);
+        setTiBlocked(blockedPage.items || []);
+        setTiTotalBlocked(Number(blockedPage.total || 0));
+      }
+    } catch {
+      // Keep previous data on transient failures.
+    }
+  };
+
   useEffect(() => {
     void loadPublicStyle();
     void refresh();
@@ -459,6 +530,17 @@ function App() {
     const t = window.setInterval(() => { void refreshAuditOnly(); }, 5000);
     return () => window.clearInterval(t);
   }, [tab]);
+
+  useEffect(() => {
+    if (tab !== 'threatIntel') return;
+    void loadThreatIntel();
+    const t = window.setInterval(() => { void loadThreatIntel(); }, 8000);
+    return () => window.clearInterval(t);
+  }, [tab, tiHours, tiDecision, tiQuery, tiPage, tiPageSize, tiView, tiBlockedOpen]);
+
+  useEffect(() => {
+    setTiPage(1);
+  }, [tiHours, tiDecision, tiQuery, tiView, tiPageSize]);
 
   const login = async () => {
     setLoading(true);
@@ -1577,6 +1659,193 @@ function App() {
     setDetailHABackends((prev) => prev.filter((_, i) => i !== idx));
   };
 
+  const saveThreatIntelConfig = async () => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/threat-intel/config', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify(tiConfig),
+      });
+      setTiConfigSavedAt(new Date().toISOString());
+      await loadThreatIntel();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const syncThreatIntelNow = async () => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/threat-intel/sync', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      await loadThreatIntel();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addThreatIntelFeed = async () => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    if (!tiFeedName.trim() || !tiFeedURL.trim()) return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/threat-intel/feeds', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ name: tiFeedName.trim(), url: tiFeedURL.trim(), enabled: tiFeedEnabled }),
+      });
+      setTiFeedName('');
+      setTiFeedURL('');
+      setTiFeedEnabled(true);
+      await loadThreatIntel();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleThreatIntelFeed = async (f: ThreatIntelFeed) => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/threat-intel/feeds', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ ...f, enabled: !f.enabled }),
+      });
+      await loadThreatIntel();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteThreatIntelFeed = async (id: number) => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/threat-intel/feeds/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      await loadThreatIntel();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const threatIntelBlockIP = async (ip: string) => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/threat-intel/actions/block', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ ip, reason: 'manual from threat intel' }),
+      });
+      await Promise.all([loadThreatIntel(), refresh()]);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const threatIntelAllowIP = async (ip: string, reason = 'manual allow') => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/threat-intel/actions/allow', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ ip, reason }),
+      });
+      await Promise.all([loadThreatIntel(), refresh()]);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const threatIntelUnallowIP = async (ip: string) => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/threat-intel/actions/unallow', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ ip }),
+      });
+      await loadThreatIntel();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addThreatIntelAllow = async () => {
+    if (!tiAllowIP.trim()) return;
+    await threatIntelAllowIP(tiAllowIP.trim(), tiAllowReason.trim() || 'manual allow');
+    setTiAllowIP('');
+    setTiAllowReason('');
+  };
+
+  const openThreatIntelTargets = async (ip: string) => {
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<{ items: ThreatIntelTarget[] }>(`/api/v1/threat-intel/matches/${encodeURIComponent(ip)}/targets?hours=${encodeURIComponent(String(tiHours))}&limit=500`);
+      setTiTargetsIP(ip);
+      setTiTargets(out.items || []);
+      setTiTargetsOpen(true);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const openThreatIntelBlocked = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=${encodeURIComponent(tiQuery)}&page=1&pageSize=500`);
+      setTiBlocked(out.items || []);
+      setTiTotalBlocked(Number(out.total || 0));
+      setTiBlockedOpen(true);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const tiTotalCurrent = tiView === 'events' ? tiTotalMatches : tiTotalOffenders;
+  const tiPageCount = Math.max(1, Math.ceil(Math.max(0, tiTotalCurrent) / Math.max(1, tiPageSize)));
+
   return (
     <>
       {identity ? (
@@ -1588,6 +1857,7 @@ function App() {
           <nav className="menu">
             <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
             <button className={tab === 'metricCenter' ? 'active' : ''} onClick={() => setTab('metricCenter')}>MetricCenter</button>
+            <button className={tab === 'threatIntel' ? 'active' : ''} onClick={() => setTab('threatIntel')}>Threat Intel</button>
             <button className={tab === 'domains' ? 'active' : ''} onClick={() => setTab('domains')}>Domains</button>
             <button className={tab === 'hosts' ? 'active' : ''} onClick={() => setTab('hosts')}>Subdomains</button>
             {identity?.role === 'admin' ? <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button> : null}
@@ -1813,25 +2083,174 @@ function App() {
                         </div>
                       </div>
                     ) : null}
-                    <div className="card" style={{ marginTop: '.8rem', marginBottom: 0 }}>
-                      <div className="muted" style={{ marginBottom: '.45rem' }}>Blocked Source IPs</div>
-                      {blockedIPs.length === 0 ? (
-                        <div className="muted">No blocked IPs.</div>
-                      ) : (
-                        blockedIPs.map((b) => (
-                          <div key={b.ip} className="host" style={{ paddingTop: '.45rem', paddingBottom: '.45rem' }}>
-                            <div>
-                              <strong>{b.ip}</strong>
-                              {b.reason ? <div className="muted">{b.reason}</div> : null}
-                            </div>
-                            <button className="btn" onClick={() => unblockIP(b.ip)} disabled={loading}>Unblock</button>
-                          </div>
-                        ))
-                      )}
-                    </div>
                   </section>
                 ) : null}
               </aside>
+            </section>
+          ) : null}
+
+          {tab === 'threatIntel' ? (
+            <section className="entity-page threatintel-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>Threat Intel Policy</h3></div>
+                  <div className="row">
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '.45rem' }}>
+                      <input type="checkbox" checked={!!tiConfig.enabled} onChange={(e) => setTiConfig((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                      Opt-in enabled
+                    </label>
+                    <select value={tiConfig.mode} onChange={(e) => setTiConfig((p) => ({ ...p, mode: e.target.value as 'monitor_only' | 'auto_mode' }))} disabled={isReadOnlyRole || identity?.role !== 'admin'}>
+                      <option value="monitor_only">Monitor only</option>
+                      <option value="auto_mode">Auto mode (soft + hard)</option>
+                    </select>
+                    <input type="number" min={1} max={168} value={String(tiConfig.syncHours || 24)} onChange={(e) => setTiConfig((p) => ({ ...p, syncHours: Number(e.target.value) || 24 }))} placeholder="sync hours" disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                    <button className="btn" onClick={saveThreatIntelConfig} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Save Policy</button>
+                    <button className="btn" onClick={syncThreatIntelNow} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Sync Now</button>
+                    <button className="btn" onClick={() => setTiFeedsOpen(true)}>Feeds</button>
+                    <button className="btn" onClick={() => setTiAllowOpen(true)}>Allowlist</button>
+                    <button className="btn danger" onClick={openThreatIntelBlocked}>Blocked ({tiTotalBlocked})</button>
+                  </div>
+                  <div className="muted">
+                    Default feed: <code>https://lists.blocklist.de/lists/all.txt</code> · Data view optimized for large datasets with paging.
+                  </div>
+                  {tiConfigSavedAt ? <div className="muted">Policy saved: {new Date(tiConfigSavedAt).toLocaleString()}</div> : null}
+                </section>
+
+                <section className="card">
+                  <div className="card-head">
+                    <h3>Threat Data</h3>
+                    <button className="btn danger" onClick={openThreatIntelBlocked}>Blocked ({tiTotalBlocked})</button>
+                  </div>
+                  <div className="row">
+                    <div className="wizard-steps" style={{ marginBottom: 0 }}>
+                      <button className={tiView === 'events' ? 'wiz active' : 'wiz'} onClick={() => setTiView('events')}>Events</button>
+                      <button className={tiView === 'offenders' ? 'wiz active' : 'wiz'} onClick={() => setTiView('offenders')}>Offenders</button>
+                    </div>
+                    <select value={String(tiHours)} onChange={(e) => setTiHours(Number(e.target.value) || 24)}>
+                      <option value="1">Last 1h</option>
+                      <option value="6">Last 6h</option>
+                      <option value="24">Last 24h</option>
+                      <option value="168">Last 7d</option>
+                    </select>
+                    <select value={String(tiPageSize)} onChange={(e) => setTiPageSize(Math.max(25, Number(e.target.value) || 100))}>
+                      <option value="50">50 / page</option>
+                      <option value="100">100 / page</option>
+                      <option value="250">250 / page</option>
+                      <option value="500">500 / page</option>
+                    </select>
+                    {tiView === 'events' ? (
+                      <select value={tiDecision} onChange={(e) => setTiDecision(e.target.value)}>
+                        <option value="all">All decisions</option>
+                        <option value="monitor_observe">Monitor</option>
+                        <option value="soft_block_set">Soft block set</option>
+                        <option value="soft_block_active">Soft block active</option>
+                        <option value="hard_block_set">Hard block set</option>
+                        <option value="hard_block_permanent">Hard block active</option>
+                      </select>
+                    ) : null}
+                    <input value={tiQuery} onChange={(e) => setTiQuery(e.target.value)} placeholder="Search ip/host/path/feed/country" />
+                  </div>
+                  <div className="muted" style={{ marginBottom: '.55rem' }}>
+                    Showing page {tiPage} / {tiPageCount} · total records: {tiTotalCurrent} · Events: repeated IPs only (hits {'>='} 2) · Offenders: burst offenders (hits {'>'} 10 in short window) · Tiering: XP + Level + State
+                  </div>
+                  <div className="log-table-wrap">
+                    {tiView === 'events' ? (
+                      <table className="log-table">
+                        <thead>
+                          <tr>
+                            <th>Last Seen</th>
+                            <th>IP</th>
+                            <th>Decision</th>
+                            <th>Hits</th>
+                            <th className="ti-tier-col">Tier</th>
+                            <th className="ti-feed-col">Feed</th>
+                            <th>Targets</th>
+                            <th>Country</th>
+                            <th>Trace</th>
+                            <th>Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {tiMatches.length === 0 ? (
+                            <tr><td colSpan={10} className="muted">No repeated threat events in current filter.</td></tr>
+                          ) : tiMatches.map((m) => (
+                            <tr key={`ti-match-${m.id}`}>
+                              <td>{new Date(m.lastSeenAt).toLocaleString()}</td>
+                              <td><code>{m.ip}</code></td>
+                              <td><span className={`badge ${threatDecisionBadge(m.decision).cls}`}>{threatDecisionBadge(m.decision).label}</span></td>
+                              <td>{m.hits}</td>
+                              <td className="ti-tier-col"><span className={`badge ${m.riskState === 'hardblock' ? 'err' : m.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(m.tier || 'tier0').toUpperCase()} · L{m.level || 0} · XP {m.xp || 0}</span></td>
+                              <td className="ti-feed-col">{m.feed}</td>
+                              <td>
+                                <button className="btn" onClick={() => openThreatIntelTargets(m.ip)} disabled={loading}>
+                                  View ({m.targetCount || 0})
+                                </button>
+                              </td>
+                              <td>{m.country || 'ZZ'}</td>
+                              <td><code>{m.lastTraceId || '-'}</code></td>
+                              <td>
+                                <div className="row" style={{ marginBottom: 0 }}>
+                                  <button className="btn danger" onClick={() => threatIntelBlockIP(m.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Block</button>
+                                  <button className="btn" onClick={() => threatIntelAllowIP(m.ip, 'allow from threat events')} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Allow</button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <table className="log-table">
+                        <thead>
+                          <tr>
+                            <th>IP</th>
+                            <th>Hits</th>
+                            <th>Feeds</th>
+                            <th>Hosts</th>
+                            <th>Decision</th>
+                            <th className="ti-tier-col">Tier</th>
+                            <th>Last Seen</th>
+                            <th>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {tiOffenders.length === 0 ? (
+                            <tr><td colSpan={8} className="muted">No burst offenders ({'>'}10 hits) in current filter.</td></tr>
+                          ) : tiOffenders.map((o) => (
+                            <tr key={`ti-off-${o.ip}`}>
+                              <td><code>{o.ip}</code></td>
+                              <td>{o.totalHits}</td>
+                              <td>{o.distinctFeeds}</td>
+                              <td>{o.distinctHosts}</td>
+                              <td>
+                                <div className="row" style={{ marginBottom: 0 }}>
+                                  {threatDecisionList(o.decisions).map((d) => {
+                                    const b = threatDecisionBadge(d);
+                                    return <span key={`${o.ip}-${d}`} className={`badge ${b.cls}`}>{b.label}</span>;
+                                  })}
+                                </div>
+                              </td>
+                              <td className="ti-tier-col"><span className={`badge ${o.riskState === 'hardblock' ? 'err' : o.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(o.tier || 'tier0').toUpperCase()} · L{o.level || 0} · XP {o.xp || 0}</span></td>
+                              <td>{new Date(o.lastSeenAt).toLocaleString()}</td>
+                              <td>
+                                <div className="row" style={{ marginBottom: 0 }}>
+                                  <button className="btn danger" onClick={() => threatIntelBlockIP(o.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Block</button>
+                                  <button className="btn" onClick={() => threatIntelAllowIP(o.ip, 'allow from offender list')} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Allow</button>
+                                  {o.allowlisted ? <span className="badge ok">allowlisted</span> : null}
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                  <div className="row" style={{ marginTop: '.6rem', marginBottom: 0 }}>
+                    <button className="btn" onClick={() => setTiPage((p) => Math.max(1, p - 1))} disabled={tiPage <= 1}>Prev</button>
+                    <button className="btn" onClick={() => setTiPage((p) => Math.min(tiPageCount, p + 1))} disabled={tiPage >= tiPageCount}>Next</button>
+                    <button className="btn" onClick={loadThreatIntel} disabled={loading}>Refresh</button>
+                  </div>
+                </section>
+              </div>
             </section>
           ) : null}
 
@@ -2960,6 +3379,204 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         </div>
       ) : null}
 
+      {identity && tiFeedsOpen ? (
+        <div className="overlay modal-overlay">
+          <div className="login-card modal-card" style={{ maxWidth: '1100px', width: '95vw' }}>
+            <div className="modal-head">
+              <h3>Threat Intel Feeds</h3>
+            </div>
+            <div className="row modal-controls">
+              <input value={tiFeedName} onChange={(e) => setTiFeedName(e.target.value)} placeholder="feed name" disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+              <input value={tiFeedURL} onChange={(e) => setTiFeedURL(e.target.value)} placeholder="https://provider/feed.txt" disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: '.45rem' }}>
+                <input type="checkbox" checked={tiFeedEnabled} onChange={(e) => setTiFeedEnabled(e.target.checked)} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                Enabled
+              </label>
+              <button className="btn" onClick={addThreatIntelFeed} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Add Feed</button>
+              <button className="btn" onClick={() => setTiFeedsOpen(false)}>Close</button>
+            </div>
+            <div className="modal-body">
+              <div className="log-table-wrap modal-table-wrap">
+                <table className="log-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>URL</th>
+                      <th>Entries</th>
+                      <th>Last Sync</th>
+                      <th>Status</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tiFeeds.map((f) => (
+                      <tr key={`ti-feed-modal-${f.id}`}>
+                        <td>{f.name}{f.isDefault ? <span className="badge ok" style={{ marginLeft: '.35rem' }}>default</span> : null}</td>
+                        <td><code>{f.url}</code></td>
+                        <td>{f.entryCount || 0}</td>
+                        <td>{f.lastSyncAt ? new Date(f.lastSyncAt).toLocaleString() : '-'}</td>
+                        <td>{f.lastError ? <span className="badge err">error</span> : <span className={`badge ${f.enabled ? 'ok' : 'warn'}`}>{f.enabled ? 'enabled' : 'disabled'}</span>}</td>
+                        <td>
+                          <div className="row" style={{ marginBottom: 0 }}>
+                            <button className="btn" onClick={() => toggleThreatIntelFeed(f)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>{f.enabled ? 'Disable' : 'Enable'}</button>
+                            {!f.isDefault ? <button className="btn danger" onClick={() => deleteThreatIntelFeed(f.id)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Delete</button> : null}
+                          </div>
+                          {f.lastError ? <div className="muted" style={{ marginTop: '.3rem' }}>{f.lastError}</div> : null}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {identity && tiAllowOpen ? (
+        <div className="overlay modal-overlay">
+          <div className="login-card modal-card" style={{ maxWidth: '1000px', width: '94vw' }}>
+            <div className="modal-head">
+              <h3>Threat Intel Allowlist Overrides</h3>
+            </div>
+            <div className="row modal-controls">
+              <input value={tiAllowIP} onChange={(e) => setTiAllowIP(e.target.value)} placeholder="IP to allowlist" disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+              <input value={tiAllowReason} onChange={(e) => setTiAllowReason(e.target.value)} placeholder="reason" disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+              <button className="btn" onClick={addThreatIntelAllow} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Add</button>
+              <button className="btn" onClick={() => setTiAllowOpen(false)}>Close</button>
+            </div>
+            <div className="modal-body">
+              <div className="log-table-wrap modal-table-wrap">
+                <table className="log-table">
+                  <thead>
+                    <tr>
+                      <th>IP</th>
+                      <th>Reason</th>
+                      <th>Updated</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tiAllowlist.length === 0 ? (
+                      <tr><td colSpan={4} className="muted">No allowlist overrides.</td></tr>
+                    ) : tiAllowlist.map((a) => (
+                      <tr key={`ti-allow-modal-${a.ip}`}>
+                        <td><code>{a.ip}</code></td>
+                        <td>{a.reason || '-'}</td>
+                        <td>{a.updatedAt ? new Date(a.updatedAt).toLocaleString() : '-'}</td>
+                        <td><button className="btn danger" onClick={() => threatIntelUnallowIP(a.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Remove</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {identity && tiBlockedOpen ? (
+        <div className="overlay modal-overlay">
+          <div className="login-card modal-card" style={{ maxWidth: '1150px', width: '96vw' }}>
+            <div className="modal-head">
+              <h3>Threat Intel Blocked Entries</h3>
+            </div>
+            <div className="row modal-controls">
+              <div className="muted">Consolidated blocked list with XP/Level/Tier state. Total blocked: {tiTotalBlocked}</div>
+              <button className="btn" onClick={openThreatIntelBlocked} disabled={loading}>Refresh</button>
+              <button className="btn" onClick={() => setTiBlockedOpen(false)}>Close</button>
+            </div>
+            <div className="modal-body">
+              <div className="log-table-wrap modal-table-wrap">
+                <table className="log-table">
+                  <thead>
+                    <tr>
+                      <th>IP</th>
+                      <th>Reason</th>
+                      <th>History</th>
+                      <th>Hits</th>
+                      <th>Feeds</th>
+                      <th>Hosts</th>
+                      <th className="ti-tier-col">Tier</th>
+                      <th>Last Seen</th>
+                      <th>Blocked At</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tiBlocked.length === 0 ? (
+                      <tr><td colSpan={10} className="muted">No blocked entries in current filter.</td></tr>
+                    ) : tiBlocked.map((b) => (
+                      <tr key={`ti-blocked-${b.ip}`}>
+                        <td><code>{b.ip}</code></td>
+                        <td>{b.reason || '-'}</td>
+                        <td className="muted">{b.history || '-'}</td>
+                        <td>{b.totalHits || 0}</td>
+                        <td>{b.distinctFeeds || 0}</td>
+                        <td>{b.distinctHosts || 0}</td>
+                        <td className="ti-tier-col"><span className={`badge ${b.riskState === 'hardblock' ? 'err' : b.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(b.tier || 'tier0').toUpperCase()} · L{b.level || 0} · XP {b.xp || 0}</span></td>
+                        <td>{b.lastSeenAt ? new Date(b.lastSeenAt).toLocaleString() : '-'}</td>
+                        <td>{b.updatedAt ? new Date(b.updatedAt).toLocaleString() : '-'}</td>
+                        <td>
+                          <div className="row" style={{ marginBottom: 0 }}>
+                            <button className="btn danger" onClick={() => unblockIP(b.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Unblock</button>
+                            <button className="btn" onClick={() => threatIntelAllowIP(b.ip, 'allow from blocked list')} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Allow</button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {identity && tiTargetsOpen ? (
+        <div className="overlay modal-overlay">
+          <div className="login-card modal-card" style={{ maxWidth: '1100px', width: '95vw' }}>
+            <div className="modal-head">
+              <h3>Threat Targets for {tiTargetsIP}</h3>
+            </div>
+            <div className="row modal-controls">
+              <div className="muted">Consolidated by IP in Threat Data. Targets are expanded here.</div>
+              <button className="btn" onClick={() => setTiTargetsOpen(false)}>Close</button>
+            </div>
+            <div className="modal-body">
+              <div className="log-table-wrap modal-table-wrap">
+                <table className="log-table">
+                  <thead>
+                    <tr>
+                      <th>Host</th>
+                      <th>Path</th>
+                      <th>Feed</th>
+                      <th>Decision</th>
+                      <th>Hits</th>
+                      <th>Last Seen</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tiTargets.length === 0 ? (
+                      <tr><td colSpan={6} className="muted">No target details available.</td></tr>
+                    ) : tiTargets.map((t, idx) => (
+                      <tr key={`ti-target-${idx}`}>
+                        <td>{t.host || '-'}</td>
+                        <td><code>{t.path || '/'}</code></td>
+                        <td>{t.feed || '-'}</td>
+                        <td><span className={`badge ${threatDecisionBadge(t.decision).cls}`}>{threatDecisionBadge(t.decision).label}</span></td>
+                        <td>{t.hits || 0}</td>
+                        <td>{t.lastSeenAt ? new Date(t.lastSeenAt).toLocaleString() : '-'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <style>{`
         :root { --bg:${activeTheme.bg}; --surface:${activeTheme.surface}; --panel:${activeTheme.panel}; --panel-hover:${activeTheme.panelHover}; --border:${activeTheme.border}; --text:${activeTheme.text}; --text-dim:${activeTheme.textDim}; --accent:${activeTheme.accent}; --accent-hover:${activeTheme.accentHover}; --accent-active:${activeTheme.accentActive}; --accent-soft:${activeTheme.accentSoft}; --green:${activeTheme.success}; --red:${activeTheme.danger}; --input-bg:${activeTheme.inputBg}; --hero-a:${activeTheme.heroA}; --hero-b:${activeTheme.heroB}; --radius:12px; }
         * { box-sizing: border-box; }
@@ -3000,6 +3617,13 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .entity-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
         .entity-main { display:grid; gap:1rem; }
         .entity-side { display:grid; gap:1rem; }
+        .threatintel-page { grid-template-columns:minmax(0,1fr); }
+        .threatintel-page .entity-main,
+        .threatintel-page .entity-side { min-width:0; }
+        .threatintel-page .entity-side { grid-template-columns:minmax(0,1fr); }
+        .threatintel-page .log-table { min-width:900px; }
+        .threatintel-page .log-table-wrap { max-height:560px; }
+        .ti-filter-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
         .cc-hero { background:
           radial-gradient(900px 300px at 88% -35%, var(--hero-a), transparent 58%),
           radial-gradient(900px 300px at 12% -45%, var(--hero-b), transparent 58%),
@@ -3090,14 +3714,17 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .host { display:flex; justify-content:space-between; align-items:flex-start; gap:.6rem; border-top:1px solid var(--border); padding:.6rem 0; }
         .diag { display:flex; gap:.35rem; flex-wrap:wrap; margin-top:.35rem; }
         .diag-block { margin-top:.4rem; }
-        .badge { font-size:.74rem; padding:.15rem .45rem; border-radius:999px; border:1px solid transparent; }
+        .badge { font-size:.74rem; padding:.15rem .45rem; border-radius:999px; border:1px solid transparent; display:inline-flex; align-items:center; white-space:nowrap; }
         .badge.ok { background:#103227; border-color:#1d5a45; color:#9df3cb; }
         .badge.warn { background:#3a2a0f; border-color:#6b4d19; color:#ffd89a; }
         .badge.err { background:#3a1717; border-color:#6b2222; color:#ffb3b3; }
+        .ti-tier-col { min-width:160px; white-space:nowrap; }
+        .ti-feed-col { min-width:260px; word-break:break-word; }
         .muted { color:var(--text-dim); }
         .errtxt { color:#fca5a5; }
         .error { margin-bottom:1rem; background:#3a1a1a; border:1px solid #7f1d1d; color:#fecaca; padding:.7rem .9rem; border-radius:10px; }
-        .overlay { position:fixed; inset:0; background:rgba(0,0,0,.5); display:grid; place-items:center; padding:1rem; }
+        .overlay { position:fixed; inset:0; z-index:10000; background:rgba(0,0,0,.5); display:grid; place-items:center; padding:1rem; }
+        .modal-overlay { display:flex; align-items:center; justify-content:center; overflow:auto; }
         .auth-overlay {
           background:
             radial-gradient(800px 350px at 85% -10%, rgba(34,197,94,.16), transparent 52%),
@@ -3106,6 +3733,12 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         }
         .login-card { width:min(420px,100%); background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1rem; }
         .login-card h3 { margin-top:0; }
+        .modal-card { position:relative; z-index:10001; max-height:calc(100vh - 2rem); display:flex; flex-direction:column; overflow:hidden; }
+        .modal-head { flex:0 0 auto; }
+        .modal-controls { flex:0 0 auto; }
+        .modal-body { flex:1 1 auto; min-height:0; overflow:auto; }
+        .modal-table-wrap { max-height:none; height:100%; min-height:0; }
+        .modal-table-wrap .log-table th { position:static; top:auto; z-index:auto; }
         .auth-login-card { width:min(460px,100%); border-color:#2b3445; background:linear-gradient(180deg, rgba(18,22,32,.95), rgba(15,18,28,.95)); }
         .auth-brand { display:grid; place-items:center; margin-bottom:.5rem; }
         .auth-brand img {
@@ -3128,7 +3761,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         }
         .col { display:grid; gap:.6rem; }
         @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} }
-        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} }
+        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} }
       `}</style>
     </>
   );
@@ -3144,6 +3777,32 @@ function Card({ title, value, status }: { title: string; value: string; status: 
       <div className="value">{value}</div>
     </div>
   );
+}
+
+function threatDecisionBadge(decision: string): { cls: 'ok' | 'warn' | 'err'; label: string } {
+  const d = (decision || '').trim().toLowerCase();
+  if (d === 'monitor_observe') return { cls: 'ok', label: 'Monitor' };
+  if (d === 'soft_block_set') return { cls: 'warn', label: 'Soft set' };
+  if (d === 'soft_block_active') return { cls: 'warn', label: 'Soft active' };
+  if (d === 'hard_block_set') return { cls: 'err', label: 'Hard set' };
+  if (d === 'hard_block_permanent') return { cls: 'err', label: 'Hard active' };
+  if (d.includes('hard') || d.includes('block')) return { cls: 'err', label: decision || 'Block' };
+  if (d.includes('soft') || d.includes('check')) return { cls: 'warn', label: decision || 'Soft' };
+  return { cls: 'ok', label: decision || 'Monitor' };
+}
+
+function threatDecisionList(decisions: string): string[] {
+  const inRaw = (decisions || '').trim();
+  if (!inRaw) return ['monitor_observe'];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of inRaw.split(',')) {
+    const d = raw.trim().toLowerCase();
+    if (!d || seen.has(d)) continue;
+    seen.add(d);
+    out.push(d);
+  }
+  return out.length > 0 ? out : ['monitor_observe'];
 }
 
 function classifyAuditLevel(action: string, target: string): 'critical' | 'warn' | 'info' {
