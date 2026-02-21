@@ -33,6 +33,11 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
     - `active`: normal external + internal access.
     - `maintenance`: external traffic gets a maintenance page, LAN/hairpin clients can still access the upstream.
     - `disabled`: all traffic receives a host-disabled page.
+  - Optional SSH Bastion listener (single public TCP port)
+    - Dedicated SSH bastion mode on one configurable port (for example `2222`) without changing HTTP/HTTPS routing.
+    - Subdomain wizard integration: mark a subdomain as `SSH Bastion` to auto-bind upstream handling and auto-register its SSH bastion route.
+    - Public-key authentication with per-key target allowlists.
+    - Forwarding decisions are audited (`ssh.bastion.*` events).
 - ACME:
   - Let's Encrypt production + staging
     - Switch between staging and production ACME endpoints without changing deployment architecture.
@@ -154,6 +159,10 @@ Minimum important values:
 - `DOMNEX_HTTPS_ADDR=:443`
 - `DOMNEX_ADMIN_BIND=0.0.0.0:8443` (or restricted bind IP)
 - `DOMNEX_ACME_EMAIL=<you@example.com>`
+- Optional SSH bastion:
+  - `DOMNEX_SSH_BASTION_ENABLED=true`
+  - `DOMNEX_SSH_BASTION_ADDR=:2222`
+  - `DOMNEX_SSH_BASTION_HOST_KEY=/var/lib/domnexdomain/ssh_bastion_host_key.pem`
 
 `DOMNEX_DOMAIN` is optional. Leaving it empty starts with no preloaded master domain.
 
@@ -214,6 +223,12 @@ GeoIP database setup (recommended):
 - Target directory on server: `/var/lib/domnexdomain/geoip/`
 - Required runtime file path: `/var/lib/domnexdomain/geoip/IP2LOCATION-LITE-DB1.MMDB`
 - The MMDB file is runtime data and must not be committed to git.
+
+## Support
+
+- Open a GitHub issue for bugs, feature requests, or regressions.
+- Join the community Discord for setup help and operator discussion:
+  - https://discord.gg/GnAUmXhfeG
 
 ## API Overview (Technical)
 
@@ -277,6 +292,14 @@ curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/me"
   - `POST /users`
   - `PUT /users/{id}/domains`
   - `DELETE /users/{id}`
+- SSH bastion (admin):
+  - `GET /ssh/routes`
+  - `POST /ssh/routes`
+  - `DELETE /ssh/routes/{id}`
+  - `GET /ssh/keys`
+  - `POST /ssh/keys/import`
+  - `POST /ssh/keys/generate`
+  - `DELETE /ssh/keys/{id}`
 
 ### In-App API Documentation
 

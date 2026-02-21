@@ -24,9 +24,15 @@ type HostTrafficDetails = { hours: number; hostId: number; fqdn: string; request
 type CountryTraffic = { country: string; requests: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; bytesOut: number };
 type HostCountryTraffic = { hostId: number; fqdn: string; requests: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; bytesOut: number };
 type TrafficCountryOverview = { hours: number; generatedAt: string; requestClass?: string; hostId?: number; hostFqdn?: string; totalRequests: number; totalBlocked: number; totalBytesOut: number; countries: CountryTraffic[]; unknownBreakdown?: HostCountryTraffic[] };
+type SSHBastionRoute = { id: number; fqdn: string; targetHost: string; targetPort: number; enabled: boolean; createdAt: string; updatedAt: string };
+type SSHBastionKey = { id: number; name: string; publicKey: string; fingerprint: string; enabled: boolean; routeIds: number[]; createdAt: string; updatedAt: string };
+type SSHBastionGenerate = { key: SSHBastionKey; privateKey?: string; privateKeyPpk?: string; publicKeyRfc4716?: string; ppkError?: string };
 
-type Tab = 'dashboard' | 'metricCenter' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'audit';
+type Tab = 'dashboard' | 'metricCenter' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'ssh' | 'audit';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
+const SSH_BASTION_DEFAULT_UPSTREAM = 'http://127.0.0.1:8443';
+const SSH_BASTION_DEFAULT_TARGET_HOST = '127.0.0.1';
+const SSH_BASTION_DEFAULT_TARGET_PORT = 22;
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
@@ -50,6 +56,44 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 function getCookie(name: string): string {
   const item = document.cookie.split('; ').find((v) => v.startsWith(`${name}=`));
   return item ? decodeURIComponent(item.split('=')[1]) : '';
+}
+
+function downloadTextFile(filename: string, content: string): void {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, { error: string }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { error: '' };
+  }
+  static getDerivedStateFromError(err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { error: msg || 'Unknown UI runtime error' };
+  }
+  componentDidCatch(err: unknown) {
+    // Keep a clear trace in browser console for debugging white-screen incidents.
+    // eslint-disable-next-line no-console
+    console.error('DomNex UI runtime error:', err);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: '1rem', fontFamily: 'monospace' }}>
+          <h2>DomNex UI Runtime Error</h2>
+          <p>{this.state.error}</p>
+          <p>Reload the page. If this persists, report this message in GitHub/Discord support.</p>
+        </div>
+      );
+    }
+    return this.props.children as React.ReactElement;
+  }
 }
 
 function App() {
@@ -83,6 +127,7 @@ function App() {
   const [hostDomain, setHostDomain] = useState('');
   const [hostSub, setHostSub] = useState('');
   const [hostUpstream, setHostUpstream] = useState('http://127.0.0.1:3000');
+  const [hostSSHBastion, setHostSSHBastion] = useState(false);
   const [hostInsecureTLS, setHostInsecureTLS] = useState(false);
   const [hostHAEnabled, setHostHAEnabled] = useState(false);
   const [hostHAMode, setHostHAMode] = useState<'failover' | 'round_robin'>('failover');
@@ -131,6 +176,22 @@ function App() {
   const [settingsPublicIPv4, setSettingsPublicIPv4] = useState('');
   const [settingsBaseDomain, setSettingsBaseDomain] = useState('');
   const [settingsMessage, setSettingsMessage] = useState('');
+  const [sshRoutes, setSshRoutes] = useState<SSHBastionRoute[]>([]);
+  const [sshKeys, setSshKeys] = useState<SSHBastionKey[]>([]);
+  const [sshSelectedHostFQDN, setSshSelectedHostFQDN] = useState('');
+  const [sshRouteFQDN, setSshRouteFQDN] = useState('');
+  const [sshRouteTargetHost, setSshRouteTargetHost] = useState('');
+  const [sshRouteTargetPort, setSshRouteTargetPort] = useState('22');
+  const [sshRouteEnabled, setSshRouteEnabled] = useState(true);
+  const [sshKeyName, setSshKeyName] = useState('');
+  const [sshKeyPublic, setSshKeyPublic] = useState('');
+  const [sshKeyRouteIDs, setSshKeyRouteIDs] = useState<number[]>([]);
+  const [sshGeneratedPrivateKey, setSshGeneratedPrivateKey] = useState('');
+  const [sshGeneratedPublicKey, setSshGeneratedPublicKey] = useState('');
+  const [sshGeneratedKeyName, setSshGeneratedKeyName] = useState('');
+  const [sshGeneratedPPK, setSshGeneratedPPK] = useState('');
+  const [sshGeneratedRFC4716, setSshGeneratedRFC4716] = useState('');
+  const [sshGeneratedPPKError, setSshGeneratedPPKError] = useState('');
   const [newUserName, setNewUserName] = useState('');
   const [newUserPassword, setNewUserPassword] = useState('');
   const [newUserRole, setNewUserRole] = useState<'admin' | 'domain-admin'>('domain-admin');
@@ -188,6 +249,18 @@ function App() {
         setUsers([]);
       }
       try {
+        const sr = await api<{ items: SSHBastionRoute[] }>('/api/v1/ssh/routes');
+        setSshRoutes(sr.items || []);
+      } catch {
+        // Keep current list on transient errors so UI does not flicker to empty.
+      }
+      try {
+        const sk = await api<{ items: SSHBastionKey[] }>('/api/v1/ssh/keys');
+        setSshKeys(sk.items || []);
+      } catch {
+        // Keep current list on transient errors so UI does not flicker to empty.
+      }
+      try {
         const s = await api<RuntimeSettings>('/api/v1/settings');
         setSettings(s);
         setSettingsAcmeEmail(s.acmeEmail || '');
@@ -214,6 +287,8 @@ function App() {
         setAudit([]);
         setTrafficOverview(null);
         setSelectedHostTraffic(null);
+        setSshRoutes([]);
+        setSshKeys([]);
       } else {
         setError(err.message);
       }
@@ -253,11 +328,11 @@ function App() {
   }, [tab, domainWizardStep, domainName, domainProvider, domainZoneID]);
 
   useEffect(() => {
-    if (tab !== 'hosts' || hostWizardStep !== 2 || !hostDomain || !hostSub || (!hostHAEnabled && !hostUpstream)) return;
+    if (tab !== 'hosts' || hostWizardStep !== 2 || !hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)) return;
     void checkHostPreflight();
     const t = window.setInterval(() => { void checkHostPreflight(); }, 4000);
     return () => window.clearInterval(t);
-  }, [tab, hostWizardStep, hostDomain, hostSub, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends]);
+  }, [tab, hostWizardStep, hostDomain, hostSub, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends, hostSSHBastion]);
 
   useEffect(() => {
     if (!selectedHostID) {
@@ -311,6 +386,8 @@ function App() {
       setAudit([]);
       setTokens([]);
       setUsers([]);
+      setSshRoutes([]);
+      setSshKeys([]);
       setDomainChecks({});
       setSettings(null);
       setSettingsPublicIPv4('');
@@ -347,7 +424,7 @@ function App() {
   };
 
   const addHost = async () => {
-    if (!hostDomain || !hostSub || (!hostHAEnabled && !hostUpstream)) return;
+    if (!hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)) return;
     setLoading(true);
     setError('');
     try {
@@ -357,15 +434,32 @@ function App() {
         body: JSON.stringify({
           domain: hostDomain,
           subdomain: hostSub,
-          upstream: hostUpstream,
+          upstream: hostEffectiveUpstream,
           insecureTls: hostInsecureTLS,
           haEnabled: hostHAEnabled,
           haMode: hostHAMode,
           haBackends: normalizeBackends(hostHABackends),
         }),
       });
+      if (hostSSHBastion || hostEffectiveUpstream.trim().toLowerCase() === SSH_BASTION_DEFAULT_UPSTREAM) {
+        try {
+          await api('/api/v1/ssh/routes', {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrf },
+            body: JSON.stringify({
+              fqdn: `${hostSub}.${hostDomain}`.toLowerCase(),
+              targetHost: SSH_BASTION_DEFAULT_TARGET_HOST,
+              targetPort: SSH_BASTION_DEFAULT_TARGET_PORT,
+              enabled: true,
+            }),
+          });
+        } catch (routeErr) {
+          setError(`Subdomain created, but SSH bastion route setup failed: ${(routeErr as Error).message}`);
+        }
+      }
       setHostSub('');
       setHostHAEnabled(false);
+      setHostSSHBastion(false);
       setHostHAMode('failover');
       setHostHABackends([{ name: 'server1', url: '' }, { name: 'server2', url: '' }]);
       setHostInsecureTLS(false);
@@ -403,7 +497,7 @@ function App() {
   };
 
   const checkHostPreflight = async () => {
-    if (!hostDomain || !hostSub || (!hostHAEnabled && !hostUpstream)) {
+    if (!hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)) {
       setHostPreflight(null);
       return;
     }
@@ -415,7 +509,7 @@ function App() {
         body: JSON.stringify({
           domain: hostDomain,
           subdomain: hostSub,
-          upstream: hostUpstream,
+          upstream: hostEffectiveUpstream,
           insecureTls: hostInsecureTLS,
           haEnabled: hostHAEnabled,
           haMode: hostHAMode,
@@ -624,6 +718,27 @@ function App() {
   const usersWithoutDomainScope = users.filter((u) => u.role === 'domain-admin' && (!u.domainIds || u.domainIds.length === 0)).length;
   const configuredAdminFQDN = settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '');
   const fqdnPreview = hostSub && hostDomain ? `${hostSub}.${hostDomain}` : '';
+  const hostUsesDirectUpstream = !hostHAEnabled && !hostSSHBastion;
+  const hostEffectiveUpstream = hostSSHBastion ? SSH_BASTION_DEFAULT_UPSTREAM : hostUpstream;
+  const sshRouteByFQDN = useMemo(() => {
+    const out: Record<string, SSHBastionRoute> = {};
+    sshRoutes.forEach((r) => { out[r.fqdn.toLowerCase()] = r; });
+    return out;
+  }, [sshRoutes]);
+  const sshCandidateHosts = useMemo(
+    () => hosts.filter((h) => !h.haEnabled && (h.upstreamUrl || '').trim().toLowerCase() === SSH_BASTION_DEFAULT_UPSTREAM),
+    [hosts],
+  );
+  const sshUnroutedCandidateHosts = useMemo(
+    () => sshCandidateHosts.filter((h) => !sshRouteByFQDN[h.fqdn.toLowerCase()]),
+    [sshCandidateHosts, sshRouteByFQDN],
+  );
+  useEffect(() => {
+    if (tab !== 'ssh') return;
+    if (sshSelectedHostFQDN) return;
+    if (sshUnroutedCandidateHosts.length === 0) return;
+    setSshSelectedHostFQDN(sshUnroutedCandidateHosts[0].fqdn);
+  }, [tab, sshSelectedHostFQDN, sshUnroutedCandidateHosts]);
   const selectedHost = selectedHostID ? (hosts.find((h) => h.id === selectedHostID) || null) : null;
   const requestsByHostID = useMemo(() => {
     const out: Record<number, number> = {};
@@ -930,6 +1045,191 @@ function App() {
     }
   };
 
+  const saveSSHRoute = async () => {
+    const fqdn = (sshSelectedHostFQDN || sshRouteFQDN).trim().toLowerCase();
+    if (!fqdn || !sshRouteTargetHost.trim() || !sshRouteTargetPort.trim()) return;
+    const existing = sshRouteByFQDN[fqdn];
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<SSHBastionRoute>('/api/v1/ssh/routes', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          id: existing?.id || 0,
+          fqdn,
+          targetHost: sshRouteTargetHost.trim(),
+          targetPort: Number(sshRouteTargetPort) || 22,
+          enabled: sshRouteEnabled,
+        }),
+      });
+      setSshRoutes((prev) => {
+        const idx = prev.findIndex((r) => r.id === out.id || r.fqdn.toLowerCase() === out.fqdn.toLowerCase());
+        if (idx < 0) return [out, ...prev].sort((a, b) => a.fqdn.localeCompare(b.fqdn));
+        const next = [...prev];
+        next[idx] = out;
+        return next.sort((a, b) => a.fqdn.localeCompare(b.fqdn));
+      });
+      setSshSelectedHostFQDN('');
+      setSshRouteFQDN('');
+      setSshRouteTargetHost('');
+      setSshRouteTargetPort('22');
+      setSshRouteEnabled(true);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteSSHRoute = async (id: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/ssh/routes/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleSSHKeyRoute = (id: number) => {
+    setSshKeyRouteIDs((prev) => prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]);
+  };
+
+  const editSSHRoute = (r: SSHBastionRoute) => {
+    setSshSelectedHostFQDN(r.fqdn);
+    setSshRouteFQDN(r.fqdn);
+    setSshRouteTargetHost(r.targetHost);
+    setSshRouteTargetPort(String(r.targetPort || 22));
+    setSshRouteEnabled(!!r.enabled);
+  };
+
+  const generateSSHKeyForRoute = async (routeID: number, fqdn: string) => {
+    setLoading(true);
+    setError('');
+    try {
+      const safeName = fqdn.replace(/[^a-zA-Z0-9._-]/g, '-');
+      const out = await api<SSHBastionGenerate>('/api/v1/ssh/keys/generate', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ name: `${safeName}-key`, routeIds: [routeID] }),
+      });
+      setSshGeneratedPrivateKey(out.privateKey || '');
+      setSshGeneratedPublicKey(out.key?.publicKey || '');
+      setSshGeneratedKeyName(out.key?.name || `${safeName}-key`);
+      setSshGeneratedPPK(out.privateKeyPpk || '');
+      setSshGeneratedRFC4716(out.publicKeyRfc4716 || '');
+      setSshGeneratedPPKError(out.ppkError || '');
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const generateSSHKey = async () => {
+    if (!sshKeyName.trim() || sshKeyRouteIDs.length === 0) return;
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<SSHBastionGenerate>('/api/v1/ssh/keys/generate', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ name: sshKeyName.trim(), routeIds: sshKeyRouteIDs }),
+      });
+      setSshGeneratedPrivateKey(out.privateKey || '');
+      setSshGeneratedPublicKey(out.key?.publicKey || '');
+      setSshGeneratedKeyName(out.key?.name || sshKeyName.trim());
+      setSshGeneratedPPK(out.privateKeyPpk || '');
+      setSshGeneratedRFC4716(out.publicKeyRfc4716 || '');
+      setSshGeneratedPPKError(out.ppkError || '');
+      setSshKeyName('');
+      setSshKeyPublic('');
+      setSshKeyRouteIDs([]);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const downloadGeneratedLinuxKey = () => {
+    if (!sshGeneratedPrivateKey.trim()) return;
+    const base = (sshGeneratedKeyName || 'domnex-bastion-key').replace(/[^a-zA-Z0-9._-]/g, '-');
+    downloadTextFile(`${base}.key`, sshGeneratedPrivateKey.endsWith('\n') ? sshGeneratedPrivateKey : `${sshGeneratedPrivateKey}\n`);
+  };
+
+  const downloadGeneratedWindowsKey = () => {
+    if (!sshGeneratedPrivateKey.trim()) return;
+    const base = (sshGeneratedKeyName || 'domnex-bastion-key').replace(/[^a-zA-Z0-9._-]/g, '-');
+    const content = (sshGeneratedPrivateKey.endsWith('\n') ? sshGeneratedPrivateKey : `${sshGeneratedPrivateKey}\n`).replace(/\n/g, '\r\n');
+    downloadTextFile(`${base}.pem`, content);
+  };
+
+  const downloadGeneratedPublicKey = () => {
+    if (!sshGeneratedPublicKey.trim()) return;
+    const base = (sshGeneratedKeyName || 'domnex-bastion-key').replace(/[^a-zA-Z0-9._-]/g, '-');
+    downloadTextFile(`${base}.pub`, sshGeneratedPublicKey.endsWith('\n') ? sshGeneratedPublicKey : `${sshGeneratedPublicKey}\n`);
+  };
+
+  const downloadGeneratedPPK = () => {
+    if (!sshGeneratedPPK.trim()) return;
+    const base = (sshGeneratedKeyName || 'domnex-bastion-key').replace(/[^a-zA-Z0-9._-]/g, '-');
+    downloadTextFile(`${base}.ppk`, sshGeneratedPPK.endsWith('\n') ? sshGeneratedPPK : `${sshGeneratedPPK}\n`);
+  };
+
+  const downloadGeneratedRFC4716 = () => {
+    if (!sshGeneratedRFC4716.trim()) return;
+    const base = (sshGeneratedKeyName || 'domnex-bastion-key').replace(/[^a-zA-Z0-9._-]/g, '-');
+    downloadTextFile(`${base}.ssh2`, sshGeneratedRFC4716.endsWith('\n') ? sshGeneratedRFC4716 : `${sshGeneratedRFC4716}\n`);
+  };
+
+  const importSSHKey = async () => {
+    if (!sshKeyName.trim() || !sshKeyPublic.trim() || sshKeyRouteIDs.length === 0) return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/ssh/keys/import', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ name: sshKeyName.trim(), publicKey: sshKeyPublic.trim(), routeIds: sshKeyRouteIDs }),
+      });
+      setSshKeyName('');
+      setSshKeyPublic('');
+      setSshKeyRouteIDs([]);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteSSHKey = async (id: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/ssh/keys/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const createUser = async () => {
     setLoading(true);
     setError('');
@@ -1109,6 +1409,7 @@ function App() {
             {identity?.role === 'admin' ? <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Settings</button> : null}
             {identity?.role === 'admin' ? <button className={tab === 'api' ? 'active' : ''} onClick={() => setTab('api')}>API Mgmt</button> : null}
             {identity?.role === 'admin' ? <button className={tab === 'apiDocs' ? 'active' : ''} onClick={() => setTab('apiDocs')}>API Docs</button> : null}
+            {identity?.role === 'admin' ? <button className={tab === 'ssh' ? 'active' : ''} onClick={() => setTab('ssh')}>SSH Bastion</button> : null}
             <button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Logs</button>
           </nav>
         </aside>
@@ -1647,8 +1948,9 @@ function App() {
                             ))}
                           </select>
                           <input value={hostSub} onChange={(e) => setHostSub(e.target.value.toLowerCase().trim())} placeholder="app" />
-                          <label className="check"><input type="checkbox" checked={hostHAEnabled} onChange={(e) => setHostHAEnabled(e.target.checked)} /> Enable HA</label>
-                          {!hostHAEnabled ? <input value={hostUpstream} onChange={(e) => setHostUpstream(e.target.value)} placeholder="http://127.0.0.1:3000" /> : null}
+                          <label className="check"><input type="checkbox" checked={hostHAEnabled} onChange={(e) => { const checked = e.target.checked; setHostHAEnabled(checked); if (checked) setHostSSHBastion(false); }} /> Enable HA</label>
+                          {identity?.role === 'admin' ? <label className="check"><input type="checkbox" checked={hostSSHBastion} onChange={(e) => { const checked = e.target.checked; setHostSSHBastion(checked); if (checked) setHostHAEnabled(false); }} /> SSH Bastion</label> : null}
+                          {hostUsesDirectUpstream ? <input value={hostUpstream} onChange={(e) => setHostUpstream(e.target.value)} placeholder="http://127.0.0.1:3000" /> : null}
                           {hostHAEnabled ? (
                             <select value={hostHAMode} onChange={(e) => setHostHAMode(e.target.value as 'failover' | 'round_robin')}>
                               <option value="failover">Failover</option>
@@ -1656,7 +1958,7 @@ function App() {
                             </select>
                           ) : null}
                           <label className="check"><input type="checkbox" checked={hostInsecureTLS} onChange={(e) => setHostInsecureTLS(e.target.checked)} /> No TLS Verify</label>
-                          <button className="btn" onClick={() => { setHostPreflight(null); setHostWizardStep(2); }} disabled={!hostDomain || !hostSub || (!hostHAEnabled && !hostUpstream)}>Next</button>
+                          <button className="btn" onClick={() => { setHostPreflight(null); setHostWizardStep(2); }} disabled={!hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)}>Next</button>
                         </div>
                         {hostHAEnabled ? (
                           <>
@@ -1675,6 +1977,9 @@ function App() {
                         {hostHAEnabled ? (
                           <div className="muted">HA enabled. Configure named backend servers (minimum 2).</div>
                         ) : null}
+                        {hostSSHBastion ? (
+                          <div className="muted">SSH Bastion enabled. Upstream is auto-bound to this DomNex node and the FQDN is auto-added to SSH Bastion routes.</div>
+                        ) : null}
                         <div className="muted">
                           {fqdnPreview ? `Will be created as: ${fqdnPreview}` : 'Enter a subdomain name, choose a domain, and set the upstream.'}
                         </div>
@@ -1686,7 +1991,7 @@ function App() {
                           Checks run automatically every 4 seconds. Continue only when all checks are green.
                         </div>
                         <div className="muted" style={{ marginBottom: '.5rem' }}>
-                          Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled (self-signed accepted)' : 'enabled (strict verify)'}</strong> · Routing: <strong>{hostHAEnabled ? `HA (${hostHAMode})` : 'Single Upstream'}</strong>
+                          Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled (self-signed accepted)' : 'enabled (strict verify)'}</strong> · Routing: <strong>{hostHAEnabled ? `HA (${hostHAMode})` : hostSSHBastion ? 'SSH Bastion' : 'Single Upstream'}</strong>
                         </div>
                         {hostPreflight ? (
                           <div className="diag" style={{ marginBottom: '.5rem' }}>
@@ -1712,6 +2017,7 @@ function App() {
                         </div>
                         <div className="muted" style={{ marginBottom: '.5rem' }}>
                           Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled' : 'enabled'}</strong>
+                          {hostSSHBastion ? <span> · SSH Bastion route will be created automatically.</span> : null}
                         </div>
                         <div className="row">
                           <button className="btn" onClick={() => setHostWizardStep(2)}>Back</button>
@@ -2119,6 +2425,114 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 # Token revoke
 curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
               </div>
+            </section>
+          ) : null}
+
+          {identity?.role === 'admin' && tab === 'ssh' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>SSH Bastion Routes</h3></div>
+                  {sshCandidateHosts.length > 0 ? (
+                    <div className="muted" style={{ marginBottom: '.45rem' }}>
+                      Bastion candidates from Subdomains: {sshCandidateHosts.length} total, {sshUnroutedCandidateHosts.length} without route.
+                    </div>
+                  ) : (
+                    <div className="muted" style={{ marginBottom: '.45rem' }}>
+                      No bastion candidates found in Subdomains yet. Create a Subdomain with SSH Bastion first.
+                    </div>
+                  )}
+                  <div className="row">
+                    <select value={sshSelectedHostFQDN} onChange={(e) => setSshSelectedHostFQDN(e.target.value)}>
+                      <option value="">Select Subdomain (recommended)</option>
+                      {sshCandidateHosts.map((h) => (
+                        <option key={`ssh-cand-${h.id}`} value={h.fqdn}>
+                          {h.fqdn}{sshRouteByFQDN[h.fqdn.toLowerCase()] ? ' (configured)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                    <input value={sshRouteFQDN} onChange={(e) => setSshRouteFQDN(e.target.value)} placeholder="manual FQDN fallback" />
+                    <input value={sshRouteTargetHost} onChange={(e) => setSshRouteTargetHost(e.target.value)} placeholder="192.168.1.14" />
+                    <input value={sshRouteTargetPort} onChange={(e) => setSshRouteTargetPort(e.target.value)} placeholder="22" />
+                    <label className="check"><input type="checkbox" checked={sshRouteEnabled} onChange={(e) => setSshRouteEnabled(e.target.checked)} /> enabled</label>
+                    <button className="btn" onClick={saveSSHRoute} disabled={loading || (!sshSelectedHostFQDN.trim() && !sshRouteFQDN.trim())}>Save Route</button>
+                  </div>
+                  {sshRoutes.length === 0 ? (
+                    <div className="muted">No SSH routes configured.</div>
+                  ) : (
+                    sshRoutes.map((r) => (
+                      <div key={r.id} className="host">
+                        <div>
+                          <strong>{r.fqdn}</strong>
+                          <div className="muted">{r.targetHost}:{r.targetPort} · {r.enabled ? 'enabled' : 'disabled'}</div>
+                        </div>
+                        <div className="row">
+                          <button className="btn" onClick={() => editSSHRoute(r)} disabled={loading}>Edit</button>
+                          <button className="btn" onClick={() => generateSSHKeyForRoute(r.id, r.fqdn)} disabled={loading}>Generate Host Key</button>
+                          <button className="btn danger" onClick={() => deleteSSHRoute(r.id)} disabled={loading}>Delete</button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>SSH Bastion Keys</h3></div>
+                  <div className="row">
+                    <input value={sshKeyName} onChange={(e) => setSshKeyName(e.target.value)} placeholder="user1-key" />
+                    <button className="btn" onClick={generateSSHKey} disabled={loading || !sshKeyName || sshKeyRouteIDs.length === 0}>Generate Keypair</button>
+                    <button className="btn" onClick={importSSHKey} disabled={loading || !sshKeyName || !sshKeyPublic || sshKeyRouteIDs.length === 0}>Import Public Key</button>
+                  </div>
+                  <textarea value={sshKeyPublic} onChange={(e) => setSshKeyPublic(e.target.value)} placeholder="ssh-ed25519 AAAA... user@host" rows={3} />
+                  <div className="muted" style={{ marginBottom: '.3rem' }}>Allowed routes:</div>
+                  <div className="domain-pills">
+                    {sshRoutes.map((r) => (
+                      <label key={`ssh-route-${r.id}`} className="pill">
+                        <input type="checkbox" checked={sshKeyRouteIDs.includes(r.id)} onChange={() => toggleSSHKeyRoute(r.id)} />
+                        {r.fqdn}
+                      </label>
+                    ))}
+                  </div>
+                  {sshGeneratedPrivateKey ? (
+                    <div className="card" style={{ marginBottom: '.6rem' }}>
+                      <div className="muted">Generated private key (shown once):</div>
+                      <div className="row" style={{ marginBottom: '.35rem' }}>
+                        <button className="btn" onClick={downloadGeneratedLinuxKey} disabled={loading}>Download Linux/macOS Key (.key)</button>
+                        <button className="btn" onClick={downloadGeneratedWindowsKey} disabled={loading}>Download Windows Key (.pem)</button>
+                        <button className="btn" onClick={downloadGeneratedPPK} disabled={loading || !sshGeneratedPPK}>Download PuTTY Key (.ppk)</button>
+                        <button className="btn" onClick={downloadGeneratedPublicKey} disabled={loading || !sshGeneratedPublicKey}>Download Public Key (.pub)</button>
+                        <button className="btn" onClick={downloadGeneratedRFC4716} disabled={loading || !sshGeneratedRFC4716}>Download RFC4716 Public (.ssh2)</button>
+                      </div>
+                      {sshGeneratedPPKError ? <div className="muted" style={{ marginBottom: '.25rem' }}>PPK export unavailable: {sshGeneratedPPKError}</div> : null}
+                      <pre>{sshGeneratedPrivateKey}</pre>
+                    </div>
+                  ) : null}
+                  {sshKeys.length === 0 ? (
+                    <div className="muted">No SSH keys configured.</div>
+                  ) : (
+                    sshKeys.map((k) => (
+                      <div key={k.id} className="host">
+                        <div>
+                          <strong>{k.name}</strong>
+                          <div className="muted">{k.fingerprint}</div>
+                          <div className="muted">Routes: {(k.routeIds || []).map((rid) => sshRoutes.find((r) => r.id === rid)?.fqdn || `#${rid}`).join(', ') || '-'}</div>
+                        </div>
+                        <button className="btn danger" onClick={() => deleteSSHKey(k.id)} disabled={loading}>Delete</button>
+                      </div>
+                    ))
+                  )}
+                </section>
+              </div>
+              <aside className="entity-side">
+                <section className="card">
+                  <div className="card-head"><h3>How To Use</h3></div>
+                  <div className="muted">Expose only one TCP port externally (e.g. 2222) and enable SSH Bastion in env config.</div>
+                  <div className="muted" style={{ marginTop: '.4rem' }}>Users authenticate with assigned key at bastion, then use SSH ProxyJump to allowed targets.</div>
+                  <pre>{`Host target1
+  HostName 192.168.1.14
+  User root
+  ProxyJump user1@bastion.yourdomain:2222`}</pre>
+                </section>
+              </aside>
             </section>
           ) : null}
 
@@ -2677,4 +3091,8 @@ function UserRow({
   );
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(
+  <RootErrorBoundary>
+    <App />
+  </RootErrorBoundary>,
+);

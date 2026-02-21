@@ -1,0 +1,242 @@
+package bastion
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/domnexdomain/domnexdomain/internal/logx"
+	"github.com/domnexdomain/domnexdomain/internal/model"
+	"golang.org/x/crypto/ssh"
+)
+
+type AuthSource interface {
+	GetSSHBastionAuthByFingerprint(ctx context.Context, fingerprint string) (model.SSHBastionKeyAuth, error)
+	AddAuditEvent(ctx context.Context, e model.AuditEvent) error
+}
+
+type Server struct {
+	addr        string
+	hostKeyPath string
+	src         AuthSource
+	log         *logx.Logger
+}
+
+func New(addr, hostKeyPath string, src AuthSource, log *logx.Logger) *Server {
+	return &Server{
+		addr:        strings.TrimSpace(addr),
+		hostKeyPath: strings.TrimSpace(hostKeyPath),
+		src:         src,
+		log:         log,
+	}
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	if s.addr == "" {
+		return fmt.Errorf("ssh bastion addr empty")
+	}
+	signer, err := ensureHostSigner(s.hostKeyPath)
+	if err != nil {
+		return err
+	}
+	cfg := &ssh.ServerConfig{
+		NoClientAuth: false,
+		PublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			fp := ssh.FingerprintSHA256(key)
+			auth, err := s.src.GetSSHBastionAuthByFingerprint(context.Background(), fp)
+			if err != nil || !auth.Key.Enabled {
+				_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
+					Actor:  "ssh-bastion",
+					Action: "ssh.bastion.auth.denied",
+					Target: meta.RemoteAddr().String(),
+					Meta:   "fingerprint=" + fp + ";user=" + meta.User(),
+				})
+				return nil, fmt.Errorf("unknown key")
+			}
+			_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
+				Actor:  "ssh-bastion",
+				Action: "ssh.bastion.auth.ok",
+				Target: auth.Key.Name,
+				Meta:   "fingerprint=" + fp + ";user=" + meta.User() + ";source=" + addrIP(meta.RemoteAddr()),
+			})
+			return &ssh.Permissions{Extensions: map[string]string{
+				"key_fingerprint": fp,
+				"principal":       auth.Key.Name,
+			}}, nil
+		},
+	}
+	cfg.AddHostKey(signer)
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	s.log.Info("ssh bastion listening", map[string]any{"addr": s.addr})
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			continue
+		}
+		go s.handleConn(conn, cfg)
+	}
+}
+
+func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
+	defer nc.Close()
+	serverConn, chans, reqs, err := ssh.NewServerConn(nc, cfg)
+	if err != nil {
+		return
+	}
+	defer serverConn.Close()
+	go ssh.DiscardRequests(reqs)
+	for ch := range chans {
+		if ch.ChannelType() != "direct-tcpip" {
+			_ = ch.Reject(ssh.UnknownChannelType, "only direct-tcpip is supported")
+			continue
+		}
+		var d struct {
+			DestAddr   string
+			DestPort   uint32
+			OriginAddr string
+			OriginPort uint32
+		}
+		if err := ssh.Unmarshal(ch.ExtraData(), &d); err != nil {
+			_ = ch.Reject(ssh.ConnectionFailed, "invalid direct-tcpip payload")
+			continue
+		}
+		fp := serverConn.Permissions.Extensions["key_fingerprint"]
+		auth, err := s.src.GetSSHBastionAuthByFingerprint(context.Background(), fp)
+		if err != nil || !auth.Key.Enabled {
+			_ = ch.Reject(ssh.Prohibited, "unauthorized key")
+			continue
+		}
+		targetHost := strings.TrimSpace(d.DestAddr)
+		targetPort := int(d.DestPort)
+		allowed := false
+		for _, rt := range auth.Routes {
+			if !rt.Enabled {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(rt.TargetHost), targetHost) && rt.TargetPort == targetPort {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
+				Actor:  auth.Key.Name,
+				Action: "ssh.bastion.forward.denied",
+				Target: fmt.Sprintf("%s:%d", targetHost, targetPort),
+				Meta:   "source=" + addrIP(serverConn.RemoteAddr()) + ";fingerprint=" + fp,
+			})
+			_ = ch.Reject(ssh.Prohibited, "target not allowed")
+			continue
+		}
+		upstream, err := net.DialTimeout("tcp", net.JoinHostPort(targetHost, fmt.Sprintf("%d", targetPort)), 8*time.Second)
+		if err != nil {
+			_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
+				Actor:  auth.Key.Name,
+				Action: "ssh.bastion.forward.error",
+				Target: fmt.Sprintf("%s:%d", targetHost, targetPort),
+				Meta:   "source=" + addrIP(serverConn.RemoteAddr()) + ";err=" + err.Error(),
+			})
+			_ = ch.Reject(ssh.ConnectionFailed, "target unreachable")
+			continue
+		}
+		channel, requests, err := ch.Accept()
+		if err != nil {
+			_ = upstream.Close()
+			continue
+		}
+		go ssh.DiscardRequests(requests)
+		_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
+			Actor:  auth.Key.Name,
+			Action: "ssh.bastion.forward.ok",
+			Target: fmt.Sprintf("%s:%d", targetHost, targetPort),
+			Meta:   "source=" + addrIP(serverConn.RemoteAddr()) + ";fingerprint=" + fp,
+		})
+		pipeConn(channel, upstream)
+	}
+}
+
+type rwc interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}
+
+func pipeConn(a, b rwc) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(a, b)
+		if c, ok := a.(interface{ CloseWrite() error }); ok {
+			_ = c.CloseWrite()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(b, a)
+		if c, ok := b.(interface{ CloseWrite() error }); ok {
+			_ = c.CloseWrite()
+		}
+	}()
+	wg.Wait()
+	_ = a.Close()
+	_ = b.Close()
+}
+
+func ensureHostSigner(path string) (ssh.Signer, error) {
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		return ssh.ParsePrivateKey(raw)
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		return nil, err
+	}
+	return ssh.ParsePrivateKey(pemBytes)
+}
+
+func addrIP(a net.Addr) string {
+	if a == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(a.String()))
+	if err != nil {
+		return strings.TrimSpace(a.String())
+	}
+	return strings.TrimSpace(host)
+}

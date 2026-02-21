@@ -93,3 +93,29 @@ type BlockedIP struct {
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
+
+type SSHBastionRoute struct {
+	ID         int64     `json:"id"`
+	FQDN       string    `json:"fqdn"`
+	TargetHost string    `json:"targetHost"`
+	TargetPort int       `json:"targetPort"`
+	Enabled    bool      `json:"enabled"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+type SSHBastionKey struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	PublicKey   string    `json:"publicKey"`
+	Fingerprint string    `json:"fingerprint"`
+	Enabled     bool      `json:"enabled"`
+	RouteIDs    []int64   `json:"routeIds"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+type SSHBastionKeyAuth struct {
+	Key    SSHBastionKey
+	Routes []SSHBastionRoute
+}

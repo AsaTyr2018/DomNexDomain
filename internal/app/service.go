@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -9,12 +10,15 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +29,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/logx"
 	"github.com/domnexdomain/domnexdomain/internal/model"
 	"github.com/domnexdomain/domnexdomain/internal/store"
+	"golang.org/x/crypto/ssh"
 )
 
 type Service struct {
@@ -225,6 +230,14 @@ type HostCountryTraffic struct {
 	Status4xx int64  `json:"status4xx"`
 	Status5xx int64  `json:"status5xx"`
 	BytesOut  int64  `json:"bytesOut"`
+}
+
+type SSHBastionKeyCreateResult struct {
+	Key              model.SSHBastionKey `json:"key"`
+	PrivateKey       string              `json:"privateKey,omitempty"`
+	PrivateKeyPPK    string              `json:"privateKeyPpk,omitempty"`
+	PublicKeyRFC4716 string              `json:"publicKeyRfc4716,omitempty"`
+	PPKError         string              `json:"ppkError,omitempty"`
 }
 
 func normalizeRequestClass(class string) string {
@@ -596,6 +609,130 @@ func (s *Service) RemoveHost(ctx context.Context, id int64) error {
 		}
 	}
 	return s.store.RemoveHost(ctx, id)
+}
+
+func (s *Service) ListSSHBastionRoutes(ctx context.Context) ([]model.SSHBastionRoute, error) {
+	return s.store.ListSSHBastionRoutes(ctx)
+}
+
+func (s *Service) UpsertSSHBastionRoute(ctx context.Context, in model.SSHBastionRoute) (model.SSHBastionRoute, error) {
+	return s.store.UpsertSSHBastionRoute(ctx, in)
+}
+
+func (s *Service) DeleteSSHBastionRoute(ctx context.Context, id int64) error {
+	return s.store.DeleteSSHBastionRoute(ctx, id)
+}
+
+func (s *Service) ListSSHBastionKeys(ctx context.Context) ([]model.SSHBastionKey, error) {
+	return s.store.ListSSHBastionKeys(ctx)
+}
+
+func (s *Service) CreateSSHBastionKeyFromPublic(ctx context.Context, name, publicKey string, routeIDs []int64) (model.SSHBastionKey, error) {
+	name = strings.TrimSpace(name)
+	publicKey = strings.TrimSpace(publicKey)
+	if name == "" || publicKey == "" {
+		return model.SSHBastionKey{}, fmt.Errorf("name and public key required")
+	}
+	pk, _, _, _, err := ssh.ParseAuthorizedKey([]byte(publicKey))
+	if err != nil {
+		return model.SSHBastionKey{}, fmt.Errorf("invalid public key: %w", err)
+	}
+	fp := ssh.FingerprintSHA256(pk)
+	return s.store.CreateSSHBastionKey(ctx, name, string(ssh.MarshalAuthorizedKey(pk)), fp, true, routeIDs)
+}
+
+func (s *Service) GenerateSSHBastionKey(ctx context.Context, name string, routeIDs []int64) (SSHBastionKeyCreateResult, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return SSHBastionKeyCreateResult{}, fmt.Errorf("name required")
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return SSHBastionKeyCreateResult{}, err
+	}
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		return SSHBastionKeyCreateResult{}, err
+	}
+	fp := ssh.FingerprintSHA256(sshPub)
+	key, err := s.store.CreateSSHBastionKey(ctx, name, string(ssh.MarshalAuthorizedKey(sshPub)), fp, true, routeIDs)
+	if err != nil {
+		return SSHBastionKeyCreateResult{}, err
+	}
+	openSSHBlock, err := ssh.MarshalPrivateKey(priv, name)
+	if err != nil {
+		return SSHBastionKeyCreateResult{}, err
+	}
+	privatePEM := pem.EncodeToMemory(openSSHBlock)
+	rfc4716, err := toRFC4716Public(sshPub)
+	if err != nil {
+		return SSHBastionKeyCreateResult{}, err
+	}
+	ppk, ppkErr := toPPKFromPrivatePEM(privatePEM)
+	out := SSHBastionKeyCreateResult{
+		Key:              key,
+		PrivateKey:       string(privatePEM),
+		PublicKeyRFC4716: rfc4716,
+	}
+	if ppkErr != nil {
+		out.PPKError = ppkErr.Error()
+	} else {
+		out.PrivateKeyPPK = ppk
+	}
+	return out, nil
+}
+
+func toRFC4716Public(pub ssh.PublicKey) (string, error) {
+	if pub == nil {
+		return "", fmt.Errorf("missing public key")
+	}
+	b64 := base64.StdEncoding.EncodeToString(pub.Marshal())
+	var lines []string
+	for len(b64) > 70 {
+		lines = append(lines, b64[:70])
+		b64 = b64[70:]
+	}
+	if b64 != "" {
+		lines = append(lines, b64)
+	}
+	return "---- BEGIN SSH2 PUBLIC KEY ----\n" + strings.Join(lines, "\n") + "\n---- END SSH2 PUBLIC KEY ----\n", nil
+}
+
+func toPPKFromPrivatePEM(privatePEM []byte) (string, error) {
+	if len(privatePEM) == 0 {
+		return "", fmt.Errorf("empty private key")
+	}
+	if _, err := exec.LookPath("puttygen"); err != nil {
+		return "", fmt.Errorf("puttygen not installed")
+	}
+	dir, err := os.MkdirTemp("", "domnex-ppk-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	inPath := dir + "/key.pem"
+	outPath := dir + "/key.ppk"
+	if err := os.WriteFile(inPath, privatePEM, 0o600); err != nil {
+		return "", err
+	}
+	cmd := exec.Command("puttygen", inPath, "-O", "private", "-o", outPath)
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("puttygen failed: %s", strings.TrimSpace(string(raw)))
+	}
+	ppk, err := os.ReadFile(outPath)
+	if err != nil {
+		return "", err
+	}
+	return string(ppk), nil
+}
+
+func (s *Service) DeleteSSHBastionKey(ctx context.Context, id int64) error {
+	return s.store.DeleteSSHBastionKey(ctx, id)
+}
+
+func (s *Service) GetSSHBastionAuthByFingerprint(ctx context.Context, fingerprint string) (model.SSHBastionKeyAuth, error) {
+	return s.store.GetSSHBastionAuthByFingerprint(ctx, fingerprint)
 }
 
 func (s *Service) SetHostDisabled(ctx context.Context, hostID int64, disabled bool) (model.Host, error) {

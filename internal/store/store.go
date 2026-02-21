@@ -223,11 +223,41 @@ CREATE TABLE IF NOT EXISTS host_visitors_daily (
   FOREIGN KEY(host_id) REFERENCES hosts(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS ssh_bastion_routes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fqdn TEXT NOT NULL UNIQUE,
+  target_host TEXT NOT NULL,
+  target_port INTEGER NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ssh_bastion_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  fingerprint TEXT NOT NULL UNIQUE,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ssh_bastion_key_routes (
+  key_id INTEGER NOT NULL,
+  route_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(key_id, route_id),
+  FOREIGN KEY(key_id) REFERENCES ssh_bastion_keys(id) ON DELETE CASCADE,
+  FOREIGN KEY(route_id) REFERENCES ssh_bastion_routes(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_bucket ON host_traffic_minute(bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_host_bucket ON host_traffic_minute(host_id, bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_class_minute_bucket ON host_traffic_class_minute(bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_class_minute_host_bucket ON host_traffic_class_minute(host_id, bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_visitors_daily_day ON host_visitors_daily(day);
+CREATE INDEX IF NOT EXISTS idx_ssh_bastion_key_fingerprint ON ssh_bastion_keys(fingerprint);
 `
 	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
@@ -1488,4 +1518,252 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 INSERT INTO settings(key, value, updated_at) VALUES(?,?,?)
 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`, key, value, now)
 	return err
+}
+
+func (s *Store) UpsertSSHBastionRoute(ctx context.Context, in model.SSHBastionRoute) (model.SSHBastionRoute, error) {
+	in.FQDN = strings.ToLower(strings.TrimSpace(in.FQDN))
+	in.TargetHost = strings.TrimSpace(in.TargetHost)
+	if in.FQDN == "" || in.TargetHost == "" || in.TargetPort <= 0 || in.TargetPort > 65535 {
+		return model.SSHBastionRoute{}, fmt.Errorf("invalid ssh bastion route")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if in.ID > 0 {
+		_, err := s.db.ExecContext(ctx, `
+UPDATE ssh_bastion_routes
+SET fqdn=?, target_host=?, target_port=?, enabled=?, updated_at=?
+WHERE id=?`, in.FQDN, in.TargetHost, in.TargetPort, boolToInt(in.Enabled), now, in.ID)
+		if err != nil {
+			return model.SSHBastionRoute{}, err
+		}
+		return s.GetSSHBastionRouteByID(ctx, in.ID)
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO ssh_bastion_routes(fqdn, target_host, target_port, enabled, created_at, updated_at)
+VALUES(?,?,?,?,?,?)
+ON CONFLICT(fqdn) DO UPDATE SET
+  target_host=excluded.target_host,
+  target_port=excluded.target_port,
+  enabled=excluded.enabled,
+  updated_at=excluded.updated_at`, in.FQDN, in.TargetHost, in.TargetPort, boolToInt(in.Enabled), now, now)
+	if err != nil {
+		return model.SSHBastionRoute{}, err
+	}
+	return s.GetSSHBastionRouteByFQDN(ctx, in.FQDN)
+}
+
+func (s *Store) GetSSHBastionRouteByFQDN(ctx context.Context, fqdn string) (model.SSHBastionRoute, error) {
+	fqdn = strings.ToLower(strings.TrimSpace(fqdn))
+	var out model.SSHBastionRoute
+	var created, updated string
+	var enabled int
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, fqdn, target_host, target_port, enabled, created_at, updated_at
+FROM ssh_bastion_routes WHERE fqdn=?`, fqdn).
+		Scan(&out.ID, &out.FQDN, &out.TargetHost, &out.TargetPort, &enabled, &created, &updated)
+	if err != nil {
+		return out, err
+	}
+	out.Enabled = enabled != 0
+	out.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	out.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	return out, nil
+}
+
+func (s *Store) GetSSHBastionRouteByID(ctx context.Context, id int64) (model.SSHBastionRoute, error) {
+	var out model.SSHBastionRoute
+	var created, updated string
+	var enabled int
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, fqdn, target_host, target_port, enabled, created_at, updated_at
+FROM ssh_bastion_routes WHERE id=?`, id).
+		Scan(&out.ID, &out.FQDN, &out.TargetHost, &out.TargetPort, &enabled, &created, &updated)
+	if err != nil {
+		return out, err
+	}
+	out.Enabled = enabled != 0
+	out.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	out.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	return out, nil
+}
+
+func (s *Store) ListSSHBastionRoutes(ctx context.Context) ([]model.SSHBastionRoute, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, fqdn, target_host, target_port, enabled, created_at, updated_at
+FROM ssh_bastion_routes
+ORDER BY fqdn`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.SSHBastionRoute{}
+	for rows.Next() {
+		var item model.SSHBastionRoute
+		var created, updated string
+		var enabled int
+		if err := rows.Scan(&item.ID, &item.FQDN, &item.TargetHost, &item.TargetPort, &enabled, &created, &updated); err != nil {
+			return nil, err
+		}
+		item.Enabled = enabled != 0
+		item.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteSSHBastionRoute(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ssh_bastion_routes WHERE id=?`, id)
+	return err
+}
+
+func (s *Store) CreateSSHBastionKey(ctx context.Context, name, publicKey, fingerprint string, enabled bool, routeIDs []int64) (model.SSHBastionKey, error) {
+	name = strings.TrimSpace(name)
+	publicKey = strings.TrimSpace(publicKey)
+	fingerprint = strings.TrimSpace(fingerprint)
+	if name == "" || publicKey == "" || fingerprint == "" {
+		return model.SSHBastionKey{}, fmt.Errorf("invalid ssh bastion key")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.SSHBastionKey{}, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := tx.ExecContext(ctx, `
+INSERT INTO ssh_bastion_keys(name, public_key, fingerprint, enabled, created_at, updated_at)
+VALUES(?,?,?,?,?,?)`, name, publicKey, fingerprint, boolToInt(enabled), now, now)
+	if err != nil {
+		return model.SSHBastionKey{}, err
+	}
+	keyID, _ := res.LastInsertId()
+	for _, rid := range routeIDs {
+		if rid <= 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO ssh_bastion_key_routes(key_id, route_id, created_at)
+VALUES(?,?,?)`, keyID, rid, now); err != nil {
+			return model.SSHBastionKey{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return model.SSHBastionKey{}, err
+	}
+	return s.GetSSHBastionKeyByID(ctx, keyID)
+}
+
+func (s *Store) GetSSHBastionKeyByID(ctx context.Context, id int64) (model.SSHBastionKey, error) {
+	var out model.SSHBastionKey
+	var created, updated string
+	var enabled int
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, name, public_key, fingerprint, enabled, created_at, updated_at
+FROM ssh_bastion_keys WHERE id=?`, id).
+		Scan(&out.ID, &out.Name, &out.PublicKey, &out.Fingerprint, &enabled, &created, &updated)
+	if err != nil {
+		return out, err
+	}
+	out.Enabled = enabled != 0
+	out.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	out.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	routeRows, err := s.db.QueryContext(ctx, `SELECT route_id FROM ssh_bastion_key_routes WHERE key_id=? ORDER BY route_id`, out.ID)
+	if err != nil {
+		return out, err
+	}
+	defer routeRows.Close()
+	for routeRows.Next() {
+		var rid int64
+		if err := routeRows.Scan(&rid); err != nil {
+			return out, err
+		}
+		out.RouteIDs = append(out.RouteIDs, rid)
+	}
+	return out, routeRows.Err()
+}
+
+func (s *Store) ListSSHBastionKeys(ctx context.Context) ([]model.SSHBastionKey, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, name, public_key, fingerprint, enabled, created_at, updated_at
+FROM ssh_bastion_keys
+ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.SSHBastionKey{}
+	for rows.Next() {
+		var item model.SSHBastionKey
+		var created, updated string
+		var enabled int
+		if err := rows.Scan(&item.ID, &item.Name, &item.PublicKey, &item.Fingerprint, &enabled, &created, &updated); err != nil {
+			return nil, err
+		}
+		item.Enabled = enabled != 0
+		item.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		out = append(out, item)
+	}
+	for i := range out {
+		routeRows, err := s.db.QueryContext(ctx, `SELECT route_id FROM ssh_bastion_key_routes WHERE key_id=? ORDER BY route_id`, out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		for routeRows.Next() {
+			var rid int64
+			if err := routeRows.Scan(&rid); err != nil {
+				routeRows.Close()
+				return nil, err
+			}
+			out[i].RouteIDs = append(out[i].RouteIDs, rid)
+		}
+		routeRows.Close()
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteSSHBastionKey(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ssh_bastion_keys WHERE id=?`, id)
+	return err
+}
+
+func (s *Store) GetSSHBastionAuthByFingerprint(ctx context.Context, fingerprint string) (model.SSHBastionKeyAuth, error) {
+	fingerprint = strings.TrimSpace(fingerprint)
+	var out model.SSHBastionKeyAuth
+	var enabled int
+	var created, updated string
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, name, public_key, fingerprint, enabled, created_at, updated_at
+FROM ssh_bastion_keys
+WHERE fingerprint=?`, fingerprint).
+		Scan(&out.Key.ID, &out.Key.Name, &out.Key.PublicKey, &out.Key.Fingerprint, &enabled, &created, &updated)
+	if err != nil {
+		return out, err
+	}
+	out.Key.Enabled = enabled != 0
+	out.Key.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	out.Key.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT r.id, r.fqdn, r.target_host, r.target_port, r.enabled, r.created_at, r.updated_at
+FROM ssh_bastion_key_routes kr
+JOIN ssh_bastion_routes r ON r.id = kr.route_id
+WHERE kr.key_id=?
+ORDER BY r.id`, out.Key.ID)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rt model.SSHBastionRoute
+		var rtEnabled int
+		var rtCreated, rtUpdated string
+		if err := rows.Scan(&rt.ID, &rt.FQDN, &rt.TargetHost, &rt.TargetPort, &rtEnabled, &rtCreated, &rtUpdated); err != nil {
+			return out, err
+		}
+		rt.Enabled = rtEnabled != 0
+		rt.CreatedAt, _ = time.Parse(time.RFC3339Nano, rtCreated)
+		rt.UpdatedAt, _ = time.Parse(time.RFC3339Nano, rtUpdated)
+		out.Key.RouteIDs = append(out.Key.RouteIDs, rt.ID)
+		out.Routes = append(out.Routes, rt)
+	}
+	return out, rows.Err()
 }

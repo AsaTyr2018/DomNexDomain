@@ -113,6 +113,13 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/logout-all", s.handleLogoutAll)
 		pr.Post("/api/v1/security/ip-blocks", s.handleAddBlockedIP)
 		pr.Post("/api/v1/security/ip-blocks/remove", s.handleRemoveBlockedIP)
+		pr.Get("/api/v1/ssh/routes", s.handleListSSHBastionRoutes)
+		pr.Post("/api/v1/ssh/routes", s.handleUpsertSSHBastionRoute)
+		pr.Delete("/api/v1/ssh/routes/{id}", s.handleDeleteSSHBastionRoute)
+		pr.Get("/api/v1/ssh/keys", s.handleListSSHBastionKeys)
+		pr.Post("/api/v1/ssh/keys/import", s.handleImportSSHBastionKey)
+		pr.Post("/api/v1/ssh/keys/generate", s.handleGenerateSSHBastionKey)
+		pr.Delete("/api/v1/ssh/keys/{id}", s.handleDeleteSSHBastionKey)
 	})
 
 	r.Get("/*", func(w http.ResponseWriter, req *http.Request) {
@@ -1475,6 +1482,176 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "user.delete", Target: strconv.FormatInt(userID, 10), Meta: ""})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleListSSHBastionRoutes(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	items, err := s.app.ListSSHBastionRoutes(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleUpsertSSHBastionRoute(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		ID         int64  `json:"id"`
+		FQDN       string `json:"fqdn"`
+		TargetHost string `json:"targetHost"`
+		TargetPort int    `json:"targetPort"`
+		Enabled    bool   `json:"enabled"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out, err := s.app.UpsertSSHBastionRoute(r.Context(), model.SSHBastionRoute{
+		ID:         in.ID,
+		FQDN:       in.FQDN,
+		TargetHost: in.TargetHost,
+		TargetPort: in.TargetPort,
+		Enabled:    in.Enabled,
+	})
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "ssh.bastion.route.upsert",
+		Target: out.FQDN,
+		Meta:   out.TargetHost + ":" + strconv.Itoa(out.TargetPort),
+	})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleDeleteSSHBastionRoute(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	routeID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if routeID <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid route id")
+		return
+	}
+	if err := s.app.DeleteSSHBastionRoute(r.Context(), routeID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "ssh.bastion.route.delete",
+		Target: strconv.FormatInt(routeID, 10),
+		Meta:   "",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleListSSHBastionKeys(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	items, err := s.app.ListSSHBastionKeys(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleImportSSHBastionKey(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		Name      string  `json:"name"`
+		PublicKey string  `json:"publicKey"`
+		RouteIDs  []int64 `json:"routeIds"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	key, err := s.app.CreateSSHBastionKeyFromPublic(r.Context(), in.Name, in.PublicKey, in.RouteIDs)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "ssh.bastion.key.import",
+		Target: key.Name,
+		Meta:   key.Fingerprint,
+	})
+	writeJSON(w, http.StatusOK, key)
+}
+
+func (s *Server) handleGenerateSSHBastionKey(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		Name     string  `json:"name"`
+		RouteIDs []int64 `json:"routeIds"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out, err := s.app.GenerateSSHBastionKey(r.Context(), in.Name, in.RouteIDs)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "ssh.bastion.key.generate",
+		Target: out.Key.Name,
+		Meta:   out.Key.Fingerprint,
+	})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleDeleteSSHBastionKey(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	keyID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if keyID <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid key id")
+		return
+	}
+	if err := s.app.DeleteSSHBastionKey(r.Context(), keyID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "ssh.bastion.key.delete",
+		Target: strconv.FormatInt(keyID, 10),
+		Meta:   "",
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

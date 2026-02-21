@@ -16,6 +16,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/api"
 	"github.com/domnexdomain/domnexdomain/internal/app"
 	"github.com/domnexdomain/domnexdomain/internal/auth"
+	"github.com/domnexdomain/domnexdomain/internal/bastion"
 	"github.com/domnexdomain/domnexdomain/internal/config"
 	"github.com/domnexdomain/domnexdomain/internal/crypto"
 	"github.com/domnexdomain/domnexdomain/internal/dns"
@@ -185,6 +186,16 @@ func main() {
 	go px.StartRefresher(ctx, 10*time.Second)
 	go pruneSessions(ctx, st, log)
 	go tr.Start(ctx)
+
+	if cfg.SSHBastionOn {
+		sshBastion := bastion.New(cfg.SSHBastionAddr, cfg.SSHBastionKey, appSvc, log)
+		go func() {
+			if err := sshBastion.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Error("ssh bastion failed", map[string]any{"err": err.Error()})
+				stop()
+			}
+		}()
+	}
 
 	<-ctx.Done()
 	log.Info("shutdown requested", nil)

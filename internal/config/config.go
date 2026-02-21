@@ -31,6 +31,9 @@ type Config struct {
 	BootstrapPass  string
 	AllowedCIDRs   []string
 	EnableFileLogs bool
+	SSHBastionAddr string
+	SSHBastionOn   bool
+	SSHBastionKey  string
 }
 
 func Load() (Config, error) {
@@ -51,11 +54,14 @@ func Load() (Config, error) {
 		BootstrapUser:  getenv("DOMNEX_BOOTSTRAP_USER", "admin"),
 		BootstrapPass:  getenv("DOMNEX_BOOTSTRAP_PASSWORD", ""),
 		EnableFileLogs: getenv("DOMNEX_FILE_LOGS", "false") == "true",
+		SSHBastionAddr: getenv("DOMNEX_SSH_BASTION_ADDR", ":2222"),
+		SSHBastionOn:   getenv("DOMNEX_SSH_BASTION_ENABLED", "false") == "true",
 	}
 
 	cfg.DBPath = getenv("DOMNEX_DB_PATH", filepath.Join(cfg.DataDir, "domnex.sqlite3"))
 	cfg.SecretKeyPath = getenv("DOMNEX_SECRET_KEY", filepath.Join(cfg.DataDir, "keystore.key"))
 	cfg.ACMECacheDir = getenv("DOMNEX_ACME_CACHE", filepath.Join(cfg.DataDir, "acme"))
+	cfg.SSHBastionKey = getenv("DOMNEX_SSH_BASTION_HOST_KEY", filepath.Join(cfg.DataDir, "ssh_bastion_host_key.pem"))
 	cfg.AllowedCIDRs = splitCSV(getenv("DOMNEX_ADMIN_ALLOWED_CIDRS", "127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"))
 
 	if cfg.BootstrapPass == "" {
