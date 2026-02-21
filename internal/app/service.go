@@ -3009,6 +3009,15 @@ func decayThreatState(st *model.ThreatIntelIPState, now time.Time) {
 	if st == nil || st.LastSeenAt.IsZero() {
 		return
 	}
+	// Prison mode: while blocked, no rehabilitation decay is applied.
+	// - Hard block (perm) stays frozen until manually cleared.
+	// - Soft block stays frozen until ban window expires.
+	if st.PermBlocked {
+		return
+	}
+	if !st.BanUntil.IsZero() && st.BanUntil.After(now) {
+		return
+	}
 	idle := now.Sub(st.LastSeenAt)
 	// Conservative decay: keep offenders visible longer before rehabilitation.
 	if idle >= 30*time.Minute {
