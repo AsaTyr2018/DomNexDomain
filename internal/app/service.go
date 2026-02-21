@@ -3010,18 +3010,25 @@ func decayThreatState(st *model.ThreatIntelIPState, now time.Time) {
 		return
 	}
 	idle := now.Sub(st.LastSeenAt)
-	if idle >= 10*time.Minute {
-		steps := int(idle / (10 * time.Minute))
+	// Conservative decay: keep offenders visible longer before rehabilitation.
+	if idle >= 30*time.Minute {
+		steps := int(idle / (30 * time.Minute))
 		for i := 0; i < steps; i++ {
-			st.XP = int(math.Floor(float64(st.XP) * 0.85))
+			st.XP = int(math.Floor(float64(st.XP) * 0.93))
+			if st.XP < 0 {
+				st.XP = 0
+			}
 		}
 	}
-	if idle >= 24*time.Hour && st.Level > 0 {
-		down := int(idle / (24 * time.Hour))
+	if idle >= 72*time.Hour && st.Level > 0 {
+		down := int(idle / (72 * time.Hour))
 		if down > st.Level {
 			down = st.Level
 		}
 		st.Level -= down
+		if st.Level < 0 {
+			st.Level = 0
+		}
 	}
 }
 
@@ -3241,8 +3248,9 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 		if !st.BanUntil.IsZero() && !st.BanUntil.After(now) {
 			st.BanUntil = time.Time{}
 		}
-		// If an IP has fully cooled down, drop it from active threat state/history.
-		if st.XP <= 0 && !st.PermBlocked && st.BanUntil.IsZero() {
+		// If an IP has fully cooled down for a sustained period, drop it from active state/history.
+		idle := now.Sub(st.LastSeenAt)
+		if st.XP <= 0 && st.Level <= 0 && idle >= 72*time.Hour && !st.PermBlocked && st.BanUntil.IsZero() {
 			st.XP = 0
 			st.Level = 0
 			st.RiskState = "monitoring"
