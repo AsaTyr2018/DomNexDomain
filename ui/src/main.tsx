@@ -359,6 +359,8 @@ function App() {
   const [newUserPassword, setNewUserPassword] = useState('');
   const [newUserRole, setNewUserRole] = useState<'admin' | 'domain-admin' | 'read-only'>('domain-admin');
   const [newUserDomainIDs, setNewUserDomainIDs] = useState<number[]>([]);
+  const [usersRoleFilter, setUsersRoleFilter] = useState<'all' | 'admin' | 'domain-admin' | 'read-only'>('all');
+  const [usersQuery, setUsersQuery] = useState('');
   const [showPasswordDialog, setShowPasswordDialog] = useState(false);
   const [selfCurrentPassword, setSelfCurrentPassword] = useState('');
   const [selfNewPassword, setSelfNewPassword] = useState('');
@@ -1041,10 +1043,14 @@ function App() {
     if (!d) return false;
     return (d.dnsRecords || []).length > 0 && d.tlsOk && d.httpsStatus >= 200 && d.httpsStatus < 500;
   }).length;
-  const globalAdmins = users.filter((u) => u.role === 'admin').length;
-  const domainAdmins = users.filter((u) => u.role === 'domain-admin').length;
-  const readOnlyUsers = users.filter((u) => u.role === 'read-only').length;
-  const usersWithoutDomainScope = users.filter((u) => u.role === 'domain-admin' && (!u.domainIds || u.domainIds.length === 0)).length;
+  const filteredUsers = useMemo(() => {
+    const q = usersQuery.trim().toLowerCase();
+    return users.filter((u) => {
+      if (usersRoleFilter !== 'all' && u.role !== usersRoleFilter) return false;
+      if (!q) return true;
+      return u.username.toLowerCase().includes(q) || String(u.id).includes(q) || u.role.toLowerCase().includes(q);
+    });
+  }, [users, usersRoleFilter, usersQuery]);
   const configuredAdminFQDN = settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '');
   const activeTheme = useMemo<ThemeVars>(() => {
     const selectedProfile = identity ? settingsStyleProfile : publicStyleProfile;
@@ -3135,37 +3141,64 @@ function App() {
           ) : null}
 
           {identity?.role === 'admin' && tab === 'users' ? (
-            <section className="entity-page">
+            <section className="entity-page users-page">
               <div className="entity-main">
                 <section className="card">
-                  <div className="card-head"><h3>User Management</h3></div>
-                  <div className="row">
-                    <input value={newUserName} onChange={(e) => setNewUserName(e.target.value.toLowerCase().trim())} placeholder="username" />
-                    <input type="password" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} placeholder="password (min 10)" />
-                    <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as 'admin' | 'domain-admin' | 'read-only')}>
-                      <option value="domain-admin">Sub Admin (domain-admin)</option>
-                      <option value="read-only">Read Only</option>
-                      <option value="admin">Global Admin</option>
-                    </select>
+                  <div className="card-head"><h3>Create User</h3></div>
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>Username</label>
+                      <input value={newUserName} onChange={(e) => setNewUserName(e.target.value.toLowerCase().trim())} placeholder="username" />
+                    </div>
+                    <div className="field">
+                      <label>Temporary Password</label>
+                      <input type="password" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} placeholder="minimum 10 characters" />
+                    </div>
+                    <div className="field">
+                      <label>Role</label>
+                      <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as 'admin' | 'domain-admin' | 'read-only')}>
+                        <option value="domain-admin">Sub Admin (domain-admin)</option>
+                        <option value="read-only">Read Only</option>
+                        <option value="admin">Global Admin</option>
+                      </select>
+                    </div>
                   </div>
                   {newUserRole === 'domain-admin' ? (
-                    <div className="domain-pills">
-                      {domains.map((d) => (
-                        <label key={d.id} className="pill">
-                          <input type="checkbox" checked={newUserDomainIDs.includes(d.id)} onChange={() => toggleNewUserDomain(d.id)} />
-                          {d.name}
-                        </label>
-                      ))}
+                    <div className="field" style={{ marginBottom: '.8rem' }}>
+                      <label>Domain Scope</label>
+                      <div className="domain-pills">
+                        {domains.map((d) => (
+                          <label key={d.id} className="pill">
+                            <input type="checkbox" checked={newUserDomainIDs.includes(d.id)} onChange={() => toggleNewUserDomain(d.id)} />
+                            {d.name}
+                          </label>
+                        ))}
+                      </div>
                     </div>
                   ) : null}
-                  <div className="row">
+                  <div className="row" style={{ marginBottom: 0 }}>
                     <button className="btn" onClick={createUser} disabled={loading || !newUserName || !newUserPassword || (newUserRole === 'domain-admin' && newUserDomainIDs.length === 0)}>Create User</button>
                   </div>
                 </section>
 
                 <section className="card">
-                  <div className="card-head"><h3>Managed Users</h3></div>
-                  {users.map((u) => (
+                  <div className="card-head"><h3>User Operations</h3></div>
+                  <div className="log-filter-grid" style={{ gridTemplateColumns: 'repeat(3,minmax(0,1fr))' }}>
+                    <select value={usersRoleFilter} onChange={(e) => setUsersRoleFilter(e.target.value as 'all' | 'admin' | 'domain-admin' | 'read-only')}>
+                      <option value="all">All roles</option>
+                      <option value="admin">Global Admin</option>
+                      <option value="domain-admin">Domain Admin</option>
+                      <option value="read-only">Read Only</option>
+                    </select>
+                    <input value={usersQuery} onChange={(e) => setUsersQuery(e.target.value)} placeholder="Search username, role, id..." />
+                    <button className="btn" onClick={refresh} disabled={loading}>Refresh</button>
+                  </div>
+                  <div className="muted" style={{ marginBottom: '.6rem' }}>
+                    Showing {filteredUsers.length} of {users.length} users.
+                  </div>
+                  {filteredUsers.length === 0 ? (
+                    <div className="muted">No users match the current filter.</div>
+                  ) : filteredUsers.map((u) => (
                     <UserRow
                       key={u.id}
                       user={u}
@@ -3179,25 +3212,6 @@ function App() {
                   ))}
                 </section>
               </div>
-              <aside className="entity-side">
-                <section className="card">
-                  <div className="card-head"><h3>User Stats</h3></div>
-                  <div className="metric-grid">
-                    <MetricTile label="Total Users" value={String(users.length)} hint="Managed accounts" />
-                    <MetricTile label="Global Admins" value={String(globalAdmins)} hint="Full control users" />
-                    <MetricTile label="Domain Admins" value={String(domainAdmins)} hint="Scoped admins" />
-                    <MetricTile label="Read Only" value={String(readOnlyUsers)} hint="View-only accounts" />
-                    <MetricTile label="Missing Scope" value={String(usersWithoutDomainScope)} hint="Domain-admin without domains" />
-                  </div>
-                </section>
-                <section className="card">
-                  <div className="card-head"><h3>Role Guide</h3></div>
-                  <div className="muted">`admin`: global access across domains, users, settings.</div>
-                  <div className="muted" style={{ marginTop: '.45rem' }}>`domain-admin`: limited to assigned domains and hosts.</div>
-                  <div className="muted" style={{ marginTop: '.45rem' }}>`read-only`: view-only access (no create/update/delete).</div>
-                  <div className="muted" style={{ marginTop: '.45rem' }}>Use domain scope assignment right after user creation.</div>
-                </section>
-              </aside>
             </section>
           ) : null}
 
@@ -3995,6 +4009,9 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .field { display:grid; gap:.35rem; margin-bottom:.8rem; min-width:0; }
         .field > label { font-size:.78rem; color:var(--text-dim); letter-spacing:.02em; }
         .field-grid { display:grid; gap:.6rem; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); margin-bottom:.8rem; }
+        .users-page { grid-template-columns:minmax(0,1fr); }
+        .user-row-card { background:linear-gradient(180deg, rgba(255,255,255,.01), rgba(255,255,255,0)); }
+        .user-row-head { display:flex; align-items:center; gap:.45rem; flex-wrap:wrap; }
         input, select, textarea { background:var(--input-bg); border:1px solid var(--border); color:var(--text); border-radius:9px; padding:.6rem .75rem; }
         textarea { min-height:6rem; width:100%; }
         .wizard-steps { display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap; }
@@ -4355,44 +4372,53 @@ function UserRow({
   };
 
   return (
-    <div className="card" style={{ marginBottom: '.6rem' }}>
-      <div className="host" style={{ borderTop: 'none', paddingTop: 0 }}>
-        <div>
-          <strong>{user.username}</strong> <span className="muted">({user.role})</span>
-          <div className="muted">ID: {user.id}</div>
+    <div className="card user-row-card" style={{ marginBottom: '.6rem' }}>
+      <div className="host" style={{ borderTop: 'none', paddingTop: 0, marginBottom: '.55rem' }}>
+        <div className="user-row-head">
+          <strong>{user.username}</strong>
+          <span className="badge warn">{user.role}</span>
+          <span className="muted">ID {user.id}</span>
         </div>
-        <button className="btn danger" onClick={() => onDelete(user.id)} disabled={loading}>Delete</button>
+        <div className="row" style={{ marginBottom: 0 }}>
+          <button className="btn danger" onClick={() => onDelete(user.id)} disabled={loading}>Delete</button>
+        </div>
       </div>
       {user.role === 'domain-admin' ? (
         <>
-          <div className="domain-pills">
-            {domains.map((d) => (
-              <label key={d.id} className="pill">
-                <input type="checkbox" checked={domainIds.includes(d.id)} onChange={() => toggle(d.id)} />
-                {d.name}
-              </label>
-            ))}
+          <div className="field" style={{ marginBottom: '.6rem' }}>
+            <label>Assigned Domains</label>
+            <div className="domain-pills">
+              {domains.map((d) => (
+                <label key={d.id} className="pill">
+                  <input type="checkbox" checked={domainIds.includes(d.id)} onChange={() => toggle(d.id)} />
+                  {d.name}
+                </label>
+              ))}
+            </div>
           </div>
-          <div className="row">
+          <div className="row" style={{ marginBottom: '.6rem' }}>
             <button className="btn" onClick={() => onSaveDomains(user.id, domainIds)} disabled={loading || domainIds.length === 0}>Save Domain Scope</button>
           </div>
         </>
       ) : null}
-      <div className="row" style={{ marginTop: '.4rem' }}>
-        <input
-          type="password"
-          value={newPassword}
-          onChange={(e) => setNewPassword(e.target.value)}
-          placeholder={isCurrentUser ? 'Use Change Password (top bar) for your account' : `Reset password for ${user.username} (min 10)`}
-          disabled={isCurrentUser}
-        />
-        <button
-          className="btn"
-          onClick={async () => { await onResetPassword(user.id, newPassword); setNewPassword(''); }}
-          disabled={isCurrentUser || loading || newPassword.length < 10}
-        >
-          Reset Password
-        </button>
+      <div className="field" style={{ marginBottom: 0 }}>
+        <label>Password Operations</label>
+        <div className="row" style={{ marginBottom: 0 }}>
+          <input
+            type="password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            placeholder={isCurrentUser ? 'Use Change Password (top bar) for your account' : `Reset password for ${user.username} (min 10)`}
+            disabled={isCurrentUser}
+          />
+          <button
+            className="btn"
+            onClick={async () => { await onResetPassword(user.id, newPassword); setNewPassword(''); }}
+            disabled={isCurrentUser || loading || newPassword.length < 10}
+          >
+            Reset Password
+          </button>
+        </div>
       </div>
     </div>
   );
