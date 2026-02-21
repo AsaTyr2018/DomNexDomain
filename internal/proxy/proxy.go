@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"html"
 	"io"
@@ -32,6 +33,7 @@ type HostSource interface {
 	ListHosts(ctx context.Context) ([]model.Host, error)
 	PublicIPv4(ctx context.Context) string
 	AddAuditEvent(ctx context.Context, e model.AuditEvent) error
+	GetStyleSettings(ctx context.Context) (string, string, error)
 }
 
 type Engine struct {
@@ -44,18 +46,136 @@ type Engine struct {
 	mu       sync.RWMutex
 	routes   map[string]*routeEntry
 	auth     map[string]authSession
+	theme    edgeTheme
+	wafMu    sync.Mutex
+	wafCount map[string]wafCounter
+	wafBlock map[string]time.Time
+}
+
+type wafCounter struct {
+	windowStart time.Time
+	count       int
+}
+
+type edgeTheme struct {
+	bg      string
+	surface string
+	border  string
+	text    string
+	dim     string
+	accent  string
+	danger  string
+	inputBg string
+	success string
+	heroA   string
+	heroB   string
 }
 
 func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.Recorder) *Engine {
 	return &Engine{
-		source: source,
-		log:    log,
-		m:      m,
-		geo:    geoip.New(1 * time.Hour),
-		tr:     tr,
-		routes: map[string]*routeEntry{},
-		auth:   map[string]authSession{},
+		source:   source,
+		log:      log,
+		m:        m,
+		geo:      geoip.New(1 * time.Hour),
+		tr:       tr,
+		routes:   map[string]*routeEntry{},
+		auth:     map[string]authSession{},
+		theme:    monolithEdgeTheme(),
+		wafCount: map[string]wafCounter{},
+		wafBlock: map[string]time.Time{},
 	}
+}
+
+func monolithEdgeTheme() edgeTheme {
+	return edgeTheme{
+		bg:      "#0b0c12",
+		surface: "#13141c",
+		border:  "#2a2d3a",
+		text:    "#f3f4f6",
+		dim:     "#9ca3af",
+		accent:  "#2563eb",
+		danger:  "#fca5a5",
+		inputBg: "#0f1119",
+		success: "#10b981",
+		heroA:   "rgba(56,189,248,.15)",
+		heroB:   "rgba(99,102,241,.2)",
+	}
+}
+
+func cyberMonolithEdgeTheme() edgeTheme {
+	return edgeTheme{
+		bg:      "#16161a",
+		surface: "#1c1c22",
+		border:  "#2a2a36",
+		text:    "#e6e6f0",
+		dim:     "#8b8b99",
+		accent:  "#8b5cf6",
+		danger:  "#dc2626",
+		inputBg: "#17171d",
+		success: "#10b981",
+		heroA:   "rgba(139,92,246,.16)",
+		heroB:   "rgba(124,58,237,.12)",
+	}
+}
+
+func parseEdgeTheme(profile, custom string) edgeTheme {
+	base := monolithEdgeTheme()
+	if strings.EqualFold(strings.TrimSpace(profile), "cybermonolith") {
+		base = cyberMonolithEdgeTheme()
+	}
+	if strings.EqualFold(strings.TrimSpace(profile), "custom") {
+		base = monolithEdgeTheme()
+	}
+	custom = strings.TrimSpace(custom)
+	if custom == "" {
+		return base
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(custom), &m); err != nil {
+		return base
+	}
+	set := func(dst *string, key string) {
+		v := strings.TrimSpace(m[key])
+		if v == "" || len(v) > 64 {
+			return
+		}
+		if !isSafeThemeValue(v) {
+			return
+		}
+		*dst = v
+	}
+	set(&base.bg, "bg")
+	set(&base.surface, "surface")
+	set(&base.border, "border")
+	set(&base.text, "text")
+	set(&base.dim, "textDim")
+	set(&base.accent, "accent")
+	set(&base.danger, "danger")
+	set(&base.inputBg, "inputBg")
+	set(&base.success, "success")
+	set(&base.heroA, "heroA")
+	set(&base.heroB, "heroB")
+	return base
+}
+
+func isSafeThemeValue(v string) bool {
+	for _, ch := range v {
+		switch {
+		case ch >= 'a' && ch <= 'z':
+		case ch >= 'A' && ch <= 'Z':
+		case ch >= '0' && ch <= '9':
+		case strings.ContainsRune("#(),.%- _", ch):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) currentTheme() edgeTheme {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.theme
 }
 
 type routeEntry struct {
@@ -82,12 +202,18 @@ const hostAuthPathLogin = "/_domnex/auth/login"
 const hostAuthPathLogout = "/_domnex/auth/logout"
 const hostAuthTTL = 12 * time.Hour
 
+const wafUnknownWindow = 60 * time.Second
+const wafUnknownThreshold = 80
+const wafTempBlockTTL = 15 * time.Minute
+
 func (e *Engine) Refresh(ctx context.Context) error {
 	hosts, err := e.source.ListHosts(ctx)
 	if err != nil {
 		return err
 	}
 	publicIP := strings.TrimSpace(e.source.PublicIPv4(ctx))
+	styleProfile, styleCustom, _ := e.source.GetStyleSettings(ctx)
+	theme := parseEdgeTheme(styleProfile, styleCustom)
 	routes := map[string]*routeEntry{}
 	for _, h := range hosts {
 		if h.State != "active" && h.State != "disabled" && h.State != "maintenance" {
@@ -129,6 +255,7 @@ func (e *Engine) Refresh(ctx context.Context) error {
 	e.mu.Lock()
 	e.routes = routes
 	e.publicIP = publicIP
+	e.theme = theme
 	e.mu.Unlock()
 	e.log.Info("proxy routes refreshed", map[string]any{"count": len(routes), "publicIP": publicIP})
 	return nil
@@ -175,41 +302,82 @@ func (e *Engine) Handler() http.Handler {
 			}
 		}()
 
-		host := r.Host
-		if idx := strings.Index(host, ":"); idx >= 0 {
-			host = host[:idx]
+		if r.URL.Path == edgeLogoPath {
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			w.Header().Set("Content-Type", "image/png")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(edgeLogoPNG)
+			return
 		}
-		host = strings.ToLower(host)
+
+		host := normalizeHostHeader(r.Host)
+		clientIP = clientIPFromRequest(r)
 		e.mu.RLock()
+		publicIP := e.publicIP
 		route, ok := e.routes[host]
 		e.mu.RUnlock()
 		selectedRoute = route
-		if !ok {
+		if isBlocked, until := e.wafIsBlocked(clientIP, publicIP); isBlocked {
 			traceID, _ := randomHex(8)
-			clientIP = clientIPFromRequest(r)
-			e.auditProxyEvent(r.Context(), "proxy.error.unknown_host", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
+			e.auditProxyEvent(r.Context(), "proxy.waf.temp_block.hit", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";until="+until.UTC().Format(time.RFC3339))
 			e.renderSmartErrorPage(sw, r, smartErrorPage{
-				HTTPStatus:   http.StatusNotFound,
-				Title:        "Unknown Endpoint",
-				Description:  "This hostname is not configured on this edge.",
-				Code:         "DNX-ROUTE-404",
-				FailurePoint: "routing",
+				HTTPStatus:   http.StatusTooManyRequests,
+				Title:        "Temporarily Blocked",
+				Description:  "Automated edge protection temporarily limited requests from this source.",
+				Code:         "DNX-WAF-429",
+				FailurePoint: "waf: unknown-host flood detected",
 				Host:         host,
 				TraceID:      traceID,
 				Theme:        "warn",
+				Scope:        requestScope(clientIP, publicIP),
 			})
 			return
 		}
-		clientIP = clientIPFromRequest(r)
+		if !ok {
+			triggered, until, hits := e.wafTrackUnknownHost(clientIP, publicIP)
+			traceID, _ := randomHex(8)
+			if triggered {
+				e.log.Warn("waf temporary block set", map[string]any{
+					"source":  clientIP,
+					"host":    host,
+					"path":    r.URL.Path,
+					"hits":    hits,
+					"until":   until.UTC().Format(time.RFC3339),
+					"traceID": traceID,
+				})
+				e.auditProxyEvent(r.Context(), "proxy.waf.temp_block.set", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";hits="+strconv.Itoa(hits)+";until="+until.UTC().Format(time.RFC3339))
+				e.renderSmartErrorPage(sw, r, smartErrorPage{
+					HTTPStatus:   http.StatusTooManyRequests,
+					Title:        "Temporarily Blocked",
+					Description:  "Automated edge protection temporarily limited requests from this source.",
+					Code:         "DNX-WAF-429",
+					FailurePoint: "waf: unknown-host flood detected",
+					Host:         host,
+					TraceID:      traceID,
+					Theme:        "warn",
+					Scope:        requestScope(clientIP, publicIP),
+				})
+				return
+			}
+			e.auditProxyEvent(r.Context(), "proxy.error.unknown_host", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
+			e.renderSmartErrorPage(sw, r, smartErrorPage{
+				HTTPStatus:   http.StatusNotFound,
+				Title:        "Nothing here yet",
+				Description:  "This subdomain is not active yet. Check back later, something might appear soon.",
+				Code:         "DNX-ROUTE-404",
+				FailurePoint: "routing: host not configured (yet)",
+				Host:         host,
+				TraceID:      traceID,
+				Theme:        "ok",
+			})
+			return
+		}
 		if route.host.State == "disabled" {
 			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.error.host_disabled", route.host.FQDN, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
 			e.renderHostDisabledPage(route.host, traceID, sw, r)
 			return
 		}
-		e.mu.RLock()
-		publicIP := e.publicIP
-		e.mu.RUnlock()
 		if route.host.State == "maintenance" && !isLANClient(clientIP, publicIP) {
 			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.error.maintenance", route.host.FQDN, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
@@ -394,6 +562,70 @@ func isLANClient(raw, publicIP string) bool {
 		return (v6[0] & 0xfe) == 0xfc
 	}
 	return false
+}
+
+func normalizeHostHeader(host string) string {
+	host = strings.TrimSpace(host)
+	if idx := strings.Index(host, ":"); idx >= 0 {
+		host = host[:idx]
+	}
+	return strings.ToLower(strings.TrimSpace(host))
+}
+
+func (e *Engine) wafPrune(now time.Time) {
+	for ip, until := range e.wafBlock {
+		if !until.After(now) {
+			delete(e.wafBlock, ip)
+		}
+	}
+	staleCutoff := now.Add(-(wafUnknownWindow + wafTempBlockTTL))
+	for ip, c := range e.wafCount {
+		if c.windowStart.Before(staleCutoff) {
+			delete(e.wafCount, ip)
+		}
+	}
+}
+
+func (e *Engine) wafIsBlocked(clientIP, publicIP string) (bool, time.Time) {
+	if clientIP == "" || isLANClient(clientIP, publicIP) {
+		return false, time.Time{}
+	}
+	now := time.Now().UTC()
+	e.wafMu.Lock()
+	defer e.wafMu.Unlock()
+	e.wafPrune(now)
+	until, ok := e.wafBlock[clientIP]
+	if !ok || !until.After(now) {
+		return false, time.Time{}
+	}
+	return true, until
+}
+
+func (e *Engine) wafTrackUnknownHost(clientIP, publicIP string) (bool, time.Time, int) {
+	if clientIP == "" || isLANClient(clientIP, publicIP) {
+		return false, time.Time{}, 0
+	}
+	now := time.Now().UTC()
+	e.wafMu.Lock()
+	defer e.wafMu.Unlock()
+	e.wafPrune(now)
+	if until, ok := e.wafBlock[clientIP]; ok && until.After(now) {
+		return true, until, wafUnknownThreshold
+	}
+	c := e.wafCount[clientIP]
+	if c.windowStart.IsZero() || now.Sub(c.windowStart) >= wafUnknownWindow {
+		c.windowStart = now
+		c.count = 0
+	}
+	c.count++
+	e.wafCount[clientIP] = c
+	if c.count < wafUnknownThreshold {
+		return false, time.Time{}, c.count
+	}
+	until := now.Add(wafTempBlockTTL)
+	e.wafBlock[clientIP] = until
+	delete(e.wafCount, clientIP)
+	return true, until, c.count
 }
 
 type statusWriter struct {
@@ -644,22 +876,24 @@ func (e *Engine) pruneAuthSessions() {
 
 func (e *Engine) renderHostLoginPage(h model.Host, w http.ResponseWriter, r *http.Request, errMsg string) {
 	next := normalizeNext(r.URL.RequestURI())
+	th := e.currentTheme()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusUnauthorized)
 	body := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Access Protected</title>
 <style>
-:root{--bg:#0b0c12;--surface:#13141c;--border:#2a2d3a;--text:#f3f4f6;--dim:#9ca3af;--accent:#2563eb;--danger:#fca5a5}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1200px 700px at 80% -10%,rgba(37,99,235,.22),transparent 45%),radial-gradient(900px 600px at -10% 110%,rgba(14,165,233,.16),transparent 45%),var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;color:var(--text)}
-.card{width:min(420px,92vw);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1rem 1rem .95rem}
-.logo{font-size:.8rem;color:var(--dim);letter-spacing:.08em;text-transform:uppercase}
+:root{--bg:` + th.bg + `;--surface:` + th.surface + `;--border:` + th.border + `;--text:` + th.text + `;--dim:` + th.dim + `;--accent:` + th.accent + `;--danger:` + th.danger + `;--input:` + th.inputBg + `}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1200px 700px at 80% -10%,` + th.heroA + `,transparent 45%),radial-gradient(900px 600px at -10% 110%,` + th.heroB + `,transparent 45%),var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;color:var(--text)}
+.card{width:min(460px,92vw);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1rem 1rem .95rem}
+.brand{display:grid;place-items:center;margin-bottom:.5rem}
+.brand img{width:100%;max-width:250px;height:auto;display:block;border-radius:16px;filter:drop-shadow(0 3px 10px rgba(0,0,0,.28));-webkit-mask-image:radial-gradient(125% 105% at 50% 48%,rgba(0,0,0,1) 48%,rgba(0,0,0,.86) 62%,rgba(0,0,0,.52) 78%,rgba(0,0,0,0) 100%),linear-gradient(to bottom,rgba(0,0,0,0) 0%,rgba(0,0,0,.95) 16%,rgba(0,0,0,.95) 84%,rgba(0,0,0,0) 100%),linear-gradient(to right,rgba(0,0,0,0) 0%,rgba(0,0,0,.96) 12%,rgba(0,0,0,.96) 88%,rgba(0,0,0,0) 100%);mask-image:radial-gradient(125% 105% at 50% 48%,rgba(0,0,0,1) 48%,rgba(0,0,0,.86) 62%,rgba(0,0,0,.52) 78%,rgba(0,0,0,0) 100%),linear-gradient(to bottom,rgba(0,0,0,0) 0%,rgba(0,0,0,.95) 16%,rgba(0,0,0,.95) 84%,rgba(0,0,0,0) 100%),linear-gradient(to right,rgba(0,0,0,0) 0%,rgba(0,0,0,.96) 12%,rgba(0,0,0,.96) 88%,rgba(0,0,0,0) 100%);-webkit-mask-composite:source-in;mask-composite:intersect}
 h1{margin:.4rem 0 .2rem;font-size:1.2rem}p{margin:.2rem 0 .9rem;color:var(--dim)}
 form{display:grid;gap:.55rem}label{display:grid;gap:.25rem;color:var(--dim);font-size:.87rem}
-input{width:100%;padding:.62rem .72rem;border:1px solid var(--border);background:#0f1119;color:var(--text);border-radius:10px}
+input{width:100%;padding:.62rem .72rem;border:1px solid var(--border);background:var(--input);color:var(--text);border-radius:10px}
 button{margin-top:.2rem;padding:.64rem .8rem;border:0;border-radius:10px;background:var(--accent);color:white;font-weight:600;cursor:pointer}
 .err{margin:.2rem 0 .1rem;color:var(--danger);font-size:.86rem}
 .host{margin-top:.75rem;color:var(--dim);font-size:.82rem}
-</style></head><body><main class="card"><div class="logo">DomNexDomain Access</div><h1>Protected Endpoint</h1><p>Sign in with this subdomain's dedicated credentials.</p>`
+</style></head><body><main class="card"><div class="brand"><img src="` + edgeLogoPath + `" alt="DomNexDomain"></div><h1>Protected Endpoint</h1><p>Sign in with this subdomain's dedicated credentials.</p>`
 	if strings.TrimSpace(errMsg) != "" {
 		body += `<div class="err">` + html.EscapeString(errMsg) + `</div>`
 	}
@@ -723,15 +957,16 @@ func (e *Engine) renderSmartErrorPage(w http.ResponseWriter, r *http.Request, p 
 		scope = requestScope(clientIP, publicIP)
 	}
 	theme := strings.TrimSpace(strings.ToLower(p.Theme))
-	gradA := "rgba(245,158,11,.18)"
-	gradB := "rgba(239,68,68,.12)"
+	th := e.currentTheme()
+	gradA := th.heroA
+	gradB := th.heroB
 	if theme == "ok" {
 		gradA = "rgba(16,185,129,.18)"
 		gradB = "rgba(34,197,94,.12)"
 	}
 	if theme == "warn" {
 		gradA = "rgba(245,158,11,.18)"
-		gradB = "rgba(99,102,241,.12)"
+		gradB = th.heroB
 	}
 	if theme == "err" {
 		gradA = "rgba(239,68,68,.2)"
@@ -744,17 +979,19 @@ func (e *Engine) renderSmartErrorPage(w http.ResponseWriter, r *http.Request, p 
 	body := `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>` + html.EscapeString(p.Title) + `</title>
 <style>
-:root{--bg:#0b0c12;--surface:#13141c;--border:#2a2d3a;--text:#f3f4f6;--dim:#9ca3af}
+:root{--bg:` + th.bg + `;--surface:` + th.surface + `;--border:` + th.border + `;--text:` + th.text + `;--dim:` + th.dim + `;--accent:` + th.accent + `}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1100px 650px at 80% -10%,` + gradA + `,transparent 45%),radial-gradient(900px 600px at -10% 110%,` + gradB + `,transparent 45%),var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;color:var(--text)}
 .card{width:min(680px,94vw);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:1rem}
+.brand{display:grid;place-items:center;margin-bottom:.5rem}
+.brand img{width:100%;max-width:270px;height:auto;display:block;border-radius:16px;filter:drop-shadow(0 3px 10px rgba(0,0,0,.28));-webkit-mask-image:radial-gradient(125% 105% at 50% 48%,rgba(0,0,0,1) 48%,rgba(0,0,0,.86) 62%,rgba(0,0,0,.52) 78%,rgba(0,0,0,0) 100%),linear-gradient(to bottom,rgba(0,0,0,0) 0%,rgba(0,0,0,.95) 16%,rgba(0,0,0,.95) 84%,rgba(0,0,0,0) 100%),linear-gradient(to right,rgba(0,0,0,0) 0%,rgba(0,0,0,.96) 12%,rgba(0,0,0,.96) 88%,rgba(0,0,0,0) 100%);mask-image:radial-gradient(125% 105% at 50% 48%,rgba(0,0,0,1) 48%,rgba(0,0,0,.86) 62%,rgba(0,0,0,.52) 78%,rgba(0,0,0,0) 100%),linear-gradient(to bottom,rgba(0,0,0,0) 0%,rgba(0,0,0,.95) 16%,rgba(0,0,0,.95) 84%,rgba(0,0,0,0) 100%),linear-gradient(to right,rgba(0,0,0,0) 0%,rgba(0,0,0,.96) 12%,rgba(0,0,0,.96) 88%,rgba(0,0,0,0) 100%);-webkit-mask-composite:source-in;mask-composite:intersect}
 .top{display:flex;justify-content:space-between;align-items:center;gap:.75rem}
-.tag{font-size:.74rem;letter-spacing:.07em;text-transform:uppercase;color:#cbd5e1}
+.tag{font-size:.74rem;letter-spacing:.07em;text-transform:uppercase;color:var(--accent)}
 h1{margin:.65rem 0 .25rem;font-size:1.22rem}
 p{margin:.2rem 0 .75rem;color:var(--dim)}
-.row{display:grid;grid-template-columns:190px 1fr;gap:.45rem;padding:.4rem 0;border-top:1px solid #232533}
+.row{display:grid;grid-template-columns:190px 1fr;gap:.45rem;padding:.4rem 0;border-top:1px solid var(--border)}
 .k{color:var(--dim)}.v{color:var(--text);word-break:break-word}
 @media (max-width:640px){.row{grid-template-columns:1fr}}
-</style></head><body><main class="card"><div class="top"><div class="tag">DomNexDomain Smart Error</div><div>` + strconv.Itoa(status) + `</div></div>
+</style></head><body><main class="card"><div class="brand"><img src="` + edgeLogoPath + `" alt="DomNexDomain"></div><div class="top"><div class="tag">DomNexDomain Smart Error</div><div>` + strconv.Itoa(status) + `</div></div>
 <h1>` + html.EscapeString(p.Title) + `</h1><p>` + html.EscapeString(p.Description) + `</p>
 <div class="row"><div class="k">Host</div><div class="v">` + html.EscapeString(host) + `</div></div>
 <div class="row"><div class="k">Path</div><div class="v">` + html.EscapeString(r.URL.Path) + `</div></div>

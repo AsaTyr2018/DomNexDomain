@@ -51,6 +51,7 @@ func (s *Server) Router() http.Handler {
 	r.Use(s.metricsMiddleware("admin_api"))
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, map[string]any{"ok": true}) })
+	r.Get("/api/v1/style", s.handlePublicStyle)
 	r.Get("/api/v1/csrf", s.handleCSRF)
 	r.Post("/api/v1/login", s.handleLogin)
 	r.Post("/api/v1/password-reset/consume", s.handleConsumePasswordReset)
@@ -97,6 +98,7 @@ func (s *Server) Router() http.Handler {
 		pr.Use(s.requireCSRF)
 		pr.Post("/api/v1/domains/preflight", s.handleDomainPreflight)
 		pr.Post("/api/v1/domains", s.handleUpsertDomain)
+		pr.Post("/api/v1/domains/{id}/deactivate", s.handleDeactivateDomain)
 		pr.Delete("/api/v1/domains/{id}", s.handleDeleteDomain)
 		pr.Post("/api/v1/dyndns", s.handleDynDNSUpdate)
 		pr.Post("/api/v1/secrets/cloudflare", s.handleSetCloudflareToken)
@@ -239,6 +241,18 @@ func (s *Server) handleCSRF(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"csrfToken": token})
 }
 
+func (s *Server) handlePublicStyle(w http.ResponseWriter, r *http.Request) {
+	profile, custom, err := s.app.GetStyleSettings(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"styleProfile": profile,
+		"styleCustom":  custom,
+	})
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
@@ -376,6 +390,33 @@ func (s *Server) handleDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := identityFrom(r.Context()).Username
 	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "domain.delete", Target: strconv.FormatInt(domainID, 10), Meta: ""})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeactivateDomain(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "domains:write") {
+		return
+	}
+	if id.Type == "token" && !auth.ScopeAllows(id.Scopes, "global:write") {
+		writeErr(w, http.StatusForbidden, "global:write required for domain deactivate")
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	domainID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err := s.app.DeactivateDomain(r.Context(), domainID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "domain.deactivate",
+		Target: strconv.FormatInt(domainID, 10),
+		Meta:   "cascade_hosts=disabled",
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -1169,7 +1210,13 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 	if !requireTokenScope(w, identityFrom(r.Context()), "audit:read") {
 		return
 	}
-	items, err := s.app.Store().ListAuditEvents(r.Context(), 200)
+	limit := 500
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	items, err := s.app.Store().ListAuditEvents(r.Context(), limit)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1291,17 +1338,19 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		ACMEEmail   string `json:"acmeEmail"`
-		ACMEStaging bool   `json:"acmeStaging"`
-		CFToken     string `json:"cfToken"`
-		PublicIPv4  string `json:"publicIpv4"`
-		BaseDomain  string `json:"baseDomain"`
+		ACMEEmail    string `json:"acmeEmail"`
+		ACMEStaging  bool   `json:"acmeStaging"`
+		CFToken      string `json:"cfToken"`
+		PublicIPv4   string `json:"publicIpv4"`
+		BaseDomain   string `json:"baseDomain"`
+		StyleProfile string `json:"styleProfile"`
+		StyleCustom  string `json:"styleCustom"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain); err != nil {
+	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}

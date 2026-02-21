@@ -18,6 +18,12 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
 
 ## Feature Highlights
 
+- Operator-focused UI and branding:
+  - Style system with `Monolith`, `CyberMonolith`, and `Custom` profiles
+    - One profile switch applies consistently to Dashboard, MetricCenter, LogCenter, login pages, and edge error pages.
+  - Unified DomNexDomain branding
+    - Dedicated logo integration across sidebar, login overlays, and smart error surfaces for consistent operator/user-facing identity.
+
 - Reverse proxy engine:
   - Host-based HTTP/HTTPS routing
     - Routes traffic by requested hostname, so each subdomain maps cleanly to its own upstream service.
@@ -41,6 +47,8 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
 - ACME:
   - Let's Encrypt production + staging
     - Switch between staging and production ACME endpoints without changing deployment architecture.
+  - Deterministic Cloudflare DNS-01 flow for wildcard certs
+    - DomNexDomain creates/updates `_acme-challenge` TXT records via Cloudflare API, then waits 5 minutes before validation to absorb DNS propagation delay.
   - Certificate diagnostics and status visibility in UI
     - Shows DNS/HTTP/HTTPS/TLS checks and certificate lifetime status per host.
   - Backoff-aware retry handling
@@ -53,8 +61,10 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
   - Live checks for DNS and reachability
     - Verifies DNS resolution, target matching, and endpoint reachability from the control plane perspective.
 - Access control:
-  - User account roles: `admin`, `domain-admin`
-    - Supports global administration and domain-scoped delegation for multi-tenant or team-based operations.
+  - User account roles: `admin`, `domain-admin`, `read-only`
+    - `admin`: full control across domains, users, settings, and system operations.
+    - `domain-admin`: write access for assigned domains/subdomains only.
+    - `read-only`: observer mode, read access only (no create/update/delete).
   - API token roles: `admin`, `operator`, `read-only`
     - Enables scoped automation identities separate from human UI users.
   - API tokens with scoped permissions and optional domain scoping
@@ -69,6 +79,10 @@ DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, AP
   - Smart Edge Error Pages with Trace ID
     - DomNexDomain serves branded error pages for policy/origin/routing failures with a trace ID shown to the user.
     - The same trace ID is written into audit events (`proxy.error.*`) so operators can search and correlate quickly in the Logs UI.
+  - Built-in WAF baseline with temporary auto-block
+    - Unknown-host flood traffic is detected at the edge and auto-blocked per source IP for 15 minutes.
+    - Blocks are intentionally temporary (no permanent auto-ban), reducing lockout risk while still damping scanner noise.
+    - WAF decisions are audited (`proxy.waf.temp_block.set` / `proxy.waf.temp_block.hit`).
   - Prometheus metrics endpoint
     - Exposes operational telemetry for alerting and dashboard integration.
   - MetricCenter traffic analytics
@@ -187,7 +201,7 @@ Login with those credentials in the Web UI.
 After first login:
 
 1. Rotate bootstrap password to a long random value.
-2. Create additional admin/domain-admin accounts as needed.
+2. Create additional `admin`, `domain-admin`, or `read-only` accounts as needed.
 3. Store Cloudflare token in Settings if you use Cloudflare automation.
 
 ## Runtime Layout
@@ -201,7 +215,11 @@ After first login:
 
 - JSON logs on stdout (optional file logs in runtime log dir)
 - Prometheus metrics endpoint via `DOMNEX_METRICS_ADDR` (default `127.0.0.1:9108`) at `/metrics`
-- Logs UI supports direct trace-ID search for edge error events (`proxy.error.*`)
+- `LogCenter` is a tabular audit view for high-volume operation:
+  - dynamic filters for time window, level, namespace, action, actor, source IP/scope, target, and free-text
+  - trace-ID lookup for direct smart-error correlation
+  - source-IP quick actions (for example temporary/manual block workflows)
+- Security and status operational widgets are consolidated in `MetricCenter` to keep `LogCenter` focused on investigation workflows.
 
 ## Security Baseline
 
@@ -308,11 +326,11 @@ Use it for endpoint descriptions, permission context, and ready-to-run request e
 
 ### Role + Scope Model
 
-- User roles (Web UI accounts): `admin`, `domain-admin`
+- User roles (Web UI accounts): `admin`, `domain-admin`, `read-only`
 - API token roles: `admin`, `operator`, `read-only`
 - Current UI behavior:
-  - User creation in the Web UI currently offers `admin` and `domain-admin`.
-  - `operator` and `read-only` are currently available through API token role selection.
+  - User creation in the Web UI offers `admin`, `domain-admin`, and `read-only`.
+  - `operator` is intended for API token automation use.
 - Tokens can be constrained by:
   - scope strings (e.g. `hosts:write`, `domains:write`, `users:write`)
   - optional domain scoping (`domainIds`)

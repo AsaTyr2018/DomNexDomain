@@ -116,6 +116,9 @@ func main() {
 	}
 
 	acmeManager := acme.New(cfg.ACMECacheDir, cfg.ACMEEmail, cfg.ACMEStaging, appSvc)
+	if err := acmeManager.RefreshWildcardCertificates(context.Background()); err != nil {
+		log.Warn("initial wildcard cert refresh failed", map[string]any{"err": err.Error()})
+	}
 	redirectOrACME := acmeManager.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://"+r.Host+r.URL.RequestURI(), http.StatusMovedPermanently)
 	}))
@@ -184,6 +187,7 @@ func main() {
 	}()
 
 	go px.StartRefresher(ctx, 10*time.Second)
+	go acmeManager.StartRefresher(ctx, 15*time.Minute)
 	go pruneSessions(ctx, st, log)
 	go tr.Start(ctx)
 

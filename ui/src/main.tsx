@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 
 type Identity = { username: string; role: string; type: string };
-type Domain = { id: number; name: string; dnsMode?: string; provider?: string; zoneId?: string };
+type Domain = { id: number; name: string; dnsMode?: string; certMode?: string; provider?: string; zoneId?: string; status?: string };
 type HABackend = { name: string; url: string };
 type Host = { id: number; fqdn: string; upstreamUrl: string; insecureTls?: boolean; haEnabled?: boolean; haMode?: string; haBackends?: HABackend[]; authEnabled?: boolean; authUser?: string; geoMode?: string; geoCountries?: string[]; state: string; errorReason?: string };
 type HostDiagnostic = { fqdn: string; dnsRecords: string[]; httpStatus: number; httpsStatus: number; tlsOk: boolean; certSubject: string; certIssuer: string; certNotAfter: string; certDaysLeft: number; haEnabled?: boolean; haMode?: string; haOnline?: number; haTotal?: number; haOffline?: string[]; error?: string };
@@ -11,7 +11,7 @@ type DomainLiveCheck = { domain: string; dnsMode: string; provider: string; serv
 type Audit = { id: number; actor: string; action: string; target: string; meta?: string; sourceIp?: string; createdAt: string };
 type BlockedIP = { ip: string; reason?: string; createdAt: string; updatedAt: string };
 type APIToken = { id: number; name: string; tokenPrefix: string; scopes: string; role: string; expiresAt: string; lastUsedAt?: string };
-type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string };
+type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string };
 type ManagedUser = { id: number; username: string; role: string; domainIds: number[]; createdAt: string; updatedAt: string };
 type DomainPreflightCheck = { name: string; ok: boolean; detail?: string };
 type DomainPreflight = { domain: string; dnsMode: string; provider: string; zoneId?: string; resolvedZone?: string; publicIpv4?: string; checks: DomainPreflightCheck[]; ready: boolean };
@@ -30,9 +30,65 @@ type SSHBastionGenerate = { key: SSHBastionKey; privateKey?: string; privateKeyP
 
 type Tab = 'dashboard' | 'metricCenter' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'ssh' | 'audit';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
+type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
+type PublicStyle = { styleProfile?: string; styleCustom?: string };
+type ThemeVars = {
+  bg: string;
+  surface: string;
+  panel: string;
+  panelHover: string;
+  border: string;
+  text: string;
+  textDim: string;
+  accent: string;
+  accentHover: string;
+  accentActive: string;
+  accentSoft: string;
+  success: string;
+  danger: string;
+  inputBg: string;
+  heroA: string;
+  heroB: string;
+};
 const SSH_BASTION_DEFAULT_UPSTREAM = 'http://127.0.0.1:8443';
 const SSH_BASTION_DEFAULT_TARGET_HOST = '127.0.0.1';
 const SSH_BASTION_DEFAULT_TARGET_PORT = 22;
+const MONOLITH_THEME: ThemeVars = {
+  bg: '#0f0f11',
+  surface: '#16161a',
+  panel: '#121219',
+  panelHover: '#171722',
+  border: '#222229',
+  text: '#e0e0e5',
+  textDim: '#9ca3af',
+  accent: '#6366f1',
+  accentHover: '#4f46e5',
+  accentActive: '#4f46e5',
+  accentSoft: 'rgba(99,102,241,.12)',
+  success: '#10b981',
+  danger: '#ef4444',
+  inputBg: '#0f0f14',
+  heroA: 'rgba(56,189,248,.15)',
+  heroB: 'rgba(99,102,241,.2)',
+};
+const CYBER_MONOLITH_THEME: ThemeVars = {
+  bg: '#16161a',
+  surface: '#1c1c22',
+  panel: '#1c1c22',
+  panelHover: '#23232c',
+  border: '#2a2a36',
+  text: '#e6e6f0',
+  textDim: '#8b8b99',
+  accent: '#8b5cf6',
+  accentHover: '#a78bfa',
+  accentActive: '#7c3aed',
+  accentSoft: 'rgba(139,92,246,.16)',
+  success: '#10b981',
+  danger: '#dc2626',
+  inputBg: '#17171d',
+  heroA: 'rgba(139,92,246,.16)',
+  heroB: 'rgba(124,58,237,.12)',
+};
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
@@ -66,6 +122,30 @@ function downloadTextFile(filename: string, content: string): void {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+function parseCustomThemeJSON(raw: string): Partial<ThemeVars> {
+  const txt = raw.trim();
+  if (!txt) return {};
+  try {
+    const obj = JSON.parse(txt) as Record<string, string>;
+    const out: Partial<ThemeVars> = {};
+    const allowed = new Set<keyof ThemeVars>([
+      'bg', 'surface', 'panel', 'panelHover', 'border', 'text', 'textDim',
+      'accent', 'accentHover', 'accentActive', 'accentSoft', 'success', 'danger',
+      'inputBg', 'heroA', 'heroB',
+    ]);
+    for (const [k, v] of Object.entries(obj)) {
+      if (!allowed.has(k as keyof ThemeVars)) continue;
+      const sv = String(v || '').trim();
+      if (!sv || sv.length > 64) continue;
+      if (!/^[#a-zA-Z0-9(),.%\-\s]+$/.test(sv)) continue;
+      (out as Record<string, string>)[k] = sv;
+    }
+    return out;
+  } catch {
+    return {};
+  }
 }
 
 class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, { error: string }> {
@@ -166,15 +246,24 @@ function App() {
   const [resetToken, setResetToken] = useState('');
   const [resetNewPassword, setResetNewPassword] = useState('');
   const [logQuery, setLogQuery] = useState('');
+  const [logWindow, setLogWindow] = useState<'15m' | '1h' | '6h' | '24h' | '7d' | 'all'>('24h');
+  const [logLevelFilter, setLogLevelFilter] = useState<'all' | 'critical' | 'warn' | 'info'>('all');
+  const [logNamespaceFilter, setLogNamespaceFilter] = useState('all');
   const [logActionFilter, setLogActionFilter] = useState('all');
   const [logActorFilter, setLogActorFilter] = useState('all');
   const [logIPFilter, setLogIPFilter] = useState('all');
+  const [logScopeFilter, setLogScopeFilter] = useState<'all' | 'internal' | 'external'>('all');
+  const [logTargetQuery, setLogTargetQuery] = useState('');
   const [settings, setSettings] = useState<RuntimeSettings | null>(null);
   const [settingsAcmeEmail, setSettingsAcmeEmail] = useState('');
   const [settingsAcmeStaging, setSettingsAcmeStaging] = useState(false);
   const [settingsCFToken, setSettingsCFToken] = useState('');
   const [settingsPublicIPv4, setSettingsPublicIPv4] = useState('');
   const [settingsBaseDomain, setSettingsBaseDomain] = useState('');
+  const [settingsStyleProfile, setSettingsStyleProfile] = useState<StyleProfile>('monolith');
+  const [settingsStyleCustom, setSettingsStyleCustom] = useState('');
+  const [publicStyleProfile, setPublicStyleProfile] = useState<StyleProfile>('monolith');
+  const [publicStyleCustom, setPublicStyleCustom] = useState('');
   const [settingsMessage, setSettingsMessage] = useState('');
   const [sshRoutes, setSshRoutes] = useState<SSHBastionRoute[]>([]);
   const [sshKeys, setSshKeys] = useState<SSHBastionKey[]>([]);
@@ -194,7 +283,7 @@ function App() {
   const [sshGeneratedPPKError, setSshGeneratedPPKError] = useState('');
   const [newUserName, setNewUserName] = useState('');
   const [newUserPassword, setNewUserPassword] = useState('');
-  const [newUserRole, setNewUserRole] = useState<'admin' | 'domain-admin'>('domain-admin');
+  const [newUserRole, setNewUserRole] = useState<'admin' | 'domain-admin' | 'read-only'>('domain-admin');
   const [newUserDomainIDs, setNewUserDomainIDs] = useState<number[]>([]);
   const [showPasswordDialog, setShowPasswordDialog] = useState(false);
   const [selfCurrentPassword, setSelfCurrentPassword] = useState('');
@@ -207,6 +296,17 @@ function App() {
 
   const csrf = useMemo(() => getCookie('domnex_csrf'), [identity, loading]);
 
+  const loadPublicStyle = async () => {
+    try {
+      const s = await api<PublicStyle>('/api/v1/style');
+      setPublicStyleProfile((s.styleProfile as StyleProfile) || 'monolith');
+      setPublicStyleCustom(s.styleCustom || '');
+    } catch {
+      setPublicStyleProfile('monolith');
+      setPublicStyleCustom('');
+    }
+  };
+
   const refresh = async () => {
     setLoading(true);
     setError('');
@@ -217,7 +317,7 @@ function App() {
       const [d, h, a] = await Promise.all([
         api<{ items: Domain[] }>('/api/v1/domains'),
         api<{ items: Host[] }>('/api/v1/hosts'),
-        api<{ items: Audit[] }>('/api/v1/audit'),
+        api<{ items: Audit[] }>('/api/v1/audit?limit=5000'),
       ]);
       setDomains(d.items || []);
       setHosts(h.items || []);
@@ -267,10 +367,14 @@ function App() {
         setSettingsAcmeStaging(!!s.acmeStaging);
         setSettingsPublicIPv4(s.publicIpv4 || '');
         setSettingsBaseDomain(s.baseDomain || '');
+        setSettingsStyleProfile((s.styleProfile as StyleProfile) || 'monolith');
+        setSettingsStyleCustom(s.styleCustom || '');
       } catch {
         setSettings(null);
         setSettingsPublicIPv4('');
         setSettingsBaseDomain('');
+        setSettingsStyleProfile('monolith');
+        setSettingsStyleCustom('');
       }
       try {
         const t = await api<TrafficOverview>('/api/v1/traffic/overview?hours=24');
@@ -289,6 +393,7 @@ function App() {
         setSelectedHostTraffic(null);
         setSshRoutes([]);
         setSshKeys([]);
+        void loadPublicStyle();
       } else {
         setError(err.message);
       }
@@ -299,7 +404,7 @@ function App() {
 
   const refreshAuditOnly = async () => {
     try {
-      const out = await api<{ items: Audit[] }>('/api/v1/audit');
+      const out = await api<{ items: Audit[] }>('/api/v1/audit?limit=5000');
       setAudit(out.items || []);
     } catch {
       // Keep existing audit list on transient failures.
@@ -307,6 +412,7 @@ function App() {
   };
 
   useEffect(() => {
+    void loadPublicStyle();
     void refresh();
   }, []);
 
@@ -392,6 +498,9 @@ function App() {
       setSettings(null);
       setSettingsPublicIPv4('');
       setSettingsBaseDomain('');
+      setSettingsStyleProfile('monolith');
+      setSettingsStyleCustom('');
+      void loadPublicStyle();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -675,14 +784,44 @@ function App() {
   const httpHealthPct = Math.round((httpHealthy / safeBase) * 100);
   const httpsHealthPct = Math.round((httpsHealthy / safeBase) * 100);
   const certWindowPct = certKnown.length > 0 ? Math.max(0, Math.min(100, Math.round((1 - (certExpiringSoon / certKnown.length)) * 100))) : 0;
-  const logActions = Array.from(new Set(audit.map((e) => e.action))).sort();
-  const logActors = Array.from(new Set(audit.map((e) => e.actor))).sort();
-  const logIPs = Array.from(new Set(audit.map((e) => extractSourceIP(e)).filter(Boolean))).sort();
-  const filteredAudit = audit.filter((e) => {
+  const logWindowCutoff = (() => {
+    const now = Date.now();
+    if (logWindow === '15m') return now - (15 * 60 * 1000);
+    if (logWindow === '1h') return now - (60 * 60 * 1000);
+    if (logWindow === '6h') return now - (6 * 60 * 60 * 1000);
+    if (logWindow === '24h') return now - (24 * 60 * 60 * 1000);
+    if (logWindow === '7d') return now - (7 * 24 * 60 * 60 * 1000);
+    return 0;
+  })();
+  const logsBaseByWindow = audit.filter((e) => {
+    if (logWindowCutoff <= 0) return true;
+    const ts = new Date(e.createdAt).getTime();
+    if (!Number.isFinite(ts) || ts <= 0) return true;
+    return ts >= logWindowCutoff;
+  });
+  const logNamespaces = Array.from(new Set(logsBaseByWindow.map((e) => actionNamespace(e.action)))).sort();
+  const logActions = Array.from(new Set(logsBaseByWindow.map((e) => e.action))).sort();
+  const logActors = Array.from(new Set(logsBaseByWindow.map((e) => e.actor))).sort();
+  const logIPs = Array.from(new Set(logsBaseByWindow.map((e) => extractSourceIP(e)).filter(Boolean))).sort();
+  const publicIPv4Hint = (settings?.publicIpv4 || settingsPublicIPv4 || '').trim();
+  const filteredAudit = logsBaseByWindow.filter((e) => {
+    const level = classifyAuditLevel(e.action, e.target);
+    if (logLevelFilter !== 'all' && level !== logLevelFilter) return false;
+    const namespace = actionNamespace(e.action);
+    if (logNamespaceFilter !== 'all' && namespace !== logNamespaceFilter) return false;
     if (logActionFilter !== 'all' && e.action !== logActionFilter) return false;
     if (logActorFilter !== 'all' && e.actor !== logActorFilter) return false;
     const src = extractSourceIP(e);
     if (logIPFilter !== 'all' && src !== logIPFilter) return false;
+    if (logScopeFilter !== 'all') {
+      if (!src) return false;
+      const scope = classifySourceScope(src, publicIPv4Hint);
+      if (scope !== logScopeFilter) return false;
+    }
+    if (logTargetQuery.trim()) {
+      const tq = logTargetQuery.trim().toLowerCase();
+      if (!(e.target || '').toLowerCase().includes(tq)) return false;
+    }
     if (!logQuery.trim()) return true;
     const q = logQuery.trim().toLowerCase();
     const qCompact = q.replace(/[^a-z0-9]/g, '');
@@ -700,9 +839,24 @@ function App() {
     const traceCompact = trace.toLowerCase().replace(/[^a-z0-9]/g, '');
     return traceCompact.includes(qCompact) || hayCompact.includes(qCompact);
   });
-  const criticalLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'critical').length;
-  const warningLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'warn').length;
-  const infoLogs = filteredAudit.filter((e) => classifyAuditLevel(e.action, e.target) === 'info').length;
+  const auditCriticalTotal = audit.filter((e) => classifyAuditLevel(e.action, e.target) === 'critical').length;
+  const auditWarningTotal = audit.filter((e) => classifyAuditLevel(e.action, e.target) === 'warn').length;
+  const auditInfoTotal = audit.filter((e) => classifyAuditLevel(e.action, e.target) === 'info').length;
+  const auditActorsTotal = new Set(audit.map((e) => e.actor).filter(Boolean)).size;
+  useEffect(() => {
+    if (logNamespaceFilter !== 'all' && !logNamespaces.includes(logNamespaceFilter)) {
+      setLogNamespaceFilter('all');
+    }
+    if (logActionFilter !== 'all' && !logActions.includes(logActionFilter)) {
+      setLogActionFilter('all');
+    }
+    if (logActorFilter !== 'all' && !logActors.includes(logActorFilter)) {
+      setLogActorFilter('all');
+    }
+    if (logIPFilter !== 'all' && !logIPs.includes(logIPFilter)) {
+      setLogIPFilter('all');
+    }
+  }, [logNamespaceFilter, logNamespaces, logActionFilter, logActions, logActorFilter, logActors, logIPFilter, logIPs]);
   const cloudflareDomains = domains.filter((d) => (d.dnsMode || '') === 'cloudflare').length;
   const manualDomains = Math.max(0, domains.length - cloudflareDomains);
   const domainsChecked = Object.keys(domainChecks).length;
@@ -715,11 +869,24 @@ function App() {
   }).length;
   const globalAdmins = users.filter((u) => u.role === 'admin').length;
   const domainAdmins = users.filter((u) => u.role === 'domain-admin').length;
+  const readOnlyUsers = users.filter((u) => u.role === 'read-only').length;
   const usersWithoutDomainScope = users.filter((u) => u.role === 'domain-admin' && (!u.domainIds || u.domainIds.length === 0)).length;
   const configuredAdminFQDN = settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '');
+  const activeTheme = useMemo<ThemeVars>(() => {
+    const selectedProfile = identity ? settingsStyleProfile : publicStyleProfile;
+    const selectedCustom = identity ? settingsStyleCustom : publicStyleCustom;
+    const profile = (selectedProfile || 'monolith') as StyleProfile;
+    const base = profile === 'cybermonolith' ? CYBER_MONOLITH_THEME : MONOLITH_THEME;
+    const custom = parseCustomThemeJSON(selectedCustom);
+    if (profile === 'custom') {
+      return { ...MONOLITH_THEME, ...custom };
+    }
+    return { ...base, ...custom };
+  }, [identity, settingsStyleProfile, settingsStyleCustom, publicStyleProfile, publicStyleCustom]);
   const fqdnPreview = hostSub && hostDomain ? `${hostSub}.${hostDomain}` : '';
   const hostUsesDirectUpstream = !hostHAEnabled && !hostSSHBastion;
   const hostEffectiveUpstream = hostSSHBastion ? SSH_BASTION_DEFAULT_UPSTREAM : hostUpstream;
+  const isReadOnlyRole = identity?.role === 'read-only';
   const sshRouteByFQDN = useMemo(() => {
     const out: Record<string, SSHBastionRoute> = {};
     sshRoutes.forEach((r) => { out[r.fqdn.toLowerCase()] = r; });
@@ -922,6 +1089,8 @@ function App() {
           cfToken: settingsCFToken,
           publicIpv4: settingsPublicIPv4,
           baseDomain: settingsBaseDomain,
+          styleProfile: settingsStyleProfile,
+          styleCustom: settingsStyleCustom,
         }),
       });
       setSettingsCFToken('');
@@ -952,6 +1121,20 @@ function App() {
     setError('');
     try {
       await api(`/api/v1/domains/${id}`, { method: 'DELETE', headers: { 'X-CSRF-Token': csrf } });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deactivateDomain = async (d: Domain) => {
+    if (!window.confirm(`Deactivate domain ${d.name}? This will disable all subdomains under it.`)) return;
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/domains/${d.id}/deactivate`, { method: 'POST', headers: { 'X-CSRF-Token': csrf } });
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -1399,7 +1582,9 @@ function App() {
       {identity ? (
       <div className="app-shell">
         <aside className="sidebar">
-          <div className="logo">DomNexDomain</div>
+          <div className="logo" title="DomNexDomain">
+            <img src="/logo.png" alt="DomNexDomain" />
+          </div>
           <nav className="menu">
             <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
             <button className={tab === 'metricCenter' ? 'active' : ''} onClick={() => setTab('metricCenter')}>MetricCenter</button>
@@ -1422,7 +1607,7 @@ function App() {
             </div>
             <div className="top-actions">
               <button className="btn" onClick={refresh} disabled={loading}>Refresh</button>
-              {identity ? <button className="btn" onClick={() => setShowPasswordDialog(true)}>Change Password</button> : null}
+              {identity && !isReadOnlyRole ? <button className="btn" onClick={() => setShowPasswordDialog(true)}>Change Password</button> : null}
               {identity ? <button className="btn" onClick={logout}>Logout</button> : null}
             </div>
           </header>
@@ -1568,6 +1753,15 @@ function App() {
               </div>
               <aside className="entity-side">
                 <section className="card">
+                  <div className="card-head"><h3>Audit Snapshot</h3></div>
+                  <div className="metric-grid">
+                    <MetricTile label="Critical" value={String(auditCriticalTotal)} hint="Deletes, resets, revokes" />
+                    <MetricTile label="Warnings" value={String(auditWarningTotal)} hint="Updates, retries, proxy issues" />
+                    <MetricTile label="Info" value={String(auditInfoTotal)} hint="Read/list/login events" />
+                    <MetricTile label="Unique Actors" value={String(auditActorsTotal)} hint="Across retained audit data" />
+                  </div>
+                </section>
+                <section className="card">
                   <div className="card-head"><h3>Top Countries</h3></div>
                   {(metricCountries.slice(0, 8)).map((c) => (
                     <div key={`top-${c.country}`} className="host">
@@ -1601,6 +1795,42 @@ function App() {
                     )}
                   </section>
                 ) : null}
+                {identity?.role === 'admin' ? (
+                  <section className="card">
+                    <div className="card-head"><h3>Security Actions</h3></div>
+                    <div className="row">
+                      <input value={resetUser} onChange={(e) => setResetUser(e.target.value)} placeholder="username" />
+                      <input value={resetTTL} onChange={(e) => setResetTTL(e.target.value)} placeholder="30m" />
+                      <button className="btn" onClick={createResetToken} disabled={loading}>Create Reset Token</button>
+                    </div>
+                    {resetToken ? (
+                      <div className="card" style={{ marginBottom: 0 }}>
+                        <div className="muted">Password reset token (time-limited):</div>
+                        <pre>{resetToken}</pre>
+                        <div className="row" style={{ marginTop: '.55rem', marginBottom: 0 }}>
+                          <input value={resetNewPassword} onChange={(e) => setResetNewPassword(e.target.value)} placeholder="new password" />
+                          <button className="btn" onClick={consumeResetToken} disabled={!resetNewPassword || loading}>Consume Token</button>
+                        </div>
+                      </div>
+                    ) : null}
+                    <div className="card" style={{ marginTop: '.8rem', marginBottom: 0 }}>
+                      <div className="muted" style={{ marginBottom: '.45rem' }}>Blocked Source IPs</div>
+                      {blockedIPs.length === 0 ? (
+                        <div className="muted">No blocked IPs.</div>
+                      ) : (
+                        blockedIPs.map((b) => (
+                          <div key={b.ip} className="host" style={{ paddingTop: '.45rem', paddingBottom: '.45rem' }}>
+                            <div>
+                              <strong>{b.ip}</strong>
+                              {b.reason ? <div className="muted">{b.reason}</div> : null}
+                            </div>
+                            <button className="btn" onClick={() => unblockIP(b.ip)} disabled={loading}>Unblock</button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </section>
+                ) : null}
               </aside>
             </section>
           ) : null}
@@ -1608,12 +1838,17 @@ function App() {
           {tab === 'domains' ? (
             <section className="entity-page">
               <div className="entity-main">
+                {isReadOnlyRole ? (
+                  <section className="card">
+                    <div className="muted">Read-only mode: domain create, deactivate, and delete actions are disabled.</div>
+                  </section>
+                ) : null}
                 <section className="card">
                   <div className="card-head"><h3>Domain Wizard</h3></div>
                   <div className="wizard-steps">
-                    <button className={domainWizardStep === 1 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(1)}>1. Basics</button>
-                    <button className={domainWizardStep === 2 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(2)}>2. DNS Guide</button>
-                    <button className={domainWizardStep === 3 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(3)}>3. Auto Checks</button>
+                    <button className={domainWizardStep === 1 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(1)} disabled={isReadOnlyRole}>1. Basics</button>
+                    <button className={domainWizardStep === 2 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(2)} disabled={isReadOnlyRole}>2. DNS Guide</button>
+                    <button className={domainWizardStep === 3 ? 'wiz active' : 'wiz'} onClick={() => setDomainWizardStep(3)} disabled={isReadOnlyRole}>3. Auto Checks</button>
                   </div>
 
                   {domainWizardStep === 1 ? (
@@ -1628,7 +1863,7 @@ function App() {
                         {domainProvider === 'cloudflare' ? (
                           <input value={domainZoneID} onChange={(e) => setDomainZoneID(e.target.value.trim())} placeholder="Cloudflare Zone ID (optional, Auto-Resolve per Domain)" />
                         ) : null}
-                        <button className="btn" onClick={() => setDomainWizardStep(2)} disabled={!domainName}>Next</button>
+                        <button className="btn" onClick={() => setDomainWizardStep(2)} disabled={isReadOnlyRole || !domainName}>Next</button>
                       </div>
                       <div className="muted">Admin endpoint will be: <strong>{adminPreview}</strong></div>
                     </div>
@@ -1643,8 +1878,8 @@ function App() {
                       <div className="muted">Recommended DNS records:</div>
                       <pre>{domainProviderGuide[domainProvider].records.join('\n')}</pre>
                       <div className="row">
-                        <button className="btn" onClick={() => setDomainWizardStep(1)}>Back</button>
-                        <button className="btn" onClick={() => { setDomainPreflight(null); setDomainWizardStep(3); }} disabled={!domainName}>Next</button>
+                        <button className="btn" onClick={() => setDomainWizardStep(1)} disabled={isReadOnlyRole}>Back</button>
+                        <button className="btn" onClick={() => { setDomainPreflight(null); setDomainWizardStep(3); }} disabled={isReadOnlyRole || !domainName}>Next</button>
                       </div>
                     </div>
                   ) : null}
@@ -1667,8 +1902,8 @@ function App() {
                         <div className="muted">Initializing preflight...</div>
                       )}
                       <div className="row">
-                        <button className="btn" onClick={() => setDomainWizardStep(2)}>Back</button>
-                        <button className="btn" onClick={saveDomain} disabled={loading || !domainPreflight?.ready}>Create Domain</button>
+                        <button className="btn" onClick={() => setDomainWizardStep(2)} disabled={isReadOnlyRole}>Back</button>
+                        <button className="btn" onClick={saveDomain} disabled={isReadOnlyRole || loading || !domainPreflight?.ready}>Create Domain</button>
                       </div>
                     </div>
                   ) : null}
@@ -1681,11 +1916,16 @@ function App() {
                       <div className="host" style={{ borderTop: 'none', paddingTop: 0 }}>
                         <div>
                           <strong>{d.name}</strong> <span className="muted">({d.dnsMode || '-'} / {d.provider || '-'})</span>
+                          <div className="diag" style={{ marginTop: '.25rem' }}>
+                            <span className={`badge ${domainStatusBadge(d.status).cls}`}>Domain {domainStatusBadge(d.status).label}</span>
+                            <span className={`badge ${domainWildcardBadge(d).cls}`}>Wildcard {domainWildcardBadge(d).label}</span>
+                          </div>
                           {d.zoneId ? <div className="muted">zone: {d.zoneId}</div> : null}
                         </div>
                         <div className="row" style={{ marginBottom: 0 }}>
                           <button className="btn" onClick={() => runDomainLiveCheck(d.id)} disabled={loading}>Live Check</button>
-                          <button className="btn danger" onClick={() => deleteDomain(d.id)} disabled={loading}>Delete</button>
+                          <button className="btn" onClick={() => deactivateDomain(d)} disabled={isReadOnlyRole || loading || (d.status || '').toLowerCase() === 'inactive'}>Deactivate</button>
+                          <button className="btn danger" onClick={() => deleteDomain(d.id)} disabled={isReadOnlyRole || loading}>Delete</button>
                         </div>
                       </div>
                       {domainChecks[d.id] ? (
@@ -1734,6 +1974,11 @@ function App() {
             selectedHost ? (
               <section className="entity-page">
                 <div className="entity-main">
+                  {isReadOnlyRole ? (
+                    <section className="card">
+                      <div className="muted">Read-only mode: all subdomain modification actions are disabled.</div>
+                    </section>
+                  ) : null}
                   <section className="card cc-hero">
                     <div className="cc-head">
                       <div>
@@ -1810,13 +2055,13 @@ function App() {
                             <option value="failover">Failover</option>
                             <option value="round_robin">Load Balance (Round Robin)</option>
                           </select>
-                          <button className="btn" type="button" onClick={addDetailBackend}>Add Backend</button>
+                      <button className="btn" type="button" onClick={addDetailBackend} disabled={isReadOnlyRole}>Add Backend</button>
                         </div>
                         {detailHABackends.map((b, idx) => (
                           <div className="row" key={`detail-ha-${idx}`}>
                             <input value={b.name} onChange={(e) => updateDetailBackend(idx, { name: e.target.value })} placeholder="Server name" />
                             <input value={b.url} onChange={(e) => updateDetailBackend(idx, { url: e.target.value })} placeholder="https://10.0.0.11:8443" />
-                            <button className="btn danger" type="button" onClick={() => removeDetailBackend(idx)} disabled={detailHABackends.length <= 1}>Remove</button>
+                            <button className="btn danger" type="button" onClick={() => removeDetailBackend(idx)} disabled={isReadOnlyRole || detailHABackends.length <= 1}>Remove</button>
                           </div>
                         ))}
                         <div className="muted">Define backend name + address. Minimum 2 backends for HA.</div>
@@ -1828,7 +2073,7 @@ function App() {
                     )}
                     <div className="row">
                       <label className="check"><input type="checkbox" checked={detailInsecureTLS} onChange={(e) => setDetailInsecureTLS(e.target.checked)} /> No TLS Verify</label>
-                      <button className="btn" onClick={saveHostGeneral} disabled={detailSavingGeneral}>{detailSavingGeneral ? 'Saving...' : 'Save General'}</button>
+                      <button className="btn" onClick={saveHostGeneral} disabled={isReadOnlyRole || detailSavingGeneral}>{detailSavingGeneral ? 'Saving...' : 'Save General'}</button>
                     </div>
                     <div className="muted">Use this section to adjust upstream routing for this specific subdomain.</div>
                   </section>
@@ -1843,7 +2088,7 @@ function App() {
                       <div className="row">
                         <input value={detailAuthUser} onChange={(e) => setDetailAuthUser(e.target.value)} placeholder="Auth username (this host only)" />
                         <input type="password" value={detailAuthPass} onChange={(e) => setDetailAuthPass(e.target.value)} placeholder={selectedHost.authEnabled ? 'New password (leave empty = keep current)' : 'Auth password'} />
-                        <button className="btn" onClick={saveHostAuth} disabled={detailSavingAuth}>{detailSavingAuth ? 'Saving...' : 'Save Auth'}</button>
+                        <button className="btn" onClick={saveHostAuth} disabled={isReadOnlyRole || detailSavingAuth}>{detailSavingAuth ? 'Saving...' : 'Save Auth'}</button>
                       </div>
                       <div className="muted">Credentials are dedicated to this single subdomain and are not shared with others.</div>
                     </section>
@@ -1856,16 +2101,16 @@ function App() {
                           <option value="allow">Allow List Countries</option>
                           <option value="deny">Deny List Countries</option>
                         </select>
-                        <button className="btn" onClick={saveHostGeo} disabled={detailSavingGeo}>{detailSavingGeo ? 'Saving...' : 'Save Geo Policy'}</button>
+                        <button className="btn" onClick={saveHostGeo} disabled={isReadOnlyRole || detailSavingGeo}>{detailSavingGeo ? 'Saving...' : 'Save Geo Policy'}</button>
                       </div>
                       {detailGeoMode !== 'off' ? (
                         <>
                           <div className="domain-pills">
                             {Object.entries(GEO_PRESETS).map(([label, codes]) => (
-                              <button key={label} type="button" className="wiz" onClick={() => setDetailGeoCountries(codes.join(', '))}>{label}</button>
+                              <button key={label} type="button" className="wiz" onClick={() => setDetailGeoCountries(codes.join(', '))} disabled={isReadOnlyRole}>{label}</button>
                             ))}
-                            <button type="button" className="wiz" onClick={() => setDetailGeoCountries(mergeCountryCodes(detailGeoCountries, GEO_PRESETS.EU))}>+ EU</button>
-                            <button type="button" className="wiz" onClick={() => setDetailGeoCountries('')}>Clear</button>
+                            <button type="button" className="wiz" onClick={() => setDetailGeoCountries(mergeCountryCodes(detailGeoCountries, GEO_PRESETS.EU))} disabled={isReadOnlyRole}>+ EU</button>
+                            <button type="button" className="wiz" onClick={() => setDetailGeoCountries('')} disabled={isReadOnlyRole}>Clear</button>
                           </div>
                           <div className="row">
                             <input
@@ -1916,14 +2161,14 @@ function App() {
                   <section className="card cc-danger">
                     <div className="card-head"><h3>Danger Zone</h3></div>
                     <div className="row">
-                      <button className="btn" onClick={() => setHostMaintenance(selectedHost.id, selectedHost.state !== 'maintenance')} disabled={loading}>
+                      <button className="btn" onClick={() => setHostMaintenance(selectedHost.id, selectedHost.state !== 'maintenance')} disabled={isReadOnlyRole || loading}>
                         {selectedHost.state === 'maintenance' ? 'Disable Maintenance' : 'Enable Maintenance'}
                       </button>
-                      <button className="btn" onClick={() => setHostDisabled(selectedHost.id, selectedHost.state !== 'disabled')} disabled={loading}>
+                      <button className="btn" onClick={() => setHostDisabled(selectedHost.id, selectedHost.state !== 'disabled')} disabled={isReadOnlyRole || loading}>
                         {selectedHost.state === 'disabled' ? 'Enable Host' : 'Disable Host'}
                       </button>
-                      {selectedHost.state === 'error' ? <button className="btn" onClick={() => retryHost(selectedHost.id)}>Retry</button> : null}
-                      <button className="btn danger" onClick={() => openDeleteHostDialog(selectedHost)} disabled={loading}>Delete Subdomain</button>
+                      {selectedHost.state === 'error' ? <button className="btn" onClick={() => retryHost(selectedHost.id)} disabled={isReadOnlyRole}>Retry</button> : null}
+                      <button className="btn danger" onClick={() => openDeleteHostDialog(selectedHost)} disabled={isReadOnlyRole || loading}>Delete Subdomain</button>
                     </div>
                   </section>
                 </aside>
@@ -1931,12 +2176,17 @@ function App() {
             ) : (
               <section className="entity-page">
                 <div className="entity-main">
+                  {isReadOnlyRole ? (
+                    <section className="card">
+                      <div className="muted">Read-only mode: subdomain creation and state changes are disabled.</div>
+                    </section>
+                  ) : null}
                   <section className="card">
                     <div className="card-head"><h3>Subdomain Wizard</h3></div>
                     <div className="wizard-steps">
-                      <button className={hostWizardStep === 1 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(1)}>1. Basics</button>
-                      <button className={hostWizardStep === 2 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(2)}>2. Auto-Checks</button>
-                      <button className={hostWizardStep === 3 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(3)}>3. Create</button>
+                      <button className={hostWizardStep === 1 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(1)} disabled={isReadOnlyRole}>1. Basics</button>
+                      <button className={hostWizardStep === 2 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(2)} disabled={isReadOnlyRole}>2. Auto-Checks</button>
+                      <button className={hostWizardStep === 3 ? 'wiz active' : 'wiz'} onClick={() => setHostWizardStep(3)} disabled={isReadOnlyRole}>3. Create</button>
                     </div>
                     {hostWizardStep === 1 ? (
                       <div className="card" style={{ marginBottom: '.8rem' }}>
@@ -1958,18 +2208,18 @@ function App() {
                             </select>
                           ) : null}
                           <label className="check"><input type="checkbox" checked={hostInsecureTLS} onChange={(e) => setHostInsecureTLS(e.target.checked)} /> No TLS Verify</label>
-                          <button className="btn" onClick={() => { setHostPreflight(null); setHostWizardStep(2); }} disabled={!hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)}>Next</button>
+                          <button className="btn" onClick={() => { setHostPreflight(null); setHostWizardStep(2); }} disabled={isReadOnlyRole || !hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)}>Next</button>
                         </div>
                         {hostHAEnabled ? (
                           <>
                             <div className="row">
-                              <button className="btn" type="button" onClick={addHostBackend}>Add Backend</button>
+                              <button className="btn" type="button" onClick={addHostBackend} disabled={isReadOnlyRole}>Add Backend</button>
                             </div>
                             {hostHABackends.map((b, idx) => (
                               <div className="row" key={`host-ha-${idx}`}>
                                 <input value={b.name} onChange={(e) => updateHostBackend(idx, { name: e.target.value })} placeholder="Server name" />
                                 <input value={b.url} onChange={(e) => updateHostBackend(idx, { url: e.target.value })} placeholder="https://10.0.0.11:8443" />
-                                <button className="btn danger" type="button" onClick={() => removeHostBackend(idx)} disabled={hostHABackends.length <= 1}>Remove</button>
+                                <button className="btn danger" type="button" onClick={() => removeHostBackend(idx)} disabled={isReadOnlyRole || hostHABackends.length <= 1}>Remove</button>
                               </div>
                             ))}
                           </>
@@ -2005,8 +2255,8 @@ function App() {
                           <div className="muted">Initializing preflight...</div>
                         )}
                         <div className="row">
-                          <button className="btn" onClick={() => setHostWizardStep(1)}>Back</button>
-                          <button className="btn" onClick={() => setHostWizardStep(3)} disabled={hostPreflightRunning || !hostPreflight?.ready}>Next</button>
+                          <button className="btn" onClick={() => setHostWizardStep(1)} disabled={isReadOnlyRole}>Back</button>
+                          <button className="btn" onClick={() => setHostWizardStep(3)} disabled={isReadOnlyRole || hostPreflightRunning || !hostPreflight?.ready}>Next</button>
                         </div>
                       </div>
                     ) : null}
@@ -2020,8 +2270,8 @@ function App() {
                           {hostSSHBastion ? <span> · SSH Bastion route will be created automatically.</span> : null}
                         </div>
                         <div className="row">
-                          <button className="btn" onClick={() => setHostWizardStep(2)}>Back</button>
-                          <button className="btn" onClick={addHost} disabled={loading || !hostPreflight?.ready}>Create Subdomain</button>
+                          <button className="btn" onClick={() => setHostWizardStep(2)} disabled={isReadOnlyRole}>Back</button>
+                          <button className="btn" onClick={addHost} disabled={isReadOnlyRole || loading || !hostPreflight?.ready}>Create Subdomain</button>
                         </div>
                       </div>
                     ) : null}
@@ -2070,15 +2320,15 @@ function App() {
                           ) : null}
                         </div>
                         <div className="row" style={{ marginBottom: 0 }}>
-                          <button className="btn" onClick={() => openHostDetail(h)}>Edit</button>
-                          <button className="btn" onClick={() => setHostMaintenance(h.id, h.state !== 'maintenance')} disabled={loading}>
+                          <button className="btn" onClick={() => openHostDetail(h)}>{isReadOnlyRole ? 'View' : 'Edit'}</button>
+                          <button className="btn" onClick={() => setHostMaintenance(h.id, h.state !== 'maintenance')} disabled={isReadOnlyRole || loading}>
                             {h.state === 'maintenance' ? 'Maintenance Off' : 'Maintenance On'}
                           </button>
-                          <button className="btn" onClick={() => setHostDisabled(h.id, h.state !== 'disabled')} disabled={loading}>
+                          <button className="btn" onClick={() => setHostDisabled(h.id, h.state !== 'disabled')} disabled={isReadOnlyRole || loading}>
                             {h.state === 'disabled' ? 'Enable' : 'Disable'}
                           </button>
-                          {h.state === 'error' ? <button className="btn" onClick={() => retryHost(h.id)}>Retry</button> : null}
-                          <button className="btn danger" onClick={() => openDeleteHostDialog(h)} disabled={loading}>Delete</button>
+                          {h.state === 'error' ? <button className="btn" onClick={() => retryHost(h.id)} disabled={isReadOnlyRole}>Retry</button> : null}
+                          <button className="btn danger" onClick={() => openDeleteHostDialog(h)} disabled={isReadOnlyRole || loading}>Delete</button>
                         </div>
                       </div>
                     ))}
@@ -2131,6 +2381,22 @@ function App() {
                   <div className="row">
                     <input value={settingsPublicIPv4} onChange={(e) => setSettingsPublicIPv4(e.target.value)} placeholder="Preferred Public IPv4 (e.g. 203.0.113.10)" />
                   </div>
+                  <div className="row">
+                    <select value={settingsStyleProfile} onChange={(e) => setSettingsStyleProfile(e.target.value as StyleProfile)}>
+                      <option value="monolith">Monolith</option>
+                      <option value="cybermonolith">CyberMonolith</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                  </div>
+                  <div className="muted" style={{ marginBottom: '.35rem' }}>
+                    Style profile controls the full UI palette. `Custom` uses JSON overrides (theme key to color/value).
+                  </div>
+                  <textarea
+                    value={settingsStyleCustom}
+                    onChange={(e) => setSettingsStyleCustom(e.target.value)}
+                    placeholder='{"accent":"#8b5cf6","surface":"#1c1c22","text":"#e6e6f0","border":"#2a2a36"}'
+                    rows={4}
+                  />
                   <div className="muted" style={{ marginBottom: '.6rem' }}>
                     Detected automatically on first start via external IP check and stored here. For multi-WAN setups, you can override the target IP manually.
                   </div>
@@ -2150,6 +2416,7 @@ function App() {
                     <MetricTile label="Public IPv4" value={settingsPublicIPv4 || settings?.publicIpv4 || '-'} hint="Preferred outbound target" />
                     <MetricTile label="Base Domain" value={settingsBaseDomain || settings?.baseDomain || '-'} hint="Used for admin endpoint" />
                     <MetricTile label="Admin Endpoint" value={settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '-')} hint="Control plane hostname" />
+                    <MetricTile label="Style Profile" value={settingsStyleProfile} hint="UI palette preset" />
                   </div>
                 </section>
                 <section className="card">
@@ -2168,8 +2435,9 @@ function App() {
                   <div className="row">
                     <input value={newUserName} onChange={(e) => setNewUserName(e.target.value.toLowerCase().trim())} placeholder="username" />
                     <input type="password" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} placeholder="password (min 10)" />
-                    <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as 'admin' | 'domain-admin')}>
+                    <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as 'admin' | 'domain-admin' | 'read-only')}>
                       <option value="domain-admin">Sub Admin (domain-admin)</option>
+                      <option value="read-only">Read Only</option>
                       <option value="admin">Global Admin</option>
                     </select>
                   </div>
@@ -2211,6 +2479,7 @@ function App() {
                     <MetricTile label="Total Users" value={String(users.length)} hint="Managed accounts" />
                     <MetricTile label="Global Admins" value={String(globalAdmins)} hint="Full control users" />
                     <MetricTile label="Domain Admins" value={String(domainAdmins)} hint="Scoped admins" />
+                    <MetricTile label="Read Only" value={String(readOnlyUsers)} hint="View-only accounts" />
                     <MetricTile label="Missing Scope" value={String(usersWithoutDomainScope)} hint="Domain-admin without domains" />
                   </div>
                 </section>
@@ -2218,6 +2487,7 @@ function App() {
                   <div className="card-head"><h3>Role Guide</h3></div>
                   <div className="muted">`admin`: global access across domains, users, settings.</div>
                   <div className="muted" style={{ marginTop: '.45rem' }}>`domain-admin`: limited to assigned domains and hosts.</div>
+                  <div className="muted" style={{ marginTop: '.45rem' }}>`read-only`: view-only access (no create/update/delete).</div>
                   <div className="muted" style={{ marginTop: '.45rem' }}>Use domain scope assignment right after user creation.</div>
                 </section>
               </aside>
@@ -2539,9 +2809,26 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
           {tab === 'audit' ? (
             <section className="logs-page">
               <div className="card">
-                <div className="card-head"><h3>Audit Stream</h3></div>
-                <div className="row">
-                  <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="Search actor, action, target, trace id..." />
+                <div className="card-head"><h3>LogCenter</h3></div>
+                <div className="log-filter-grid">
+                  <select value={logWindow} onChange={(e) => setLogWindow(e.target.value as '15m' | '1h' | '6h' | '24h' | '7d' | 'all')}>
+                    <option value="15m">Last 15 minutes</option>
+                    <option value="1h">Last 1 hour</option>
+                    <option value="6h">Last 6 hours</option>
+                    <option value="24h">Last 24 hours</option>
+                    <option value="7d">Last 7 days</option>
+                    <option value="all">All retained</option>
+                  </select>
+                  <select value={logLevelFilter} onChange={(e) => setLogLevelFilter(e.target.value as 'all' | 'critical' | 'warn' | 'info')}>
+                    <option value="all">All levels</option>
+                    <option value="critical">Critical</option>
+                    <option value="warn">Warning</option>
+                    <option value="info">Info</option>
+                  </select>
+                  <select value={logNamespaceFilter} onChange={(e) => setLogNamespaceFilter(e.target.value)}>
+                    <option value="all">All namespaces</option>
+                    {logNamespaces.map((n) => <option key={n} value={n}>{n}</option>)}
+                  </select>
                   <select value={logActionFilter} onChange={(e) => setLogActionFilter(e.target.value)}>
                     <option value="all">All actions</option>
                     {logActions.map((a) => <option key={a} value={a}>{a}</option>)}
@@ -2554,89 +2841,66 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                     <option value="all">All source IPs</option>
                     {logIPs.map((ip) => <option key={ip} value={ip}>{ip}</option>)}
                   </select>
+                  <select value={logScopeFilter} onChange={(e) => setLogScopeFilter(e.target.value as 'all' | 'internal' | 'external')}>
+                    <option value="all">All source scopes</option>
+                    <option value="internal">Internal (LAN/loopback)</option>
+                    <option value="external">External (internet)</option>
+                  </select>
+                  <input value={logTargetQuery} onChange={(e) => setLogTargetQuery(e.target.value)} placeholder="Target contains..." />
+                  <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="Search action/meta/trace/path..." />
                 </div>
                 <div className="muted" style={{ marginBottom: '.6rem' }}>
-                  Showing {filteredAudit.length} of {audit.length} events.
+                  Showing {filteredAudit.length} of {logsBaseByWindow.length} events in window.
                 </div>
-                <div className="event-list logs-list">
-                  {filteredAudit.length === 0 ? (
-                    <div className="muted">No events match your filter.</div>
-                  ) : (
-                    filteredAudit.map((e) => {
-                      const level = classifyAuditLevel(e.action, e.target);
-                      const src = extractSourceIP(e);
-                      const canBlock = identity?.role === 'admin' && !!src && !blockedIPs.some((b) => b.ip === src);
-                      return (
-                        <div className="event-item" key={e.id}>
-                          <div className="event-top">
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '.5rem' }}>
-                              <span className={`badge ${level === 'critical' ? 'err' : level === 'warn' ? 'warn' : 'ok'}`}>{level.toUpperCase()}</span>
-                              <strong>{e.action}</strong>
-                            </div>
-                            <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
-                          </div>
-                          <div className="muted">{e.actor} {'->'} {e.target}</div>
-                          {e.meta ? <div className="muted" style={{ marginTop: '.2rem', wordBreak: 'break-word' }}>Meta: {e.meta}</div> : null}
-                          <div className="muted" style={{ marginTop: '.2rem' }}>
-                            Trace ID: <strong>{extractTraceID(e) || '-'}</strong>
-                          </div>
-                          <div className="muted" style={{ marginTop: '.2rem' }}>
-                            Source IP: <strong>{src || '-'}</strong>
-                            {canBlock ? (
-                              <button className="btn danger" style={{ marginLeft: '.6rem', padding: '.35rem .6rem' }} onClick={() => blockIP(src, `from audit event ${e.id}`)} disabled={loading}>
-                                Block IP
-                              </button>
-                            ) : null}
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-              <div className="logs-side">
-                <div className="card">
-                  <div className="card-head"><h3>Event Stats</h3></div>
-                  <div className="metric-grid">
-                    <MetricTile label="Critical" value={String(criticalLogs)} hint="Deletes, resets, revokes" />
-                    <MetricTile label="Warnings" value={String(warningLogs)} hint="Updates, retries, reloads" />
-                    <MetricTile label="Info" value={String(infoLogs)} hint="List/read/login events" />
-                    <MetricTile label="Unique Actors" value={String(logActors.length)} hint="From current filter set" />
-                  </div>
-                </div>
-                <div className="card">
-                  <div className="card-head"><h3>Security Actions</h3></div>
-                  <div className="row">
-                    <input value={resetUser} onChange={(e) => setResetUser(e.target.value)} placeholder="username" />
-                    <input value={resetTTL} onChange={(e) => setResetTTL(e.target.value)} placeholder="30m" />
-                    <button className="btn" onClick={createResetToken} disabled={loading}>Create Reset Token</button>
-                  </div>
-                  {resetToken ? (
-                    <div className="card" style={{ marginBottom: 0 }}>
-                      <div className="muted">Password reset token (time-limited):</div>
-                      <pre>{resetToken}</pre>
-                      <div className="row" style={{ marginTop: '.55rem', marginBottom: 0 }}>
-                        <input value={resetNewPassword} onChange={(e) => setResetNewPassword(e.target.value)} placeholder="new password" />
-                        <button className="btn" onClick={consumeResetToken} disabled={!resetNewPassword || loading}>Consume Token</button>
-                      </div>
-                    </div>
-                  ) : null}
-                  <div className="card" style={{ marginTop: '.8rem', marginBottom: 0 }}>
-                    <div className="muted" style={{ marginBottom: '.45rem' }}>Blocked Source IPs</div>
-                    {blockedIPs.length === 0 ? (
-                      <div className="muted">No blocked IPs.</div>
-                    ) : (
-                      blockedIPs.map((b) => (
-                        <div key={b.ip} className="host" style={{ paddingTop: '.45rem', paddingBottom: '.45rem' }}>
-                          <div>
-                            <strong>{b.ip}</strong>
-                            {b.reason ? <div className="muted">{b.reason}</div> : null}
-                          </div>
-                          <button className="btn" onClick={() => unblockIP(b.ip)} disabled={loading}>Unblock</button>
-                        </div>
-                      ))
-                    )}
-                  </div>
+                <div className="log-table-wrap">
+                  <table className="log-table">
+                    <thead>
+                      <tr>
+                        <th>Time</th>
+                        <th>Level</th>
+                        <th>Namespace</th>
+                        <th>Action</th>
+                        <th>Actor</th>
+                        <th>Target</th>
+                        <th>Source</th>
+                        <th>Trace</th>
+                        <th>Meta</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredAudit.length === 0 ? (
+                        <tr>
+                          <td colSpan={9} className="muted">No events match your filter.</td>
+                        </tr>
+                      ) : filteredAudit.map((e) => {
+                        const level = classifyAuditLevel(e.action, e.target);
+                        const src = extractSourceIP(e);
+                        const trace = extractTraceID(e);
+                        const meta = e.meta || '';
+                        const canBlock = identity?.role === 'admin' && !!src && !blockedIPs.some((b) => b.ip === src);
+                        return (
+                          <tr key={e.id}>
+                            <td>{new Date(e.createdAt).toLocaleString()}</td>
+                            <td><span className={`badge ${level === 'critical' ? 'err' : level === 'warn' ? 'warn' : 'ok'}`}>{level.toUpperCase()}</span></td>
+                            <td>{actionNamespace(e.action)}</td>
+                            <td><code>{e.action}</code></td>
+                            <td>{e.actor || '-'}</td>
+                            <td className="log-target">{e.target || '-'}</td>
+                            <td>
+                              <div className="log-src-cell">
+                                <span>{src || '-'}</span>
+                                {canBlock ? (
+                                  <button className="btn danger log-mini-btn" onClick={() => blockIP(src, `from audit event ${e.id}`)} disabled={loading}>Block</button>
+                                ) : null}
+                              </div>
+                            </td>
+                            <td><code>{trace || '-'}</code></td>
+                            <td className="log-meta" title={meta}>{meta || '-'}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 </div>
               </div>
             </section>
@@ -2648,7 +2912,9 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
       {!identity ? (
         <div className="overlay auth-overlay">
           <div className="login-card auth-login-card">
-            <div className="auth-logo">DomNexDomain</div>
+            <div className="auth-brand">
+              <img src="/logo.png" alt="DomNexDomain" />
+            </div>
             <h3>Control Plane Login</h3>
             <p className="muted">Sign in with your admin account to continue.</p>
             <div className="col">
@@ -2695,15 +2961,33 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
       ) : null}
 
       <style>{`
-        :root { --bg:#0f0f11; --surface:#16161a; --border:#222229; --text:#e0e0e5; --text-dim:#9ca3af; --accent:#6366f1; --accent-dark:#4f46e5; --green:#10b981; --red:#ef4444; --radius:12px; }
+        :root { --bg:${activeTheme.bg}; --surface:${activeTheme.surface}; --panel:${activeTheme.panel}; --panel-hover:${activeTheme.panelHover}; --border:${activeTheme.border}; --text:${activeTheme.text}; --text-dim:${activeTheme.textDim}; --accent:${activeTheme.accent}; --accent-hover:${activeTheme.accentHover}; --accent-active:${activeTheme.accentActive}; --accent-soft:${activeTheme.accentSoft}; --green:${activeTheme.success}; --red:${activeTheme.danger}; --input-bg:${activeTheme.inputBg}; --hero-a:${activeTheme.heroA}; --hero-b:${activeTheme.heroB}; --radius:12px; }
         * { box-sizing: border-box; }
         body { margin:0; font-family:'Inter', system-ui, sans-serif; background:var(--bg); color:var(--text); }
         .app-shell { display:grid; grid-template-columns:240px 1fr; min-height:100vh; }
         .sidebar { background:var(--surface); border-right:1px solid var(--border); padding:1.5rem 0; }
-        .logo { padding:0 1.5rem 2rem; font-size:1.6rem; font-weight:700; background:linear-gradient(90deg,#a5b4fc,#c084fc); -webkit-background-clip:text; background-clip:text; color:transparent; }
+        .logo { padding:0 .85rem 1.25rem; display:grid; place-items:center; }
+        .logo img {
+          width:100%;
+          max-width:220px;
+          height:auto;
+          display:block;
+          border-radius:16px;
+          filter: drop-shadow(0 3px 10px rgba(0,0,0,.28));
+          -webkit-mask-image:
+            radial-gradient(125% 105% at 50% 48%, rgba(0,0,0,1) 48%, rgba(0,0,0,.86) 62%, rgba(0,0,0,.52) 78%, rgba(0,0,0,0) 100%),
+            linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,.95) 16%, rgba(0,0,0,.95) 84%, rgba(0,0,0,0) 100%),
+            linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,.96) 12%, rgba(0,0,0,.96) 88%, rgba(0,0,0,0) 100%);
+          mask-image:
+            radial-gradient(125% 105% at 50% 48%, rgba(0,0,0,1) 48%, rgba(0,0,0,.86) 62%, rgba(0,0,0,.52) 78%, rgba(0,0,0,0) 100%),
+            linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,.95) 16%, rgba(0,0,0,.95) 84%, rgba(0,0,0,0) 100%),
+            linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,.96) 12%, rgba(0,0,0,.96) 88%, rgba(0,0,0,0) 100%);
+          -webkit-mask-composite: source-in;
+          mask-composite: intersect;
+        }
         .menu { display:grid; gap:.25rem; padding:0 .5rem; }
         .menu button { text-align:left; background:transparent; border:1px solid transparent; color:var(--text-dim); padding:.85rem 1rem; border-radius:10px; cursor:pointer; }
-        .menu button:hover, .menu button.active { background:rgba(99,102,241,.12); color:var(--accent); }
+        .menu button:hover, .menu button.active { background:var(--accent-soft); color:var(--accent); }
         .main { padding:2.5rem 3rem; }
         .top { display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1.25rem; }
         h1 { margin:0; font-size:2.2rem; letter-spacing:-.6px; }
@@ -2717,22 +3001,22 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .entity-main { display:grid; gap:1rem; }
         .entity-side { display:grid; gap:1rem; }
         .cc-hero { background:
-          radial-gradient(900px 300px at 88% -35%, rgba(56,189,248,.15), transparent 58%),
-          radial-gradient(900px 300px at 12% -45%, rgba(99,102,241,.2), transparent 58%),
+          radial-gradient(900px 300px at 88% -35%, var(--hero-a), transparent 58%),
+          radial-gradient(900px 300px at 12% -45%, var(--hero-b), transparent 58%),
           var(--surface);
         }
         .cc-head { display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; margin-bottom:.85rem; }
         .cc-head h3 { margin:0 0 .25rem; }
-        .btn.ghost { background:#121219; border:1px solid #2b2b39; color:var(--text); text-decoration:none; display:inline-flex; align-items:center; }
-        .btn.ghost:hover { background:#171722; }
+        .btn.ghost { background:var(--panel); border:1px solid var(--border); color:var(--text); text-decoration:none; display:inline-flex; align-items:center; }
+        .btn.ghost:hover { background:var(--panel-hover); }
         .cc-header-grid { display:grid; gap:.65rem; margin-bottom:.75rem; }
         .cc-title { display:flex; align-items:center; gap:.6rem; font-size:1.02rem; margin-bottom:.65rem; }
         .cc-pills { display:flex; flex-wrap:wrap; gap:.45rem; }
-        .cc-pill { border:1px solid var(--border); background:#111118; color:var(--text-dim); border-radius:999px; padding:.28rem .62rem; font-size:.76rem; }
+        .cc-pill { border:1px solid var(--border); background:var(--panel); color:var(--text-dim); border-radius:999px; padding:.28rem .62rem; font-size:.76rem; }
         .cc-pill.ok { border-color:#1d5a45; color:#9df3cb; background:#103227; }
         .cc-pill.warn { border-color:#6b4d19; color:#ffd89a; background:#3a2a0f; }
         .cc-kpi-strip { display:grid; gap:.6rem; grid-template-columns:repeat(4,minmax(0,1fr)); }
-        .cc-kpi { border:1px solid #2b2b39; border-radius:10px; padding:.55rem .65rem; background:#111118; display:grid; gap:.2rem; }
+        .cc-kpi { border:1px solid var(--border); border-radius:10px; padding:.55rem .65rem; background:var(--panel); display:grid; gap:.2rem; }
         .cc-kpi span { color:var(--text-dim); font-size:.73rem; }
         .cc-kpi strong { font-size:1rem; }
         .cc-diag-inline { margin-top:.7rem; padding-top:.55rem; border-top:1px solid #2a2a35; }
@@ -2742,18 +3026,18 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .cc-split { display:grid; gap:1rem; grid-template-columns:repeat(2,minmax(0,1fr)); }
         .cc-danger { border-color:#7f1d1d; background:linear-gradient(180deg, rgba(127,29,29,.12), rgba(22,22,26,.85)); }
         .gauge-grid { display:grid; gap:.8rem; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
-        .gauge-card { background:#121219; border:1px solid var(--border); border-radius:11px; padding:.75rem; display:grid; justify-items:center; gap:.45rem; }
+        .gauge-card { background:var(--panel); border:1px solid var(--border); border-radius:11px; padding:.75rem; display:grid; justify-items:center; gap:.45rem; }
         .gauge-ring { width:92px; height:92px; border-radius:999px; display:grid; place-items:center; }
-        .gauge-inner { width:68px; height:68px; border-radius:999px; background:#111118; border:1px solid #2a2a36; display:grid; place-items:center; font-weight:700; }
+        .gauge-inner { width:68px; height:68px; border-radius:999px; background:var(--panel); border:1px solid var(--border); display:grid; place-items:center; font-weight:700; }
         .gauge-title { font-size:.82rem; text-align:center; }
         .gauge-sub { font-size:.74rem; color:var(--text-dim); text-align:center; }
         .metric-grid { display:grid; gap:.8rem; grid-template-columns:repeat(2,minmax(0,1fr)); }
-        .metric-tile { background:#121219; border:1px solid var(--border); border-radius:11px; padding:.75rem; }
+        .metric-tile { background:var(--panel); border:1px solid var(--border); border-radius:11px; padding:.75rem; }
         .metric-label { color:var(--text-dim); font-size:.78rem; margin-bottom:.35rem; }
         .metric-value { font-size:1.4rem; font-weight:700; line-height:1; margin-bottom:.25rem; }
         .metric-hint { color:var(--text-dim); font-size:.75rem; }
         .event-list { display:grid; gap:.55rem; max-height:360px; overflow:auto; }
-        .event-item { padding:.55rem .6rem; border:1px solid var(--border); border-radius:9px; background:#121219; }
+        .event-item { padding:.55rem .6rem; border:1px solid var(--border); border-radius:9px; background:var(--panel); }
         .event-top { display:flex; justify-content:space-between; align-items:center; gap:.6rem; margin-bottom:.2rem; }
         .geo-map-wrap { border:1px solid #2a2a35; border-radius:12px; background:
           radial-gradient(700px 200px at 95% -45%, rgba(14,165,233,.2), transparent 55%),
@@ -2765,9 +3049,19 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .geo-map-grid { stroke:#2b3140; stroke-width:1; opacity:.75; }
         .geo-map-bubble { fill:#22c55e; stroke:#a7f3d0; stroke-width:1.5; }
         .geo-map-label { fill:#d1d5db; font-size:11px; font-weight:600; }
-        .logs-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.75fr) minmax(300px,1fr); align-items:start; }
+        .logs-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1fr); align-items:start; }
         .logs-side { display:grid; gap:1rem; }
         .logs-list { max-height:620px; }
+        .log-filter-grid { display:grid; gap:.55rem; grid-template-columns:repeat(3,minmax(0,1fr)); margin-bottom:.7rem; }
+        .log-table-wrap { border:1px solid var(--border); border-radius:11px; overflow:auto; max-height:640px; background:var(--panel); }
+        .log-table { width:100%; border-collapse:collapse; font-size:.86rem; min-width:1080px; }
+        .log-table th, .log-table td { border-bottom:1px solid var(--border); padding:.48rem .55rem; text-align:left; vertical-align:top; }
+        .log-table th { position:sticky; top:0; z-index:1; background:var(--surface); color:var(--text-dim); font-size:.73rem; text-transform:uppercase; letter-spacing:.06em; }
+        .log-table tbody tr:hover { background:var(--panel-hover); }
+        .log-src-cell { display:flex; align-items:center; gap:.35rem; flex-wrap:wrap; }
+        .log-mini-btn { padding:.2rem .45rem; border-radius:8px; font-size:.72rem; }
+        .log-meta { max-width:320px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .log-target { max-width:220px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:1rem; }
         .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:1rem; }
         .card.wide { grid-column:span 2; }
@@ -2778,16 +3072,16 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .status.ok { background:var(--green); }
         .status.err { background:var(--red); }
         .btn { background:var(--accent); color:#fff; border:none; border-radius:10px; padding:.65rem 1rem; cursor:pointer; }
-        .btn:hover { background:var(--accent-dark); }
+        .btn:hover { background:var(--accent-hover); }
         .btn.danger { background:#b91c1c; }
         .btn.danger:hover { background:#991b1b; }
         .btn:disabled { opacity:.6; cursor:not-allowed; }
         .row { display:flex; gap:.6rem; flex-wrap:wrap; margin-bottom:.8rem; }
-        input, select, textarea { background:#0f0f14; border:1px solid var(--border); color:var(--text); border-radius:9px; padding:.6rem .75rem; }
+        input, select, textarea { background:var(--input-bg); border:1px solid var(--border); color:var(--text); border-radius:9px; padding:.6rem .75rem; }
         textarea { min-height:6rem; width:100%; }
         .wizard-steps { display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap; }
         .wiz { background:#111118; color:var(--text-dim); border:1px solid var(--border); border-radius:10px; padding:.5rem .75rem; cursor:pointer; }
-        .wiz.active { color:var(--text); border-color:var(--accent); background:rgba(99,102,241,.15); }
+        .wiz.active { color:var(--text); border-color:var(--accent); background:var(--accent-soft); }
         .check { display:flex; align-items:center; gap:.5rem; margin-bottom:.5rem; color:var(--text-dim); }
         .domain-pills { display:flex; flex-wrap:wrap; gap:.45rem; margin:.4rem 0 .8rem; }
         .pill { display:flex; align-items:center; gap:.35rem; background:#111118; border:1px solid var(--border); border-radius:999px; padding:.3rem .6rem; color:var(--text-dim); }
@@ -2813,17 +3107,27 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .login-card { width:min(420px,100%); background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1rem; }
         .login-card h3 { margin-top:0; }
         .auth-login-card { width:min(460px,100%); border-color:#2b3445; background:linear-gradient(180deg, rgba(18,22,32,.95), rgba(15,18,28,.95)); }
-        .auth-logo {
-          font-size:1.1rem;
-          font-weight:700;
-          margin-bottom:.6rem;
-          background:linear-gradient(90deg,#67e8f9,#34d399);
-          -webkit-background-clip:text;
-          background-clip:text;
-          color:transparent;
+        .auth-brand { display:grid; place-items:center; margin-bottom:.5rem; }
+        .auth-brand img {
+          width:100%;
+          max-width:260px;
+          height:auto;
+          display:block;
+          border-radius:16px;
+          filter: drop-shadow(0 3px 10px rgba(0,0,0,.28));
+          -webkit-mask-image:
+            radial-gradient(125% 105% at 50% 48%, rgba(0,0,0,1) 48%, rgba(0,0,0,.86) 62%, rgba(0,0,0,.52) 78%, rgba(0,0,0,0) 100%),
+            linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,.95) 16%, rgba(0,0,0,.95) 84%, rgba(0,0,0,0) 100%),
+            linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,.96) 12%, rgba(0,0,0,.96) 88%, rgba(0,0,0,0) 100%);
+          mask-image:
+            radial-gradient(125% 105% at 50% 48%, rgba(0,0,0,1) 48%, rgba(0,0,0,.86) 62%, rgba(0,0,0,.52) 78%, rgba(0,0,0,0) 100%),
+            linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,.95) 16%, rgba(0,0,0,.95) 84%, rgba(0,0,0,0) 100%),
+            linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,.96) 12%, rgba(0,0,0,.96) 88%, rgba(0,0,0,0) 100%);
+          -webkit-mask-composite: source-in;
+          mask-composite: intersect;
         }
         .col { display:grid; gap:.6rem; }
-        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} }
+        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} }
         @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} }
       `}</style>
     </>
@@ -2886,6 +3190,26 @@ function extractTraceNeedles(query: string): string[] {
   return out;
 }
 
+function actionNamespace(action: string): string {
+  const a = (action || '').trim().toLowerCase();
+  if (!a) return 'other';
+  const dot = a.indexOf('.');
+  if (dot <= 0) return a;
+  return a.slice(0, dot);
+}
+
+function classifySourceScope(ip: string, publicIPv4: string): 'internal' | 'external' {
+  const raw = (ip || '').trim();
+  if (!raw) return 'external';
+  if (raw === '127.0.0.1' || raw === '::1') return 'internal';
+  if (publicIPv4 && raw === publicIPv4) return 'internal';
+  if (raw.startsWith('10.')) return 'internal';
+  if (raw.startsWith('192.168.')) return 'internal';
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(raw)) return 'internal';
+  if (raw.startsWith('fc') || raw.startsWith('fd') || raw.startsWith('fe80:')) return 'internal';
+  return 'external';
+}
+
 function hostStateBadge(state: string): { cls: 'ok' | 'warn' | 'err'; label: string } {
   const s = (state || '').toLowerCase();
   if (s === 'active') return { cls: 'ok', label: 'Active' };
@@ -2897,6 +3221,22 @@ function hostStateBadge(state: string): { cls: 'ok' | 'warn' | 'err'; label: str
   if (s === 'dns_pending') return { cls: 'warn', label: 'DNS Pending' };
   if (s === 'created') return { cls: 'warn', label: 'Created' };
   return { cls: 'warn', label: state || 'Unknown' };
+}
+
+function domainStatusBadge(status?: string): { cls: 'ok' | 'warn' | 'err'; label: string } {
+  const s = (status || '').toLowerCase().trim();
+  if (s === 'active' || s === '') return { cls: 'ok', label: 'Active' };
+  if (s === 'inactive') return { cls: 'warn', label: 'Inactive' };
+  return { cls: 'warn', label: status || 'Unknown' };
+}
+
+function domainWildcardBadge(d: Domain): { cls: 'ok' | 'warn' | 'err'; label: string } {
+  const dns = (d.dnsMode || '').toLowerCase().trim();
+  const cert = (d.certMode || '').toLowerCase().trim();
+  if (dns !== 'cloudflare') return { cls: 'err', label: 'Off' };
+  if (cert.includes('catchall')) return { cls: 'ok', label: 'On' };
+  if (cert.startsWith('letsencrypt')) return { cls: 'ok', label: 'On' };
+  return { cls: 'err', label: 'Off' };
 }
 
 function normalizeBackends(items: HABackend[]): HABackend[] {

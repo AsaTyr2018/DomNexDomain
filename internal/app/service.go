@@ -45,13 +45,15 @@ type Service struct {
 const settingPublicIPv4 = "network.public_ipv4"
 
 type RuntimeSettings struct {
-	Domain      string `json:"domain"`
-	BaseDomain  string `json:"baseDomain"`
-	AdminFQDN   string `json:"adminFqdn"`
-	ACMEEmail   string `json:"acmeEmail"`
-	ACMEStaging bool   `json:"acmeStaging"`
-	HasCFToken  bool   `json:"hasCloudflareToken"`
-	PublicIPv4  string `json:"publicIpv4"`
+	Domain       string `json:"domain"`
+	BaseDomain   string `json:"baseDomain"`
+	AdminFQDN    string `json:"adminFqdn"`
+	ACMEEmail    string `json:"acmeEmail"`
+	ACMEStaging  bool   `json:"acmeStaging"`
+	HasCFToken   bool   `json:"hasCloudflareToken"`
+	PublicIPv4   string `json:"publicIpv4"`
+	StyleProfile string `json:"styleProfile"`
+	StyleCustom  string `json:"styleCustom"`
 }
 
 type ManagedUser struct {
@@ -319,6 +321,47 @@ func (s *Service) ListFQDNs(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+func (s *Service) ListCatchAllDomains(ctx context.Context) ([]string, error) {
+	domains, err := s.store.ListDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(domains))
+	for _, d := range domains {
+		dnsMode := strings.ToLower(strings.TrimSpace(d.DNSMode))
+		certMode := strings.ToLower(strings.TrimSpace(d.CertMode))
+		if dnsMode != "cloudflare" {
+			continue
+		}
+		// Keep HTTP-01 default behavior but allow opt-in catch-all mode.
+		// For backwards compatibility, existing "letsencrypt" Cloudflare domains
+		// are treated as catch-all enabled as well.
+		if certMode == "letsencrypt" || certMode == "letsencrypt-catchall" {
+			out = append(out, strings.ToLower(strings.TrimSpace(d.Name)))
+		}
+	}
+	return out, nil
+}
+
+func (s *Service) ListWildcardDomains(ctx context.Context) ([]string, error) {
+	domains, err := s.store.ListDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(domains))
+	for _, d := range domains {
+		if strings.ToLower(strings.TrimSpace(d.DNSMode)) != "cloudflare" {
+			continue
+		}
+		certMode := strings.ToLower(strings.TrimSpace(d.CertMode))
+		if !strings.HasPrefix(certMode, "letsencrypt") {
+			continue
+		}
+		out = append(out, strings.ToLower(strings.TrimSpace(d.Name)))
+	}
+	return out, nil
+}
+
 func (s *Service) SetCloudflareToken(ctx context.Context, token string) error {
 	enc, err := s.keystore.Encrypt(token)
 	if err != nil {
@@ -337,9 +380,10 @@ func (s *Service) GetCloudflareToken(ctx context.Context) (string, error) {
 
 func (s *Service) GetRuntimeSettings(ctx context.Context) (RuntimeSettings, error) {
 	out := RuntimeSettings{
-		Domain:      s.cfg.Domain,
-		ACMEEmail:   s.cfg.ACMEEmail,
-		ACMEStaging: s.cfg.ACMEStaging,
+		Domain:       s.cfg.Domain,
+		ACMEEmail:    s.cfg.ACMEEmail,
+		ACMEStaging:  s.cfg.ACMEStaging,
+		StyleProfile: "monolith",
 	}
 	if v, err := s.store.GetSetting(ctx, "runtime.base_domain"); err == nil && strings.TrimSpace(v) != "" {
 		out.BaseDomain = strings.ToLower(strings.TrimSpace(v))
@@ -367,10 +411,19 @@ func (s *Service) GetRuntimeSettings(ctx context.Context) (RuntimeSettings, erro
 	if out.PublicIPv4 == "" && strings.TrimSpace(s.publicIP) != "" {
 		out.PublicIPv4 = strings.TrimSpace(s.publicIP)
 	}
+	if v, err := s.store.GetSetting(ctx, "runtime.style_profile"); err == nil && strings.TrimSpace(v) != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "monolith", "cybermonolith", "custom":
+			out.StyleProfile = strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	if v, err := s.store.GetSetting(ctx, "runtime.style_custom"); err == nil {
+		out.StyleCustom = strings.TrimSpace(v)
+	}
 	return out, nil
 }
 
-func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain string) error {
+func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom string) error {
 	acmeEmail = strings.TrimSpace(acmeEmail)
 	if acmeEmail != "" {
 		if err := s.store.SetSetting(ctx, "acme.email", acmeEmail); err != nil {
@@ -417,7 +470,47 @@ func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acme
 			return err
 		}
 	}
+	styleProfile = strings.ToLower(strings.TrimSpace(styleProfile))
+	if styleProfile == "" {
+		styleProfile = "monolith"
+	}
+	switch styleProfile {
+	case "monolith", "cybermonolith", "custom":
+	default:
+		return fmt.Errorf("invalid style profile")
+	}
+	if err := s.store.SetSetting(ctx, "runtime.style_profile", styleProfile); err != nil {
+		return err
+	}
+	styleCustom = strings.TrimSpace(styleCustom)
+	if styleCustom != "" {
+		var tmp map[string]string
+		if err := json.Unmarshal([]byte(styleCustom), &tmp); err != nil {
+			return fmt.Errorf("invalid style custom json: %w", err)
+		}
+		if len(tmp) > 32 {
+			return fmt.Errorf("style custom json has too many keys")
+		}
+	}
+	if err := s.store.SetSetting(ctx, "runtime.style_custom", styleCustom); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Service) GetStyleSettings(ctx context.Context) (string, string, error) {
+	profile := "monolith"
+	if v, err := s.store.GetSetting(ctx, "runtime.style_profile"); err == nil && strings.TrimSpace(v) != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "monolith", "cybermonolith", "custom":
+			profile = strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	custom := ""
+	if v, err := s.store.GetSetting(ctx, "runtime.style_custom"); err == nil {
+		custom = strings.TrimSpace(v)
+	}
+	return profile, custom, nil
 }
 
 func (s *Service) ensureAdminHostForDomain(ctx context.Context, domainName string) error {
@@ -444,6 +537,16 @@ func (s *Service) adminUpstreamURL() string {
 
 func (s *Service) UpsertDomain(ctx context.Context, name, dnsMode, certMode, provider, zoneID string) (model.Domain, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
+	dnsMode = strings.ToLower(strings.TrimSpace(dnsMode))
+	certMode = strings.ToLower(strings.TrimSpace(certMode))
+	if certMode == "" {
+		certMode = "letsencrypt"
+	}
+	if dnsMode == "cloudflare" && certMode == "letsencrypt" {
+		// Cloudflare-managed domains can safely operate in catch-all ACME mode
+		// so unknown subdomains can receive certificates on-demand.
+		certMode = "letsencrypt-catchall"
+	}
 	if strings.Count(name, ".") < 1 {
 		return model.Domain{}, fmt.Errorf("invalid domain")
 	}
@@ -468,6 +571,9 @@ func (s *Service) UpsertDomain(ctx context.Context, name, dnsMode, certMode, pro
 	}
 	if err := s.dns.UpsertARecord(ctx, zoneID, name, publicIP, false); err != nil {
 		return domain, fmt.Errorf("cloudflare apex setup failed: %w", err)
+	}
+	if err := s.dns.UpsertARecord(ctx, zoneID, "*."+name, publicIP, false); err != nil {
+		return domain, fmt.Errorf("cloudflare wildcard setup failed: %w", err)
 	}
 	hosts, err := s.store.ListHostsByDomainID(ctx, domain.ID)
 	if err != nil {
@@ -553,6 +659,11 @@ func (s *Service) RunDomainPreflight(ctx context.Context, name, dnsMode, provide
 			} else {
 				out.Checks = append(out.Checks, DomainPreflightCheck{Name: "cloudflare_apex_upsert", OK: true, Detail: publicIP})
 			}
+			if err := cf.UpsertARecord(ctx, resolvedZone, "*."+name, publicIP, false); err != nil {
+				out.Checks = append(out.Checks, DomainPreflightCheck{Name: "cloudflare_wildcard_upsert", OK: false, Detail: err.Error()})
+			} else {
+				out.Checks = append(out.Checks, DomainPreflightCheck{Name: "cloudflare_wildcard_upsert", OK: true, Detail: "*." + name + " -> " + publicIP})
+			}
 		}
 	}
 
@@ -571,6 +682,25 @@ func (s *Service) RunDomainPreflight(ctx context.Context, name, dnsMode, provide
 
 func (s *Service) RemoveDomain(ctx context.Context, id int64) error {
 	return s.store.RemoveDomain(ctx, id)
+}
+
+func (s *Service) DeactivateDomain(ctx context.Context, id int64) error {
+	if _, err := s.store.GetDomainByID(ctx, id); err != nil {
+		return err
+	}
+	hosts, err := s.store.ListHostsByDomainID(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, h := range hosts {
+		if h.State == "disabled" {
+			continue
+		}
+		if err := s.store.SetHostState(ctx, h.ID, "disabled", "domain_deactivated"); err != nil {
+			return err
+		}
+	}
+	return s.store.SetDomainStatus(ctx, id, "inactive")
 }
 
 func (s *Service) ListDomains(ctx context.Context) ([]model.Domain, error) {
@@ -1237,6 +1367,9 @@ func (s *Service) UpdatePublicIP(ctx context.Context, ip string) error {
 		}
 		if err := s.dns.UpsertARecord(ctx, zoneID, d.Name, s.publicIP, false); err != nil {
 			s.log.Warn("dynDNS update failed", map[string]any{"domain": d.Name, "err": err.Error()})
+		}
+		if err := s.dns.UpsertARecord(ctx, zoneID, "*."+d.Name, s.publicIP, false); err != nil {
+			s.log.Warn("dynDNS wildcard update failed", map[string]any{"domain": d.Name, "err": err.Error()})
 		}
 	}
 	return nil
@@ -1944,8 +2077,8 @@ func (s *Service) CreateManagedUser(ctx context.Context, username, password stri
 	if len(password) < 10 {
 		return ManagedUser{}, fmt.Errorf("password too short")
 	}
-	if role != model.RoleAdmin && role != model.RoleDomainAdmin {
-		return ManagedUser{}, fmt.Errorf("role must be admin or domain-admin")
+	if role != model.RoleAdmin && role != model.RoleDomainAdmin && role != model.RoleReadOnly {
+		return ManagedUser{}, fmt.Errorf("role must be admin, domain-admin, or read-only")
 	}
 	hash, err := crypto.HashPassword(password, crypto.DefaultArgonConfig())
 	if err != nil {

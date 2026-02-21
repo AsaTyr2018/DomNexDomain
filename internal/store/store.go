@@ -679,9 +679,9 @@ func validTransition(from, to string) bool {
 		return true
 	}
 	allowed := map[string]map[string]bool{
-		"created":      {"dns_pending": true, "cert_pending": true, "error": true},
-		"dns_pending":  {"cert_pending": true, "error": true},
-		"cert_pending": {"active": true, "error": true},
+		"created":      {"dns_pending": true, "cert_pending": true, "error": true, "disabled": true},
+		"dns_pending":  {"cert_pending": true, "error": true, "disabled": true},
+		"cert_pending": {"active": true, "error": true, "disabled": true},
 		"active":       {"error": true, "cert_pending": true, "disabled": true, "maintenance": true},
 		"maintenance":  {"active": true, "error": true, "disabled": true},
 		"disabled":     {"active": true, "error": true},
@@ -716,8 +716,11 @@ func (s *Store) AddAuditEvent(ctx context.Context, e model.AuditEvent) error {
 }
 
 func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]model.AuditEvent, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 5000 {
+		limit = 5000
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, actor, action, target, meta, created_at FROM audit_events ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
@@ -818,6 +821,15 @@ func (s *Store) RemoveDomain(ctx context.Context, id int64) error {
 		return errors.New("cannot remove domain with active hosts")
 	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM domains WHERE id=?`, id)
+	return err
+}
+
+func (s *Store) SetDomainStatus(ctx context.Context, id int64, status string) error {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status == "" {
+		return errors.New("domain status required")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE domains SET status=?, updated_at=? WHERE id=?`, status, time.Now().UTC().Format(time.RFC3339Nano), id)
 	return err
 }
 
