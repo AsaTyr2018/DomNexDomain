@@ -7,10 +7,12 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +25,8 @@ import (
 type AuthSource interface {
 	GetSSHBastionAuthByFingerprint(ctx context.Context, fingerprint string) (model.SSHBastionKeyAuth, error)
 	AddAuditEvent(ctx context.Context, e model.AuditEvent) error
+	ApplyThreatIntelEvent(ctx context.Context, in model.ThreatIntelEventInput) (model.ThreatIntelEventResult, error)
+	IsSourceBlocked(ctx context.Context, ip string) (bool, bool, time.Time, string, error)
 }
 
 type Server struct {
@@ -52,14 +56,47 @@ func (s *Server) Start(ctx context.Context) error {
 	cfg := &ssh.ServerConfig{
 		NoClientAuth: false,
 		PublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			sourceIP := addrIP(meta.RemoteAddr())
+			if blocked, hard, until, why, err := s.src.IsSourceBlocked(context.Background(), sourceIP); err == nil && blocked {
+				blockReason := strings.TrimSpace(why)
+				if blockReason == "" {
+					if hard {
+						blockReason = "threat_intel_hardblock"
+					} else {
+						blockReason = "threat_intel_softblock"
+					}
+				}
+				metaBits := "source=" + sourceIP + ";user=" + meta.User() + ";reason=" + blockReason
+				if !until.IsZero() {
+					metaBits += ";until=" + until.UTC().Format(time.RFC3339)
+				}
+				_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
+					Actor:  "ssh-bastion",
+					Action: "ssh.bastion.auth.blocked",
+					Target: sourceIP,
+					Meta:   metaBits,
+				})
+				return nil, fmt.Errorf("source blocked")
+			}
 			fp := ssh.FingerprintSHA256(key)
 			auth, err := s.src.GetSSHBastionAuthByFingerprint(context.Background(), fp)
 			if err != nil || !auth.Key.Enabled {
+				traceID := sshTraceID(sourceIP, meta.User(), "auth_denied")
+				_, _ = s.src.ApplyThreatIntelEvent(context.Background(), model.ThreatIntelEventInput{
+					IP:          sourceIP,
+					Host:        "ssh-bastion",
+					Path:        "auth",
+					Country:     "ZZ",
+					SourceScope: sourceScopeFromIP(sourceIP),
+					TraceID:     traceID,
+					Signals:     []string{"behavior.auth_failed", "protocol.ssh.auth_denied"},
+					Mode:        "auto_mode",
+				})
 				_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
 					Actor:  "ssh-bastion",
 					Action: "ssh.bastion.auth.denied",
 					Target: meta.RemoteAddr().String(),
-					Meta:   "fingerprint=" + fp + ";user=" + meta.User(),
+					Meta:   "fingerprint=" + fp + ";user=" + meta.User() + ";source=" + sourceIP + ";trace=" + traceID,
 				})
 				return nil, fmt.Errorf("unknown key")
 			}
@@ -140,11 +177,23 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
 			}
 		}
 		if !allowed {
+			sourceIP := addrIP(serverConn.RemoteAddr())
+			traceID := sshTraceID(sourceIP, auth.Key.Name, "forward_denied")
+			_, _ = s.src.ApplyThreatIntelEvent(context.Background(), model.ThreatIntelEventInput{
+				IP:          sourceIP,
+				Host:        "ssh-bastion",
+				Path:        "forward",
+				Country:     "ZZ",
+				SourceScope: sourceScopeFromIP(sourceIP),
+				TraceID:     traceID,
+				Signals:     []string{"behavior.auth_failed", "protocol.ssh.forward_denied"},
+				Mode:        "auto_mode",
+			})
 			_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
 				Actor:  auth.Key.Name,
 				Action: "ssh.bastion.forward.denied",
 				Target: fmt.Sprintf("%s:%d", targetHost, targetPort),
-				Meta:   "source=" + addrIP(serverConn.RemoteAddr()) + ";fingerprint=" + fp,
+				Meta:   "source=" + sourceIP + ";fingerprint=" + fp + ";trace=" + traceID,
 			})
 			_ = ch.Reject(ssh.Prohibited, "target not allowed")
 			continue
@@ -239,4 +288,27 @@ func addrIP(a net.Addr) string {
 		return strings.TrimSpace(a.String())
 	}
 	return strings.TrimSpace(host)
+}
+
+func sourceScopeFromIP(ip string) string {
+	p := net.ParseIP(strings.TrimSpace(ip))
+	if p == nil {
+		return "external"
+	}
+	if p.IsLoopback() || p.IsPrivate() {
+		return "internal"
+	}
+	return "external"
+}
+
+func sshTraceID(ip, user, reason string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(strings.TrimSpace(ip)))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(strings.TrimSpace(user)))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(strings.TrimSpace(reason)))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
+	return fmt.Sprintf("%016x", h.Sum64())
 }

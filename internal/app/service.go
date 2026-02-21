@@ -1081,6 +1081,35 @@ func (s *Service) AddAuditEvent(ctx context.Context, e model.AuditEvent) error {
 	return s.store.AddAuditEvent(ctx, e)
 }
 
+func (s *Service) IsSourceBlocked(ctx context.Context, ip string) (bool, bool, time.Time, string, error) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return false, false, time.Time{}, "", nil
+	}
+	blocked, err := s.store.IsIPBlocked(ctx, ip)
+	if err != nil {
+		return false, false, time.Time{}, "", err
+	}
+	if blocked {
+		return true, true, time.Time{}, "blocked_ips", nil
+	}
+	st, err := s.store.GetThreatIntelIPState(ctx, ip)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, false, time.Time{}, "", nil
+		}
+		return false, false, time.Time{}, "", err
+	}
+	now := time.Now().UTC()
+	if st.PermBlocked {
+		return true, true, time.Time{}, "threat_intel_hardblock", nil
+	}
+	if !st.BanUntil.IsZero() && st.BanUntil.After(now) {
+		return true, false, st.BanUntil, "threat_intel_softblock", nil
+	}
+	return false, false, time.Time{}, "", nil
+}
+
 func (s *Service) PublicIPv4(ctx context.Context) string {
 	_ = ctx
 	return strings.TrimSpace(s.publicIP)
@@ -2893,6 +2922,8 @@ func calcThreatBaseXP(signals []string) (int, string) {
 		"behavior.ua_scanner":   2,
 		"behavior.invalid_host": 2,
 		"behavior.auth_failed":  3,
+		"protocol.ssh.auth_denied":    3,
+		"protocol.ssh.forward_denied": 4,
 	}
 	total := 0
 	top := ""
