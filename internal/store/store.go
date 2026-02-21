@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL UNIQUE,
   role TEXT NOT NULL,
+  allowed_cidrs TEXT NOT NULL DEFAULT '',
+  ip_check_disabled INTEGER NOT NULL DEFAULT 0,
   password_hash TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -384,6 +386,12 @@ CREATE INDEX IF NOT EXISTS idx_threat_intel_state_level ON threat_intel_ip_state
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE threat_intel_matches ADD COLUMN tier_after TEXT NOT NULL DEFAULT 'tier0'`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN allowed_cidrs TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN ip_check_disabled INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
 	return nil
 }
 
@@ -396,18 +404,20 @@ func (s *Store) EnsureBootstrapUser(ctx context.Context, username, role, passHas
 		return false, nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, password_hash, created_at, updated_at) VALUES(?,?,?,?,?)`, username, role, passHash, now, now)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, username, role, "", 0, passHash, now, now)
 	return true, err
 }
 
 func (s *Store) FindUserByUsername(ctx context.Context, username string) (model.User, error) {
 	var u model.User
 	var created, updated string
-	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, password_hash, created_at, updated_at FROM users WHERE username=?`, username).
-		Scan(&u.ID, &u.Username, &u.Role, &u.PasswordHash, &created, &updated)
+	var ipCheckDisabled int
+	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at FROM users WHERE username=?`, username).
+		Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &u.PasswordHash, &created, &updated)
 	if err != nil {
 		return u, err
 	}
+	u.IPCheckOff = ipCheckDisabled != 0
 	u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	u.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return u, nil
@@ -416,11 +426,13 @@ func (s *Store) FindUserByUsername(ctx context.Context, username string) (model.
 func (s *Store) GetUserByID(ctx context.Context, id int64) (model.User, error) {
 	var u model.User
 	var created, updated string
-	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, password_hash, created_at, updated_at FROM users WHERE id=?`, id).
-		Scan(&u.ID, &u.Username, &u.Role, &u.PasswordHash, &created, &updated)
+	var ipCheckDisabled int
+	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at FROM users WHERE id=?`, id).
+		Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &u.PasswordHash, &created, &updated)
 	if err != nil {
 		return u, err
 	}
+	u.IPCheckOff = ipCheckDisabled != 0
 	u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	u.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return u, nil
@@ -1553,9 +1565,9 @@ func (s *Store) SetUserPasswordHashByID(ctx context.Context, userID int64, passH
 	return err
 }
 
-func (s *Store) CreateUser(ctx context.Context, username string, role model.Role, passHash string) (model.User, error) {
+func (s *Store) CreateUser(ctx context.Context, username string, role model.Role, allowedCIDRs string, ipCheckDisabled bool, passHash string) (model.User, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, password_hash, created_at, updated_at) VALUES(?,?,?,?,?)`, username, string(role), passHash, now, now)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, username, string(role), strings.TrimSpace(allowedCIDRs), boolToInt(ipCheckDisabled), passHash, now, now)
 	if err != nil {
 		return model.User{}, err
 	}
@@ -1564,7 +1576,7 @@ func (s *Store) CreateUser(ctx context.Context, username string, role model.Role
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, username, role, password_hash, created_at, updated_at FROM users ORDER BY username`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at FROM users ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
@@ -1573,9 +1585,11 @@ func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
 	for rows.Next() {
 		var u model.User
 		var created, updated string
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.PasswordHash, &created, &updated); err != nil {
+		var ipCheckDisabled int
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &u.PasswordHash, &created, &updated); err != nil {
 			return nil, err
 		}
+		u.IPCheckOff = ipCheckDisabled != 0
 		u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		u.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 		out = append(out, u)
@@ -1604,6 +1618,68 @@ func (s *Store) SetUserDomainScopes(ctx context.Context, userID int64, domainIDs
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO user_domain_scopes(user_id, domain_id, created_at) VALUES(?,?,?)`, userID, did, now); err != nil {
 			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) SetUserRoleAndDomainScopes(ctx context.Context, userID int64, role model.Role, domainIDs []int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := tx.ExecContext(ctx, `UPDATE users SET role=?, updated_at=? WHERE id=?`, string(role), now, userID)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_domain_scopes WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	if role == model.RoleDomainAdmin {
+		for _, did := range domainIDs {
+			if did <= 0 {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO user_domain_scopes(user_id, domain_id, created_at) VALUES(?,?,?)`, userID, did, now); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) SetUserAccessPolicy(ctx context.Context, userID int64, role model.Role, domainIDs []int64, allowedCIDRs string, ipCheckDisabled bool) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := tx.ExecContext(ctx, `UPDATE users SET role=?, allowed_cidrs=?, ip_check_disabled=?, updated_at=? WHERE id=?`, string(role), strings.TrimSpace(allowedCIDRs), boolToInt(ipCheckDisabled), now, userID)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_domain_scopes WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	if role == model.RoleDomainAdmin {
+		for _, did := range domainIDs {
+			if did <= 0 {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO user_domain_scopes(user_id, domain_id, created_at) VALUES(?,?,?)`, userID, did, now); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

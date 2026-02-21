@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -61,12 +62,13 @@ func New(store Store, sessionTTL time.Duration, allowedCIDRs []string) (*Service
 }
 
 func (s *Service) AuthenticatePassword(ctx context.Context, username, password, source string) (string, model.User, error) {
+	failErr := errors.New("login failed")
 	if strings.TrimSpace(source) == "" {
 		source = "n/a"
 	}
 	if blocked, err := s.store.IsIPBlocked(ctx, source); err == nil && blocked {
 		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.blocked_ip", Target: "user", Meta: "source=" + source})
-		return "", model.User{}, errors.New("source ip blocked")
+		return "", model.User{}, failErr
 	}
 	failed, lockUntil, err := s.store.GetLoginAttempt(ctx, username)
 	if err != nil {
@@ -74,7 +76,7 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 	}
 	if failed > 0 && lockUntil.After(time.Now().UTC()) {
 		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.locked", Target: "user", Meta: "lock_until=" + lockUntil.Format(time.RFC3339) + ";source=" + source})
-		return "", model.User{}, errors.New("account temporarily locked")
+		return "", model.User{}, failErr
 	}
 
 	u, err := s.store.FindUserByUsername(ctx, username)
@@ -82,14 +84,19 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 		if errors.Is(err, sql.ErrNoRows) {
 			fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
 			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "unknown_user;failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
-			return "", model.User{}, errors.New("invalid credentials")
+			return "", model.User{}, failErr
 		}
 		return "", model.User{}, err
 	}
 	if !crypto.VerifyPassword(password, u.PasswordHash) {
 		fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
 		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "bad_password;failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
-		return "", model.User{}, errors.New("invalid credentials")
+		return "", model.User{}, failErr
+	}
+	if ok, detail := s.isSourceAllowedForUser(u, source); !ok {
+		fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
+		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "ip_policy_denied;" + detail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
+		return "", model.User{}, failErr
 	}
 	_ = s.store.ClearLoginFailures(ctx, username)
 	sid, err := randomHex(32)
@@ -105,6 +112,10 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 }
 
 func (s *Service) ResolveIdentity(r *http.Request) (Identity, error) {
+	source := requestIP(r)
+	if blocked, err := s.store.IsIPBlocked(r.Context(), source); err == nil && blocked {
+		return Identity{}, errors.New("unauthorized")
+	}
 	if token := bearerToken(r.Header.Get("Authorization")); token != "" {
 		tok, err := s.store.LookupAPIToken(r.Context(), token)
 		if err == nil {
@@ -123,8 +134,60 @@ func (s *Service) ResolveIdentity(r *http.Request) (Identity, error) {
 	if err != nil {
 		return Identity{}, errors.New("unauthorized")
 	}
+	if ok, detail := s.isSourceAllowedForUser(u, source); !ok {
+		_ = s.store.AddAuditEvent(r.Context(), model.AuditEvent{Actor: u.Username, Action: "auth.session.denied", Target: "session", Meta: detail + ";source=" + source})
+		return Identity{}, errors.New("unauthorized")
+	}
 	domainIDs, _ := s.store.GetUserDomainIDs(r.Context(), u.ID)
 	return Identity{UserID: u.ID, Username: u.Username, Role: u.Role, DomainIDs: domainIDs, Type: "session"}, nil
+}
+
+func (s *Service) isSourceAllowedForUser(u model.User, source string) (bool, string) {
+	if u.IPCheckOff {
+		return true, "ip_check_disabled=1"
+	}
+	ip := net.ParseIP(strings.TrimSpace(source))
+	if ip == nil {
+		return false, "invalid_source_ip"
+	}
+	var nets []*net.IPNet
+	var err error
+	if strings.TrimSpace(u.AllowedCIDRs) != "" {
+		nets, err = parseCIDRsCSV(u.AllowedCIDRs)
+		if err != nil {
+			return false, "invalid_user_cidrs"
+		}
+	} else {
+		nets = s.allowed
+	}
+	if len(nets) == 0 {
+		return true, "no_cidr_policy"
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true, "cidr_match"
+		}
+	}
+	return false, "cidr_miss"
+}
+
+func parseCIDRsCSV(raw string) ([]*net.IPNet, error) {
+	raw = strings.ReplaceAll(raw, "\n", ",")
+	raw = strings.ReplaceAll(raw, ";", ",")
+	parts := strings.Split(raw, ",")
+	out := make([]*net.IPNet, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		_, n, err := net.ParseCIDR(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cidr: %s", p)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 func (s *Service) Logout(ctx context.Context, sessionID string, actor string) error {

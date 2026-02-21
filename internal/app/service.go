@@ -115,12 +115,14 @@ type TimeSyncStatus struct {
 }
 
 type ManagedUser struct {
-	ID        int64      `json:"id"`
-	Username  string     `json:"username"`
-	Role      model.Role `json:"role"`
-	DomainIDs []int64    `json:"domainIds"`
-	CreatedAt time.Time  `json:"createdAt"`
-	UpdatedAt time.Time  `json:"updatedAt"`
+	ID              int64      `json:"id"`
+	Username        string     `json:"username"`
+	Role            model.Role `json:"role"`
+	DomainIDs       []int64    `json:"domainIds"`
+	AllowedCIDRs    string     `json:"allowedCidrs"`
+	IPCheckDisabled bool       `json:"ipCheckDisabled"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	UpdatedAt       time.Time  `json:"updatedAt"`
 }
 
 type HostDiagnostic struct {
@@ -2089,6 +2091,31 @@ func parseIPv4(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
+func parseAndNormalizeCIDRs(raw string) (string, error) {
+	raw = strings.ReplaceAll(raw, "\n", ",")
+	raw = strings.ReplaceAll(raw, ";", ",")
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]bool{}
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		_, n, err := net.ParseCIDR(p)
+		if err != nil {
+			return "", fmt.Errorf("invalid cidr: %s", p)
+		}
+		norm := n.String()
+		if seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		out = append(out, norm)
+	}
+	return strings.Join(out, ","), nil
+}
+
 func (s *Service) diagnoseHost(ctx context.Context, fqdn string, probeEnabled bool) HostDiagnostic {
 	d := HostDiagnostic{FQDN: fqdn}
 	rctx, cancel := context.WithTimeout(ctx, 12*time.Second)
@@ -2475,7 +2502,7 @@ func (s *Service) ConsumePasswordResetToken(ctx context.Context, token, newPassw
 	return nil
 }
 
-func (s *Service) CreateManagedUser(ctx context.Context, username, password string, role model.Role, domainIDs []int64) (ManagedUser, error) {
+func (s *Service) CreateManagedUser(ctx context.Context, username, password string, role model.Role, domainIDs []int64, allowedCIDRs string, ipCheckDisabled bool) (ManagedUser, error) {
 	username = strings.ToLower(strings.TrimSpace(username))
 	if username == "" {
 		return ManagedUser{}, fmt.Errorf("username required")
@@ -2486,11 +2513,15 @@ func (s *Service) CreateManagedUser(ctx context.Context, username, password stri
 	if role != model.RoleAdmin && role != model.RoleDomainAdmin && role != model.RoleReadOnly {
 		return ManagedUser{}, fmt.Errorf("role must be admin, domain-admin, or read-only")
 	}
+	if _, err := parseAndNormalizeCIDRs(allowedCIDRs); err != nil {
+		return ManagedUser{}, err
+	}
 	hash, err := crypto.HashPassword(password, crypto.DefaultArgonConfig())
 	if err != nil {
 		return ManagedUser{}, err
 	}
-	u, err := s.store.CreateUser(ctx, username, role, hash)
+	normCIDRs, _ := parseAndNormalizeCIDRs(allowedCIDRs)
+	u, err := s.store.CreateUser(ctx, username, role, normCIDRs, ipCheckDisabled, hash)
 	if err != nil {
 		return ManagedUser{}, err
 	}
@@ -2503,7 +2534,16 @@ func (s *Service) CreateManagedUser(ctx context.Context, username, password stri
 		}
 	}
 	ids, _ := s.store.GetUserDomainIDs(ctx, u.ID)
-	return ManagedUser{ID: u.ID, Username: u.Username, Role: u.Role, DomainIDs: ids, CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt}, nil
+	return ManagedUser{
+		ID:              u.ID,
+		Username:        u.Username,
+		Role:            u.Role,
+		DomainIDs:       ids,
+		AllowedCIDRs:    u.AllowedCIDRs,
+		IPCheckDisabled: u.IPCheckOff,
+		CreatedAt:       u.CreatedAt,
+		UpdatedAt:       u.UpdatedAt,
+	}, nil
 }
 
 func (s *Service) ListManagedUsers(ctx context.Context) ([]ManagedUser, error) {
@@ -2514,7 +2554,16 @@ func (s *Service) ListManagedUsers(ctx context.Context) ([]ManagedUser, error) {
 	out := make([]ManagedUser, 0, len(users))
 	for _, u := range users {
 		ids, _ := s.store.GetUserDomainIDs(ctx, u.ID)
-		out = append(out, ManagedUser{ID: u.ID, Username: u.Username, Role: u.Role, DomainIDs: ids, CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt})
+		out = append(out, ManagedUser{
+			ID:              u.ID,
+			Username:        u.Username,
+			Role:            u.Role,
+			DomainIDs:       ids,
+			AllowedCIDRs:    u.AllowedCIDRs,
+			IPCheckDisabled: u.IPCheckOff,
+			CreatedAt:       u.CreatedAt,
+			UpdatedAt:       u.UpdatedAt,
+		})
 	}
 	return out, nil
 }
@@ -2531,6 +2580,26 @@ func (s *Service) SetManagedUserDomains(ctx context.Context, userID int64, domai
 		return fmt.Errorf("domain-admin requires at least one domain assignment")
 	}
 	return s.store.SetUserDomainScopes(ctx, userID, domainIDs)
+}
+
+func (s *Service) SetManagedUserAccess(ctx context.Context, userID int64, role model.Role, domainIDs []int64, allowedCIDRs string, ipCheckDisabled bool) error {
+	if role != model.RoleAdmin && role != model.RoleDomainAdmin && role != model.RoleReadOnly {
+		return fmt.Errorf("role must be admin, domain-admin, or read-only")
+	}
+	normCIDRs, err := parseAndNormalizeCIDRs(allowedCIDRs)
+	if err != nil {
+		return err
+	}
+	if _, err := s.store.GetUserByID(ctx, userID); err != nil {
+		return err
+	}
+	if role == model.RoleDomainAdmin && len(domainIDs) == 0 {
+		return fmt.Errorf("domain-admin requires at least one domain assignment")
+	}
+	if role != model.RoleDomainAdmin {
+		domainIDs = nil
+	}
+	return s.store.SetUserAccessPolicy(ctx, userID, role, domainIDs, normCIDRs, ipCheckDisabled)
 }
 
 func (s *Service) DeleteManagedUser(ctx context.Context, userID int64) error {

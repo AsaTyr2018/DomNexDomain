@@ -79,6 +79,9 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/settings", s.handleGetSettings)
 		pr.Get("/api/v1/time-sync", s.handleGetTimeSyncStatus)
 		pr.Get("/api/v1/users", s.handleListUsers)
+		pr.Get("/api/v1/tokens", s.handleListTokens)
+		pr.Get("/api/v1/ssh/routes", s.handleListSSHBastionRoutes)
+		pr.Get("/api/v1/ssh/keys", s.handleListSSHBastionKeys)
 	})
 
 	r.Group(func(pr chi.Router) {
@@ -117,16 +120,15 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/settings", s.handleSetSettings)
 		pr.Post("/api/v1/reload", s.handleReloadService)
 		pr.Post("/api/v1/users", s.handleCreateUser)
+		pr.Put("/api/v1/users/{id}", s.handleUpdateUserAccess)
 		pr.Put("/api/v1/users/{id}/domains", s.handleSetUserDomains)
 		pr.Put("/api/v1/users/{id}/password", s.handleSetUserPassword)
 		pr.Delete("/api/v1/users/{id}", s.handleDeleteUser)
 		pr.Post("/api/v1/logout-all", s.handleLogoutAll)
 		pr.Post("/api/v1/security/ip-blocks", s.handleAddBlockedIP)
 		pr.Post("/api/v1/security/ip-blocks/remove", s.handleRemoveBlockedIP)
-		pr.Get("/api/v1/ssh/routes", s.handleListSSHBastionRoutes)
 		pr.Post("/api/v1/ssh/routes", s.handleUpsertSSHBastionRoute)
 		pr.Delete("/api/v1/ssh/routes/{id}", s.handleDeleteSSHBastionRoute)
-		pr.Get("/api/v1/ssh/keys", s.handleListSSHBastionKeys)
 		pr.Post("/api/v1/ssh/keys/import", s.handleImportSSHBastionKey)
 		pr.Post("/api/v1/ssh/keys/generate", s.handleGenerateSSHBastionKey)
 		pr.Delete("/api/v1/ssh/keys/{id}", s.handleDeleteSSHBastionKey)
@@ -206,10 +208,6 @@ func (s *Server) metricsMiddleware(component string) func(http.Handler) http.Han
 func (s *Server) requireAuth(role model.Role, scope string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !s.auth.CheckAdminNetwork(r) {
-				writeErr(w, http.StatusForbidden, "admin access denied")
-				return
-			}
 			id, err := s.auth.ResolveIdentity(r)
 			if err != nil {
 				writeErr(w, http.StatusUnauthorized, "unauthorized")
@@ -278,15 +276,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	source := clientIP(r)
-	if blocked, err := s.app.Store().IsIPBlocked(r.Context(), source); err == nil && blocked {
-		s.metrics.Failures.WithLabelValues("auth").Inc()
-		writeErr(w, http.StatusForbidden, "source ip blocked")
-		return
-	}
 	sid, user, err := s.auth.AuthenticatePassword(r.Context(), in.Username, in.Password, source)
 	if err != nil {
 		s.metrics.Failures.WithLabelValues("auth").Inc()
-		writeErr(w, http.StatusUnauthorized, err.Error())
+		writeErr(w, http.StatusUnauthorized, "login failed")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "domnex_session", Value: sid, Path: "/", HttpOnly: true, Secure: isSecureRequest(r), SameSite: http.SameSiteStrictMode, MaxAge: int((12 * time.Hour).Seconds())})
@@ -1153,7 +1146,12 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
-	if !requireTokenScope(w, identityFrom(r.Context()), "tokens:read") {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "tokens:read") {
+		return
+	}
+	if !isGlobalAdmin(id) && id.Role != model.RoleReadOnly {
+		writeErr(w, http.StatusForbidden, "admin or read-only required")
 		return
 	}
 	items, err := s.app.ListAPITokens(r.Context(), 200)
@@ -1723,8 +1721,8 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	if !requireTokenScope(w, id, "users:read") {
 		return
 	}
-	if !isGlobalAdmin(id) {
-		writeErr(w, http.StatusForbidden, "global admin required")
+	if !isGlobalAdmin(id) && id.Role != model.RoleReadOnly {
+		writeErr(w, http.StatusForbidden, "admin or read-only required")
 		return
 	}
 	users, err := s.app.ListManagedUsers(r.Context())
@@ -1745,16 +1743,18 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Username  string  `json:"username"`
-		Password  string  `json:"password"`
-		Role      string  `json:"role"`
-		DomainIDs []int64 `json:"domainIds"`
+		Username        string  `json:"username"`
+		Password        string  `json:"password"`
+		Role            string  `json:"role"`
+		DomainIDs       []int64 `json:"domainIds"`
+		AllowedCIDRs    string  `json:"allowedCidrs"`
+		IPCheckDisabled bool    `json:"ipCheckDisabled"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	u, err := s.app.CreateManagedUser(r.Context(), in.Username, in.Password, model.Role(in.Role), in.DomainIDs)
+	u, err := s.app.CreateManagedUser(r.Context(), in.Username, in.Password, model.Role(in.Role), in.DomainIDs, in.AllowedCIDRs, in.IPCheckDisabled)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -1785,6 +1785,47 @@ func (s *Server) handleSetUserDomains(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "user.update_domains", Target: strconv.FormatInt(userID, 10), Meta: ""})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleUpdateUserAccess(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	userID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if userID <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	if userID == id.UserID {
+		writeErr(w, http.StatusBadRequest, "cannot change own role via this endpoint")
+		return
+	}
+	var in struct {
+		Role            string  `json:"role"`
+		DomainIDs       []int64 `json:"domainIds"`
+		AllowedCIDRs    string  `json:"allowedCidrs"`
+		IPCheckDisabled bool    `json:"ipCheckDisabled"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.SetManagedUserAccess(r.Context(), userID, model.Role(in.Role), in.DomainIDs, in.AllowedCIDRs, in.IPCheckDisabled); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "user.update_access",
+		Target: strconv.FormatInt(userID, 10),
+		Meta:   strings.TrimSpace(in.Role),
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -1873,8 +1914,8 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListSSHBastionRoutes(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
-	if !isGlobalAdmin(id) {
-		writeErr(w, http.StatusForbidden, "global admin required")
+	if !isGlobalAdmin(id) && id.Role != model.RoleReadOnly {
+		writeErr(w, http.StatusForbidden, "admin or read-only required")
 		return
 	}
 	items, err := s.app.ListSSHBastionRoutes(r.Context())
@@ -1948,14 +1989,20 @@ func (s *Server) handleDeleteSSHBastionRoute(w http.ResponseWriter, r *http.Requ
 
 func (s *Server) handleListSSHBastionKeys(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
-	if !isGlobalAdmin(id) {
-		writeErr(w, http.StatusForbidden, "global admin required")
+	if !isGlobalAdmin(id) && id.Role != model.RoleReadOnly {
+		writeErr(w, http.StatusForbidden, "admin or read-only required")
 		return
 	}
 	items, err := s.app.ListSSHBastionKeys(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if id.Role == model.RoleReadOnly {
+		for i := range items {
+			items[i].PublicKey = "REDACTED"
+			items[i].Fingerprint = "REDACTED"
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }

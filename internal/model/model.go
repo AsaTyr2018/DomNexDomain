@@ -15,6 +15,8 @@ type User struct {
 	ID           int64     `json:"id"`
 	Username     string    `json:"username"`
 	Role         Role      `json:"role"`
+	AllowedCIDRs string    `json:"allowedCidrs"`
+	IPCheckOff   bool      `json:"ipCheckOff"`
 	PasswordHash string    `json:"-"`
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`

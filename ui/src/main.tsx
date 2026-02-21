@@ -18,7 +18,16 @@ type LogServerSettings = { syslog: LogServerSyslogSettings; http: LogServerHTTPS
 type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean };
 type TimeSyncProbe = { name: string; target: string; ok: boolean; offsetMs: number; rttMs: number; error?: string; detail?: string };
 type TimeSyncStatus = { mode: 'system_only' | 'external_public' | 'external_lan'; healthy: boolean; severity: 'ok' | 'warn' | 'critical'; summary: string; source?: string; offsetMs?: number; checkedAt: string; probes: TimeSyncProbe[] };
-type ManagedUser = { id: number; username: string; role: string; domainIds: number[]; createdAt: string; updatedAt: string };
+type ManagedUser = {
+  id: number;
+  username: string;
+  role: string;
+  domainIds: number[];
+  allowedCidrs?: string;
+  ipCheckDisabled?: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
 type DomainPreflightCheck = { name: string; ok: boolean; detail?: string };
 type DomainPreflight = { domain: string; dnsMode: string; provider: string; zoneId?: string; resolvedZone?: string; publicIpv4?: string; checks: DomainPreflightCheck[]; ready: boolean };
 type HostPreflightCheck = { name: string; ok: boolean; detail?: string };
@@ -359,6 +368,15 @@ function App() {
   const [newUserPassword, setNewUserPassword] = useState('');
   const [newUserRole, setNewUserRole] = useState<'admin' | 'domain-admin' | 'read-only'>('domain-admin');
   const [newUserDomainIDs, setNewUserDomainIDs] = useState<number[]>([]);
+  const [newUserAllowedCIDRs, setNewUserAllowedCIDRs] = useState('');
+  const [newUserIPCheckDisabled, setNewUserIPCheckDisabled] = useState(false);
+  const [showCreateUserDialog, setShowCreateUserDialog] = useState(false);
+  const [editUserID, setEditUserID] = useState<number | null>(null);
+  const [editUserRole, setEditUserRole] = useState<'admin' | 'domain-admin' | 'read-only'>('domain-admin');
+  const [editUserDomainIDs, setEditUserDomainIDs] = useState<number[]>([]);
+  const [editUserPassword, setEditUserPassword] = useState('');
+  const [editUserAllowedCIDRs, setEditUserAllowedCIDRs] = useState('');
+  const [editUserIPCheckDisabled, setEditUserIPCheckDisabled] = useState(false);
   const [usersRoleFilter, setUsersRoleFilter] = useState<'all' | 'admin' | 'domain-admin' | 'read-only'>('all');
   const [usersQuery, setUsersQuery] = useState('');
   const [showPasswordDialog, setShowPasswordDialog] = useState(false);
@@ -1051,6 +1069,7 @@ function App() {
       return u.username.toLowerCase().includes(q) || String(u.id).includes(q) || u.role.toLowerCase().includes(q);
     });
   }, [users, usersRoleFilter, usersQuery]);
+  const editingUser = editUserID ? (users.find((u) => u.id === editUserID) || null) : null;
   const configuredAdminFQDN = settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '');
   const activeTheme = useMemo<ThemeVars>(() => {
     const selectedProfile = identity ? settingsStyleProfile : publicStyleProfile;
@@ -1067,6 +1086,16 @@ function App() {
   const hostUsesDirectUpstream = !hostHAEnabled && !hostSSHBastion;
   const hostEffectiveUpstream = hostSSHBastion ? SSH_BASTION_DEFAULT_UPSTREAM : hostUpstream;
   const isReadOnlyRole = identity?.role === 'read-only';
+  useEffect(() => {
+    if (!isReadOnlyRole) return;
+    // Ensure no sensitive key material remains visible after switching to read-only.
+    setSshGeneratedPrivateKey('');
+    setSshGeneratedPublicKey('');
+    setSshGeneratedPPK('');
+    setSshGeneratedRFC4716('');
+    setSshGeneratedPPKError('');
+    setSshKeyPublic('');
+  }, [isReadOnlyRole]);
   const sshRouteByFQDN = useMemo(() => {
     const out: Record<string, SSHBastionRoute> = {};
     sshRoutes.forEach((r) => { out[r.fqdn.toLowerCase()] = r; });
@@ -1175,6 +1204,7 @@ function App() {
   };
 
   const createToken = async () => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     try {
@@ -1208,6 +1238,7 @@ function App() {
   };
 
   const revokeToken = async (id: number) => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     try {
@@ -1256,6 +1287,7 @@ function App() {
   };
 
   const saveSettings = async () => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     setSettingsMessage('');
@@ -1400,6 +1432,7 @@ function App() {
   };
 
   const reloadService = async () => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     setSettingsMessage('');
@@ -1415,6 +1448,7 @@ function App() {
   };
 
   const saveSSHRoute = async () => {
+    if (isReadOnlyRole) return;
     const fqdn = (sshSelectedHostFQDN || sshRouteFQDN).trim().toLowerCase();
     if (!fqdn || !sshRouteTargetHost.trim() || !sshRouteTargetPort.trim()) return;
     const existing = sshRouteByFQDN[fqdn];
@@ -1453,6 +1487,7 @@ function App() {
   };
 
   const deleteSSHRoute = async (id: number) => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     try {
@@ -1469,10 +1504,12 @@ function App() {
   };
 
   const toggleSSHKeyRoute = (id: number) => {
+    if (isReadOnlyRole) return;
     setSshKeyRouteIDs((prev) => prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]);
   };
 
   const editSSHRoute = (r: SSHBastionRoute) => {
+    if (isReadOnlyRole) return;
     setSshSelectedHostFQDN(r.fqdn);
     setSshRouteFQDN(r.fqdn);
     setSshRouteTargetHost(r.targetHost);
@@ -1481,6 +1518,7 @@ function App() {
   };
 
   const generateSSHKeyForRoute = async (routeID: number, fqdn: string) => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     try {
@@ -1505,6 +1543,7 @@ function App() {
   };
 
   const generateSSHKey = async () => {
+    if (isReadOnlyRole) return;
     if (!sshKeyName.trim() || sshKeyRouteIDs.length === 0) return;
     setLoading(true);
     setError('');
@@ -1563,6 +1602,7 @@ function App() {
   };
 
   const importSSHKey = async () => {
+    if (isReadOnlyRole) return;
     if (!sshKeyName.trim() || !sshKeyPublic.trim() || sshKeyRouteIDs.length === 0) return;
     setLoading(true);
     setError('');
@@ -1584,6 +1624,7 @@ function App() {
   };
 
   const deleteSSHKey = async (id: number) => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     try {
@@ -1600,6 +1641,7 @@ function App() {
   };
 
   const createUser = async () => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     try {
@@ -1611,12 +1653,17 @@ function App() {
           password: newUserPassword,
           role: newUserRole,
           domainIds: newUserRole === 'domain-admin' ? newUserDomainIDs : [],
+          allowedCidrs: newUserAllowedCIDRs.trim(),
+          ipCheckDisabled: !!newUserIPCheckDisabled,
         }),
       });
       setNewUserName('');
       setNewUserPassword('');
       setNewUserRole('domain-admin');
       setNewUserDomainIDs([]);
+      setNewUserAllowedCIDRs('');
+      setNewUserIPCheckDisabled(false);
+      setShowCreateUserDialog(false);
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -1626,6 +1673,7 @@ function App() {
   };
 
   const deleteUser = async (id: number) => {
+    if (isReadOnlyRole) return;
     setLoading(true);
     setError('');
     try {
@@ -1638,33 +1686,38 @@ function App() {
     }
   };
 
-  const saveUserDomains = async (id: number, domainIds: number[]) => {
-    setLoading(true);
-    setError('');
-    try {
-      await api(`/api/v1/users/${id}/domains`, {
-        method: 'PUT',
-        headers: { 'X-CSRF-Token': csrf },
-        body: JSON.stringify({ domainIds }),
-      });
-      await refresh();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setLoading(false);
+  const saveUserEdit = async () => {
+    if (isReadOnlyRole) return;
+    if (!editUserID) return;
+    if (editUserRole === 'domain-admin' && editUserDomainIDs.length === 0) {
+      setError('Domain-admin requires at least one domain assignment.');
+      return;
     }
-  };
-
-  const resetUserPassword = async (id: number, password: string) => {
     setLoading(true);
     setError('');
     try {
-      await api(`/api/v1/users/${id}/password`, {
+      await api(`/api/v1/users/${editUserID}`, {
         method: 'PUT',
         headers: { 'X-CSRF-Token': csrf },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({
+          role: editUserRole,
+          domainIds: editUserRole === 'domain-admin' ? editUserDomainIDs : [],
+          allowedCidrs: editUserAllowedCIDRs.trim(),
+          ipCheckDisabled: !!editUserIPCheckDisabled,
+        }),
       });
+      if (editUserPassword.trim()) {
+        if (editUserPassword.length < 10) {
+          throw new Error('Password must be at least 10 characters.');
+        }
+        await api(`/api/v1/users/${editUserID}/password`, {
+          method: 'PUT',
+          headers: { 'X-CSRF-Token': csrf },
+          body: JSON.stringify({ password: editUserPassword }),
+        });
+      }
       await refresh();
+      closeEditUserDialog();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -1733,6 +1786,27 @@ function App() {
 
   const toggleNewUserDomain = (id: number) => {
     setNewUserDomainIDs((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
+  };
+
+  const toggleEditUserDomain = (id: number) => {
+    setEditUserDomainIDs((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
+  };
+
+  const openEditUserDialog = (u: ManagedUser) => {
+    setEditUserID(u.id);
+    setEditUserRole((u.role as 'admin' | 'domain-admin' | 'read-only') || 'read-only');
+    setEditUserDomainIDs([...(u.domainIds || [])]);
+    setEditUserPassword('');
+    setEditUserAllowedCIDRs((u.allowedCidrs || '').trim());
+    setEditUserIPCheckDisabled(!!u.ipCheckDisabled);
+  };
+
+  const closeEditUserDialog = () => {
+    setEditUserID(null);
+    setEditUserPassword('');
+    setEditUserDomainIDs([]);
+    setEditUserAllowedCIDRs('');
+    setEditUserIPCheckDisabled(false);
   };
 
   const toggleNewTokenDomain = (id: number) => {
@@ -1970,9 +2044,9 @@ function App() {
               <button className={tab === 'domains' ? 'active' : ''} onClick={() => setTab('domains')}>Domains</button>
               <button className={tab === 'hosts' ? 'active' : ''} onClick={() => setTab('hosts')}>Subdomains</button>
               <button className={tab === 'threatIntel' ? 'active' : ''} onClick={() => setTab('threatIntel')}>Threat Intel</button>
-              {identity?.role === 'admin' ? <button className={tab === 'ssh' ? 'active' : ''} onClick={() => setTab('ssh')}>SSH Bastion</button> : null}
+              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'ssh' ? 'active' : ''} onClick={() => setTab('ssh')}>SSH Bastion</button> : null}
             </div>
-            {identity?.role === 'admin' ? (
+            {(identity?.role === 'admin' || isReadOnlyRole) ? (
               <div className="menu-group">
                 <div className="menu-title">Administration</div>
                 <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button>
@@ -1992,7 +2066,7 @@ function App() {
             </div>
             <div className="top-actions">
               <button className="btn" onClick={refresh} disabled={loading}>Refresh</button>
-              {identity && !isReadOnlyRole ? <button className="btn" onClick={() => setShowPasswordDialog(true)}>Change Password</button> : null}
+              {identity ? <button className="btn" onClick={() => setShowPasswordDialog(true)}>Change Password</button> : null}
               {identity ? <button className="btn" onClick={logout}>Logout</button> : null}
             </div>
           </header>
@@ -2892,7 +2966,7 @@ function App() {
             )
           ) : null}
 
-          {identity?.role === 'admin' && tab === 'settings' ? (
+          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'settings' ? (
             <section className="entity-page">
               <div className="entity-main">
                 <section className="card">
@@ -3130,8 +3204,8 @@ function App() {
                     </div>
                   ) : null}
                   <div className="row">
-                    <button className="btn" onClick={saveSettings} disabled={loading}>Save Settings</button>
-                    <button className="btn" onClick={reloadService} disabled={loading}>Reload Service</button>
+                    <button className="btn" onClick={saveSettings} disabled={loading || isReadOnlyRole}>Save Settings</button>
+                    <button className="btn" onClick={reloadService} disabled={loading || isReadOnlyRole}>Reload Service</button>
                     <button className="btn" onClick={loadTimeSyncStatus} disabled={loading}>Check Time Sync</button>
                   </div>
                   {settingsMessage ? <div className="muted">{settingsMessage}</div> : null}
@@ -3140,50 +3214,12 @@ function App() {
             </section>
           ) : null}
 
-          {identity?.role === 'admin' && tab === 'users' ? (
+          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'users' ? (
             <section className="entity-page users-page">
               <div className="entity-main">
                 <section className="card">
-                  <div className="card-head"><h3>Create User</h3></div>
-                  <div className="field-grid">
-                    <div className="field">
-                      <label>Username</label>
-                      <input value={newUserName} onChange={(e) => setNewUserName(e.target.value.toLowerCase().trim())} placeholder="username" />
-                    </div>
-                    <div className="field">
-                      <label>Temporary Password</label>
-                      <input type="password" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} placeholder="minimum 10 characters" />
-                    </div>
-                    <div className="field">
-                      <label>Role</label>
-                      <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as 'admin' | 'domain-admin' | 'read-only')}>
-                        <option value="domain-admin">Sub Admin (domain-admin)</option>
-                        <option value="read-only">Read Only</option>
-                        <option value="admin">Global Admin</option>
-                      </select>
-                    </div>
-                  </div>
-                  {newUserRole === 'domain-admin' ? (
-                    <div className="field" style={{ marginBottom: '.8rem' }}>
-                      <label>Domain Scope</label>
-                      <div className="domain-pills">
-                        {domains.map((d) => (
-                          <label key={d.id} className="pill">
-                            <input type="checkbox" checked={newUserDomainIDs.includes(d.id)} onChange={() => toggleNewUserDomain(d.id)} />
-                            {d.name}
-                          </label>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                  <div className="row" style={{ marginBottom: 0 }}>
-                    <button className="btn" onClick={createUser} disabled={loading || !newUserName || !newUserPassword || (newUserRole === 'domain-admin' && newUserDomainIDs.length === 0)}>Create User</button>
-                  </div>
-                </section>
-
-                <section className="card">
                   <div className="card-head"><h3>User Operations</h3></div>
-                  <div className="log-filter-grid" style={{ gridTemplateColumns: 'repeat(3,minmax(0,1fr))' }}>
+                  <div className="log-filter-grid user-ops-filters">
                     <select value={usersRoleFilter} onChange={(e) => setUsersRoleFilter(e.target.value as 'all' | 'admin' | 'domain-admin' | 'read-only')}>
                       <option value="all">All roles</option>
                       <option value="admin">Global Admin</option>
@@ -3191,31 +3227,82 @@ function App() {
                       <option value="read-only">Read Only</option>
                     </select>
                     <input value={usersQuery} onChange={(e) => setUsersQuery(e.target.value)} placeholder="Search username, role, id..." />
-                    <button className="btn" onClick={refresh} disabled={loading}>Refresh</button>
+                    <div className="row" style={{ marginBottom: 0 }}>
+                      <button className="btn" onClick={() => {
+                        setNewUserName('');
+                        setNewUserPassword('');
+                        setNewUserRole('domain-admin');
+                        setNewUserDomainIDs([]);
+                        setNewUserAllowedCIDRs('');
+                        setNewUserIPCheckDisabled(false);
+                        setShowCreateUserDialog(true);
+                      }} disabled={loading || isReadOnlyRole}>Create User</button>
+                      <button className="btn ghost" onClick={refresh} disabled={loading}>Refresh</button>
+                    </div>
                   </div>
                   <div className="muted" style={{ marginBottom: '.6rem' }}>
                     Showing {filteredUsers.length} of {users.length} users.
                   </div>
-                  {filteredUsers.length === 0 ? (
-                    <div className="muted">No users match the current filter.</div>
-                  ) : filteredUsers.map((u) => (
-                    <UserRow
-                      key={u.id}
-                      user={u}
-                      domains={domains}
-                      loading={loading}
-                      currentUserID={identity?.type === 'session' ? identity.userId : 0}
-                      onDelete={deleteUser}
-                      onSaveDomains={saveUserDomains}
-                      onResetPassword={resetUserPassword}
-                    />
-                  ))}
+                  <div className="log-table-wrap" style={{ maxHeight: '62vh' }}>
+                    <table className="log-table user-table-compact">
+                      <thead>
+                        <tr>
+                          <th>User</th>
+                          <th>Role</th>
+                          <th>Domain Scope</th>
+                          <th>IP Policy</th>
+                          <th>Updated</th>
+                          <th>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredUsers.length === 0 ? (
+                          <tr>
+                            <td colSpan={6} className="muted" style={{ padding: '.9rem' }}>No users match the current filter.</td>
+                          </tr>
+                        ) : filteredUsers.map((u) => {
+                          const scopeNames = domains
+                            .filter((d) => (u.domainIds || []).includes(d.id))
+                            .map((d) => d.name);
+                          const isCurrentUser = identity?.type === 'session' && u.id === identity.userId;
+                          return (
+                            <tr key={u.id}>
+                              <td>
+                                <div><strong>{u.username}</strong></div>
+                                <div className="muted">ID {u.id}</div>
+                              </td>
+                              <td><span className="badge warn">{u.role}</span></td>
+                              <td>
+                                {u.role === 'domain-admin'
+                                  ? (scopeNames.length > 0 ? scopeNames.join(', ') : 'none')
+                                  : 'global'}
+                              </td>
+                              <td>
+                                {u.ipCheckDisabled ? (
+                                  <span className="badge warn">IP check disabled</span>
+                                ) : (
+                                  <span className="muted">{(u.allowedCidrs || '').trim() || 'default CIDR policy'}</span>
+                                )}
+                              </td>
+                              <td>{formatDateTime(u.updatedAt)}</td>
+                              <td>
+                                <div className="row" style={{ marginBottom: 0 }}>
+                                  <button className="btn ghost" onClick={() => openEditUserDialog(u)} disabled={loading || isCurrentUser || isReadOnlyRole}>Edit</button>
+                                  <button className="btn danger" onClick={() => deleteUser(u.id)} disabled={loading || isCurrentUser || isReadOnlyRole}>Delete</button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
                 </section>
               </div>
             </section>
           ) : null}
 
-          {identity?.role === 'admin' && tab === 'api' ? (
+          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'api' ? (
             <section className="card">
               <div className="card-head"><h3>API Management</h3></div>
               <div className="row">
@@ -3246,7 +3333,7 @@ function App() {
               </div>
               <div className="row">
                 <input value={newTokenScopes} onChange={(e) => setNewTokenScopes(e.target.value)} placeholder="additional scopes comma-separated (optional)" />
-                <button className="btn" onClick={createToken} disabled={loading || !newTokenName}>Create Token</button>
+                <button className="btn" onClick={createToken} disabled={loading || !newTokenName || isReadOnlyRole}>Create Token</button>
               </div>
               {createdToken ? (
                 <div className="card" style={{ marginBottom: '.8rem' }}>
@@ -3257,13 +3344,13 @@ function App() {
               <pre>{JSON.stringify(tokens, null, 2)}</pre>
               <div className="row">
                 {tokens.map((t) => (
-                  <button key={t.id} className="btn" onClick={() => revokeToken(t.id)}>Revoke {t.name} ({t.tokenPrefix})</button>
+                  <button key={t.id} className="btn" onClick={() => revokeToken(t.id)} disabled={isReadOnlyRole}>Revoke {t.name} ({t.tokenPrefix})</button>
                 ))}
               </div>
             </section>
           ) : null}
 
-          {identity?.role === 'admin' && tab === 'apiDocs' ? (
+          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'apiDocs' ? (
             <section className="card">
               <div className="card-head"><h3>API Documentation</h3></div>
               <div className="card" style={{ marginBottom: '.8rem' }}>
@@ -3419,7 +3506,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
             </section>
           ) : null}
 
-          {identity?.role === 'admin' && tab === 'ssh' ? (
+          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'ssh' ? (
             <section className="entity-page">
               <div className="entity-main">
                 <section className="card">
@@ -3434,7 +3521,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                     </div>
                   )}
                   <div className="row">
-                    <select value={sshSelectedHostFQDN} onChange={(e) => setSshSelectedHostFQDN(e.target.value)}>
+                    <select value={sshSelectedHostFQDN} onChange={(e) => setSshSelectedHostFQDN(e.target.value)} disabled={isReadOnlyRole}>
                       <option value="">Select Subdomain (recommended)</option>
                       {sshCandidateHosts.map((h) => (
                         <option key={`ssh-cand-${h.id}`} value={h.fqdn}>
@@ -3442,11 +3529,11 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                         </option>
                       ))}
                     </select>
-                    <input value={sshRouteFQDN} onChange={(e) => setSshRouteFQDN(e.target.value)} placeholder="manual FQDN fallback" />
-                    <input value={sshRouteTargetHost} onChange={(e) => setSshRouteTargetHost(e.target.value)} placeholder="192.168.1.14" />
-                    <input value={sshRouteTargetPort} onChange={(e) => setSshRouteTargetPort(e.target.value)} placeholder="22" />
-                    <label className="check"><input type="checkbox" checked={sshRouteEnabled} onChange={(e) => setSshRouteEnabled(e.target.checked)} /> enabled</label>
-                    <button className="btn" onClick={saveSSHRoute} disabled={loading || (!sshSelectedHostFQDN.trim() && !sshRouteFQDN.trim())}>Save Route</button>
+                    <input value={sshRouteFQDN} onChange={(e) => setSshRouteFQDN(e.target.value)} placeholder="manual FQDN fallback" disabled={isReadOnlyRole} />
+                    <input value={sshRouteTargetHost} onChange={(e) => setSshRouteTargetHost(e.target.value)} placeholder="192.168.1.14" disabled={isReadOnlyRole} />
+                    <input value={sshRouteTargetPort} onChange={(e) => setSshRouteTargetPort(e.target.value)} placeholder="22" disabled={isReadOnlyRole} />
+                    <label className="check"><input type="checkbox" checked={sshRouteEnabled} onChange={(e) => setSshRouteEnabled(e.target.checked)} disabled={isReadOnlyRole} /> enabled</label>
+                    <button className="btn" onClick={saveSSHRoute} disabled={loading || isReadOnlyRole || (!sshSelectedHostFQDN.trim() && !sshRouteFQDN.trim())}>Save Route</button>
                   </div>
                   {sshRoutes.length === 0 ? (
                     <div className="muted">No SSH routes configured.</div>
@@ -3458,9 +3545,9 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                           <div className="muted">{r.targetHost}:{r.targetPort} · {r.enabled ? 'enabled' : 'disabled'}</div>
                         </div>
                         <div className="row">
-                          <button className="btn" onClick={() => editSSHRoute(r)} disabled={loading}>Edit</button>
-                          <button className="btn" onClick={() => generateSSHKeyForRoute(r.id, r.fqdn)} disabled={loading}>Generate Host Key</button>
-                          <button className="btn danger" onClick={() => deleteSSHRoute(r.id)} disabled={loading}>Delete</button>
+                          <button className="btn" onClick={() => editSSHRoute(r)} disabled={loading || isReadOnlyRole}>Edit</button>
+                          <button className="btn" onClick={() => generateSSHKeyForRoute(r.id, r.fqdn)} disabled={loading || isReadOnlyRole}>Generate Host Key</button>
+                          <button className="btn danger" onClick={() => deleteSSHRoute(r.id)} disabled={loading || isReadOnlyRole}>Delete</button>
                         </div>
                       </div>
                     ))
@@ -3469,21 +3556,21 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                 <section className="card">
                   <div className="card-head"><h3>SSH Bastion Keys</h3></div>
                   <div className="row">
-                    <input value={sshKeyName} onChange={(e) => setSshKeyName(e.target.value)} placeholder="user1-key" />
-                    <button className="btn" onClick={generateSSHKey} disabled={loading || !sshKeyName || sshKeyRouteIDs.length === 0}>Generate Keypair</button>
-                    <button className="btn" onClick={importSSHKey} disabled={loading || !sshKeyName || !sshKeyPublic || sshKeyRouteIDs.length === 0}>Import Public Key</button>
+                    <input value={sshKeyName} onChange={(e) => setSshKeyName(e.target.value)} placeholder="user1-key" disabled={isReadOnlyRole} />
+                    <button className="btn" onClick={generateSSHKey} disabled={loading || isReadOnlyRole || !sshKeyName || sshKeyRouteIDs.length === 0}>Generate Keypair</button>
+                    <button className="btn" onClick={importSSHKey} disabled={loading || isReadOnlyRole || !sshKeyName || !sshKeyPublic || sshKeyRouteIDs.length === 0}>Import Public Key</button>
                   </div>
-                  <textarea value={sshKeyPublic} onChange={(e) => setSshKeyPublic(e.target.value)} placeholder="ssh-ed25519 AAAA... user@host" rows={3} />
+                  <textarea value={sshKeyPublic} onChange={(e) => setSshKeyPublic(e.target.value)} placeholder="ssh-ed25519 AAAA... user@host" rows={3} disabled={isReadOnlyRole} />
                   <div className="muted" style={{ marginBottom: '.3rem' }}>Allowed routes:</div>
                   <div className="domain-pills">
                     {sshRoutes.map((r) => (
                       <label key={`ssh-route-${r.id}`} className="pill">
-                        <input type="checkbox" checked={sshKeyRouteIDs.includes(r.id)} onChange={() => toggleSSHKeyRoute(r.id)} />
+                        <input type="checkbox" checked={sshKeyRouteIDs.includes(r.id)} onChange={() => toggleSSHKeyRoute(r.id)} disabled={isReadOnlyRole} />
                         {r.fqdn}
                       </label>
                     ))}
                   </div>
-                  {sshGeneratedPrivateKey ? (
+                  {sshGeneratedPrivateKey && !isReadOnlyRole ? (
                     <div className="card" style={{ marginBottom: '.6rem' }}>
                       <div className="muted">Generated private key (shown once):</div>
                       <div className="row" style={{ marginBottom: '.35rem' }}>
@@ -3504,10 +3591,10 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                       <div key={k.id} className="host">
                         <div>
                           <strong>{k.name}</strong>
-                          <div className="muted">{k.fingerprint}</div>
+                          <div className="muted">{isReadOnlyRole ? 'REDACTED' : k.fingerprint}</div>
                           <div className="muted">Routes: {(k.routeIds || []).map((rid) => sshRoutes.find((r) => r.id === rid)?.fqdn || `#${rid}`).join(', ') || '-'}</div>
                         </div>
-                        <button className="btn danger" onClick={() => deleteSSHKey(k.id)} disabled={loading}>Delete</button>
+                        <button className="btn danger" onClick={() => deleteSSHKey(k.id)} disabled={loading || isReadOnlyRole}>Delete</button>
                       </div>
                     ))
                   )}
@@ -3676,6 +3763,112 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                 <button className="btn danger" onClick={confirmDeleteHost} disabled={loading || deleteHostConfirmText.trim() !== 'Remove'}>Delete Now</button>
                 <button className="btn" onClick={closeDeleteHostDialog} disabled={loading}>Cancel</button>
               </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {identity && showCreateUserDialog ? (
+        <div className="overlay">
+          <div className="login-card modal-card user-edit-modal" style={{ maxWidth: '760px', width: '94vw' }}>
+            <h3>Create User</h3>
+            <p className="muted">Create a new account and assign initial access.</p>
+            <div className="field-grid">
+              <div className="field">
+                <label>Username</label>
+                <input value={newUserName} onChange={(e) => setNewUserName(e.target.value.toLowerCase().trim())} placeholder="username" />
+              </div>
+              <div className="field">
+                <label>Temporary Password</label>
+                <input type="password" value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} placeholder="minimum 10 characters" />
+              </div>
+              <div className="field">
+                <label>Role</label>
+                <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as 'admin' | 'domain-admin' | 'read-only')}>
+                  <option value="domain-admin">Domain Admin</option>
+                  <option value="read-only">Read Only</option>
+                  <option value="admin">Global Admin</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>IP Access CIDRs (optional)</label>
+                <input value={newUserAllowedCIDRs} onChange={(e) => setNewUserAllowedCIDRs(e.target.value)} placeholder="e.g. 192.168.1.0/24, 203.0.113.8/32" disabled={newUserIPCheckDisabled} />
+              </div>
+              <div className="field">
+                <label>IP Policy</label>
+                <label className="check">
+                  <input type="checkbox" checked={newUserIPCheckDisabled} onChange={(e) => setNewUserIPCheckDisabled(e.target.checked)} />
+                  Disable IP check
+                </label>
+              </div>
+            </div>
+            {newUserRole === 'domain-admin' ? (
+              <div className="field">
+                <label>Domain Scope</label>
+                <div className="domain-pills">
+                  {domains.map((d) => (
+                    <label key={`new-user-domain-${d.id}`} className="pill">
+                      <input type="checkbox" checked={newUserDomainIDs.includes(d.id)} onChange={() => toggleNewUserDomain(d.id)} />
+                      {d.name}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <div className="row" style={{ marginBottom: 0 }}>
+              <button className="btn" onClick={createUser} disabled={loading || !newUserName || !newUserPassword || (newUserRole === 'domain-admin' && newUserDomainIDs.length === 0)}>Create User</button>
+              <button className="btn danger" onClick={() => setShowCreateUserDialog(false)} disabled={loading}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {identity && editingUser ? (
+        <div className="overlay">
+          <div className="login-card modal-card user-edit-modal" style={{ maxWidth: '860px', width: '95vw' }}>
+            <h3>Edit User: {editingUser.username}</h3>
+            <p className="muted">Update role, scope, and optional password reset in one operation.</p>
+            <div className="field-grid">
+              <div className="field">
+                <label>Role</label>
+                <select value={editUserRole} onChange={(e) => setEditUserRole(e.target.value as 'admin' | 'domain-admin' | 'read-only')}>
+                  <option value="domain-admin">Domain Admin</option>
+                  <option value="read-only">Read Only</option>
+                  <option value="admin">Global Admin</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Password Reset (optional)</label>
+                <input type="password" value={editUserPassword} onChange={(e) => setEditUserPassword(e.target.value)} placeholder="leave blank to keep current password" />
+              </div>
+              <div className="field">
+                <label>IP Access CIDRs (optional)</label>
+                <input value={editUserAllowedCIDRs} onChange={(e) => setEditUserAllowedCIDRs(e.target.value)} placeholder="e.g. 192.168.1.0/24, 203.0.113.8/32" disabled={editUserIPCheckDisabled} />
+              </div>
+              <div className="field">
+                <label>IP Policy</label>
+                <label className="check">
+                  <input type="checkbox" checked={editUserIPCheckDisabled} onChange={(e) => setEditUserIPCheckDisabled(e.target.checked)} />
+                  Disable IP check
+                </label>
+              </div>
+            </div>
+            {editUserRole === 'domain-admin' ? (
+              <div className="field">
+                <label>Domain Scope</label>
+                <div className="domain-pills">
+                  {domains.map((d) => (
+                    <label key={`edit-user-domain-${d.id}`} className="pill">
+                      <input type="checkbox" checked={editUserDomainIDs.includes(d.id)} onChange={() => toggleEditUserDomain(d.id)} />
+                      {d.name}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <div className="row" style={{ marginBottom: 0 }}>
+              <button className="btn" onClick={saveUserEdit} disabled={loading || (editUserRole === 'domain-admin' && editUserDomainIDs.length === 0)}>Save Changes</button>
+              <button className="btn danger" onClick={closeEditUserDialog} disabled={loading}>Cancel</button>
             </div>
           </div>
         </div>
@@ -4010,8 +4203,11 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .field > label { font-size:.78rem; color:var(--text-dim); letter-spacing:.02em; }
         .field-grid { display:grid; gap:.6rem; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); margin-bottom:.8rem; }
         .users-page { grid-template-columns:minmax(0,1fr); }
-        .user-row-card { background:linear-gradient(180deg, rgba(255,255,255,.01), rgba(255,255,255,0)); }
-        .user-row-head { display:flex; align-items:center; gap:.45rem; flex-wrap:wrap; }
+        .user-ops-filters { grid-template-columns:minmax(180px,.8fr) minmax(220px,1.2fr) auto; align-items:center; }
+        .user-ops-filters .row { justify-content:flex-end; }
+        .user-table-compact { min-width:980px; font-size:.82rem; }
+        .user-table-compact th, .user-table-compact td { padding:.4rem .5rem; }
+        .user-edit-modal .domain-pills { max-height:170px; overflow:auto; padding-right:.2rem; }
         input, select, textarea { background:var(--input-bg); border:1px solid var(--border); color:var(--text); border-radius:9px; padding:.6rem .75rem; }
         textarea { min-height:6rem; width:100%; }
         .wizard-steps { display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap; }
@@ -4071,8 +4267,8 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
           mask-composite: intersect;
         }
         .col { display:grid; gap:.6rem; }
-        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} }
-        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} }
+        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} .user-ops-filters{grid-template-columns:1fr 1fr;} .user-ops-filters .row{justify-content:flex-start;} }
+        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} }
       `}</style>
     </>
   );
@@ -4172,6 +4368,13 @@ function extractTraceNeedles(query: string): string[] {
     out.push(v);
   }
   return out;
+}
+
+function formatDateTime(v?: string): string {
+  if (!v) return '-';
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return '-';
+  return d.toLocaleString();
 }
 
 function actionNamespace(action: string): string {
@@ -4338,88 +4541,6 @@ function MetricTile({ label, value, hint }: { label: string; value: string; hint
       <div className="metric-label">{label}</div>
       <div className="metric-value">{value}</div>
       <div className="metric-hint">{hint}</div>
-    </div>
-  );
-}
-
-function UserRow({
-  user,
-  domains,
-  loading,
-  currentUserID,
-  onDelete,
-  onSaveDomains,
-  onResetPassword,
-}: {
-  user: ManagedUser;
-  domains: Domain[];
-  loading: boolean;
-  currentUserID: number;
-  onDelete: (id: number) => Promise<void>;
-  onSaveDomains: (id: number, domainIds: number[]) => Promise<void>;
-  onResetPassword: (id: number, password: string) => Promise<void>;
-}) {
-  const [domainIds, setDomainIds] = useState<number[]>(user.domainIds || []);
-  const [newPassword, setNewPassword] = useState('');
-  const isCurrentUser = currentUserID > 0 && user.id === currentUserID;
-
-  useEffect(() => {
-    setDomainIds(user.domainIds || []);
-  }, [user.domainIds]);
-
-  const toggle = (id: number) => {
-    setDomainIds((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
-  };
-
-  return (
-    <div className="card user-row-card" style={{ marginBottom: '.6rem' }}>
-      <div className="host" style={{ borderTop: 'none', paddingTop: 0, marginBottom: '.55rem' }}>
-        <div className="user-row-head">
-          <strong>{user.username}</strong>
-          <span className="badge warn">{user.role}</span>
-          <span className="muted">ID {user.id}</span>
-        </div>
-        <div className="row" style={{ marginBottom: 0 }}>
-          <button className="btn danger" onClick={() => onDelete(user.id)} disabled={loading}>Delete</button>
-        </div>
-      </div>
-      {user.role === 'domain-admin' ? (
-        <>
-          <div className="field" style={{ marginBottom: '.6rem' }}>
-            <label>Assigned Domains</label>
-            <div className="domain-pills">
-              {domains.map((d) => (
-                <label key={d.id} className="pill">
-                  <input type="checkbox" checked={domainIds.includes(d.id)} onChange={() => toggle(d.id)} />
-                  {d.name}
-                </label>
-              ))}
-            </div>
-          </div>
-          <div className="row" style={{ marginBottom: '.6rem' }}>
-            <button className="btn" onClick={() => onSaveDomains(user.id, domainIds)} disabled={loading || domainIds.length === 0}>Save Domain Scope</button>
-          </div>
-        </>
-      ) : null}
-      <div className="field" style={{ marginBottom: 0 }}>
-        <label>Password Operations</label>
-        <div className="row" style={{ marginBottom: 0 }}>
-          <input
-            type="password"
-            value={newPassword}
-            onChange={(e) => setNewPassword(e.target.value)}
-            placeholder={isCurrentUser ? 'Use Change Password (top bar) for your account' : `Reset password for ${user.username} (min 10)`}
-            disabled={isCurrentUser}
-          />
-          <button
-            className="btn"
-            onClick={async () => { await onResetPassword(user.id, newPassword); setNewPassword(''); }}
-            disabled={isCurrentUser || loading || newPassword.length < 10}
-          >
-            Reset Password
-          </button>
-        </div>
-      </div>
     </div>
   );
 }
