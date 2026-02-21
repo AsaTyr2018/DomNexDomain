@@ -77,6 +77,7 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/threat-intel/blocked", s.handleThreatIntelBlockedList)
 		pr.Get("/api/v1/threat-intel/allowlist", s.handleThreatIntelAllowlistList)
 		pr.Get("/api/v1/settings", s.handleGetSettings)
+		pr.Get("/api/v1/time-sync", s.handleGetTimeSyncStatus)
 		pr.Get("/api/v1/users", s.handleListUsers)
 	})
 
@@ -1352,29 +1353,45 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		ACMEEmail    string `json:"acmeEmail"`
-		ACMEStaging  bool   `json:"acmeStaging"`
-		CFToken      string `json:"cfToken"`
-		PublicIPv4   string `json:"publicIpv4"`
-		BaseDomain   string `json:"baseDomain"`
-		StyleProfile string `json:"styleProfile"`
-		StyleCustom  string `json:"styleCustom"`
+		ACMEEmail          string `json:"acmeEmail"`
+		ACMEStaging        bool   `json:"acmeStaging"`
+		CFToken            string `json:"cfToken"`
+		PublicIPv4         string `json:"publicIpv4"`
+		BaseDomain         string `json:"baseDomain"`
+		StyleProfile       string `json:"styleProfile"`
+		StyleCustom        string `json:"styleCustom"`
+		TimeSyncMode       string `json:"timeSyncMode"`
+		TimeSyncLANServers string `json:"timeSyncLANServers"`
+		LogServers         app.LogServerSettings `json:"logServers"`
+		LogHTTPBearer      string                `json:"logHttpBearer"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom); err != nil {
+	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom, in.TimeSyncMode, in.TimeSyncLANServers, in.LogServers, in.LogHTTPBearer); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actor := id.Username
-	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "settings.update", Target: "runtime", Meta: "acme/cloudflare/base-domain"})
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "settings.update", Target: "runtime", Meta: "acme/cloudflare/base-domain/time-sync/logservers"})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"restartNeeded": true,
 		"message":       "Settings saved. Please restart the service so ACME and DNS runtime pick them up safely.",
 	})
+}
+
+func (s *Server) handleGetTimeSyncStatus(w http.ResponseWriter, r *http.Request) {
+	if !requireTokenScope(w, identityFrom(r.Context()), "settings:read") {
+		return
+	}
+	out, err := s.app.GetTimeSyncStatus(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleThreatIntelConfigGet(w http.ResponseWriter, r *http.Request) {

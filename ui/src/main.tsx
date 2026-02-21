@@ -11,7 +11,13 @@ type DomainLiveCheck = { domain: string; dnsMode: string; provider: string; serv
 type Audit = { id: number; actor: string; action: string; target: string; meta?: string; sourceIp?: string; createdAt: string };
 type BlockedIP = { ip: string; reason?: string; createdAt: string; updatedAt: string };
 type APIToken = { id: number; name: string; tokenPrefix: string; scopes: string; role: string; expiresAt: string; lastUsedAt?: string };
-type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string };
+type LogServerSyslogSettings = { enabled: boolean; protocol: 'udp' | 'tcp'; address: string; minLevel: 'info' | 'warn' | 'error'; appName: string };
+type LogServerHTTPSettings = { enabled: boolean; url: string; timeoutSec: number; minLevel: 'info' | 'warn' | 'error'; insecure: boolean };
+type LogServerTCPJSONSettings = { enabled: boolean; address: string; timeoutSec: number; minLevel: 'info' | 'warn' | 'error' };
+type LogServerSettings = { syslog: LogServerSyslogSettings; http: LogServerHTTPSettings; tcpJson: LogServerTCPJSONSettings };
+type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean };
+type TimeSyncProbe = { name: string; target: string; ok: boolean; offsetMs: number; rttMs: number; error?: string; detail?: string };
+type TimeSyncStatus = { mode: 'system_only' | 'external_public' | 'external_lan'; healthy: boolean; severity: 'ok' | 'warn' | 'critical'; summary: string; source?: string; offsetMs?: number; checkedAt: string; probes: TimeSyncProbe[] };
 type ManagedUser = { id: number; username: string; role: string; domainIds: number[]; createdAt: string; updatedAt: string };
 type DomainPreflightCheck = { name: string; ok: boolean; detail?: string };
 type DomainPreflight = { domain: string; dnsMode: string; provider: string; zoneId?: string; resolvedZone?: string; publicIpv4?: string; checks: DomainPreflightCheck[]; ready: boolean };
@@ -27,7 +33,17 @@ type TrafficCountryOverview = { hours: number; generatedAt: string; requestClass
 type SSHBastionRoute = { id: number; fqdn: string; targetHost: string; targetPort: number; enabled: boolean; createdAt: string; updatedAt: string };
 type SSHBastionKey = { id: number; name: string; publicKey: string; fingerprint: string; enabled: boolean; routeIds: number[]; createdAt: string; updatedAt: string };
 type SSHBastionGenerate = { key: SSHBastionKey; privateKey?: string; privateKeyPpk?: string; publicKeyRfc4716?: string; ppkError?: string };
-type ThreatIntelConfig = { enabled: boolean; mode: 'monitor_only' | 'auto_mode'; syncHours: number };
+type ThreatIntelConfig = {
+  enabled: boolean;
+  mode: 'monitor_only' | 'auto_mode';
+  syncHours: number;
+  eventMinHits: number;
+  offenderMinHits: number;
+  monitorMaxLevel: number;
+  softMinLevel: number;
+  hardLevel: number;
+  softBlockMinutes: number;
+};
 type ThreatIntelFeed = { id: number; name: string; url: string; enabled: boolean; isDefault?: boolean; entryCount?: number; lastSyncAt?: string; lastError?: string; lastHash?: string; createdAt?: string; updatedAt?: string };
 type ThreatIntelMatch = { id: number; ip: string; feed: string; host: string; path: string; targetCount?: number; country: string; mode: string; decision: string; hits: number; firstSeenAt: string; lastSeenAt: string; lastTraceId?: string; sourceScope?: string; xp?: number; level?: number; tier?: string; riskState?: string };
 type ThreatIntelTarget = { host: string; path: string; feed: string; decision: string; hits: number; lastSeenAt: string };
@@ -38,6 +54,7 @@ type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; p
 type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
 
 type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'ssh' | 'audit';
+type SettingsTab = 'general' | 'security' | 'logservers' | 'appearance' | 'advanced';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
 type PublicStyle = { styleProfile?: string; styleCustom?: string };
@@ -62,6 +79,11 @@ type ThemeVars = {
 const SSH_BASTION_DEFAULT_UPSTREAM = 'http://127.0.0.1:8443';
 const SSH_BASTION_DEFAULT_TARGET_HOST = '127.0.0.1';
 const SSH_BASTION_DEFAULT_TARGET_PORT = 22;
+const defaultLogServers = (): LogServerSettings => ({
+  syslog: { enabled: false, protocol: 'udp', address: '', minLevel: 'info', appName: 'DomNexDomain' },
+  http: { enabled: false, url: '', timeoutSec: 4, minLevel: 'warn', insecure: false },
+  tcpJson: { enabled: false, address: '', timeoutSec: 3, minLevel: 'info' },
+});
 const MONOLITH_THEME: ThemeVars = {
   bg: '#0f0f11',
   surface: '#16161a',
@@ -193,7 +215,17 @@ function App() {
   const [hostDiagnostics, setHostDiagnostics] = useState<Record<string, HostDiagnostic>>({});
   const [audit, setAudit] = useState<Audit[]>([]);
   const [blockedIPs, setBlockedIPs] = useState<BlockedIP[]>([]);
-  const [tiConfig, setTiConfig] = useState<ThreatIntelConfig>({ enabled: false, mode: 'monitor_only', syncHours: 24 });
+  const [tiConfig, setTiConfig] = useState<ThreatIntelConfig>({
+    enabled: false,
+    mode: 'monitor_only',
+    syncHours: 24,
+    eventMinHits: 2,
+    offenderMinHits: 10,
+    monitorMaxLevel: 2,
+    softMinLevel: 3,
+    hardLevel: 6,
+    softBlockMinutes: 15,
+  });
   const [tiFeeds, setTiFeeds] = useState<ThreatIntelFeed[]>([]);
   const [tiMatches, setTiMatches] = useState<ThreatIntelMatch[]>([]);
   const [tiOffenders, setTiOffenders] = useState<ThreatIntelOffender[]>([]);
@@ -298,6 +330,12 @@ function App() {
   const [settingsBaseDomain, setSettingsBaseDomain] = useState('');
   const [settingsStyleProfile, setSettingsStyleProfile] = useState<StyleProfile>('monolith');
   const [settingsStyleCustom, setSettingsStyleCustom] = useState('');
+  const [settingsTimeSyncMode, setSettingsTimeSyncMode] = useState<'system_only' | 'external_public' | 'external_lan'>('system_only');
+  const [settingsTimeSyncLAN, setSettingsTimeSyncLAN] = useState('');
+  const [settingsLogServers, setSettingsLogServers] = useState<LogServerSettings>(defaultLogServers());
+  const [settingsLogHTTPBearer, setSettingsLogHTTPBearer] = useState('');
+  const [timeSyncStatus, setTimeSyncStatus] = useState<TimeSyncStatus | null>(null);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [publicStyleProfile, setPublicStyleProfile] = useState<StyleProfile>('monolith');
   const [publicStyleCustom, setPublicStyleCustom] = useState('');
   const [settingsMessage, setSettingsMessage] = useState('');
@@ -405,18 +443,46 @@ function App() {
         setSettingsBaseDomain(s.baseDomain || '');
         setSettingsStyleProfile((s.styleProfile as StyleProfile) || 'monolith');
         setSettingsStyleCustom(s.styleCustom || '');
+        setSettingsTimeSyncMode((s.timeSyncMode as 'system_only' | 'external_public' | 'external_lan') || 'system_only');
+        setSettingsTimeSyncLAN((s.timeSyncLANServers || []).join(', '));
+        setSettingsLogServers(s.logServers || defaultLogServers());
       } catch {
         setSettings(null);
         setSettingsPublicIPv4('');
         setSettingsBaseDomain('');
         setSettingsStyleProfile('monolith');
         setSettingsStyleCustom('');
+        setSettingsTimeSyncMode('system_only');
+        setSettingsTimeSyncLAN('');
+        setSettingsLogServers(defaultLogServers());
+      }
+      try {
+        const ts = await api<TimeSyncStatus>('/api/v1/time-sync');
+        setTimeSyncStatus(ts);
+      } catch {
+        setTimeSyncStatus(null);
       }
       try {
         const t = await api<TrafficOverview>('/api/v1/traffic/overview?hours=24');
         setTrafficOverview(t);
       } catch {
         setTrafficOverview(null);
+      }
+      try {
+        const cfg = await api<ThreatIntelConfig>('/api/v1/threat-intel/config');
+        setTiConfig({
+          enabled: !!cfg.enabled,
+          mode: (cfg.mode || 'monitor_only') as 'monitor_only' | 'auto_mode',
+          syncHours: Number(cfg.syncHours || 24),
+          eventMinHits: Number(cfg.eventMinHits || 2),
+          offenderMinHits: Number(cfg.offenderMinHits || 10),
+          monitorMaxLevel: Number(cfg.monitorMaxLevel || 2),
+          softMinLevel: Number(cfg.softMinLevel || 3),
+          hardLevel: Number(cfg.hardLevel || 6),
+          softBlockMinutes: Number(cfg.softBlockMinutes || 15),
+        });
+      } catch {
+        // Keep previous threat intel config on transient failures.
       }
     } catch (e) {
       const err = e as Error & { status?: number };
@@ -447,6 +513,15 @@ function App() {
     }
   };
 
+  const loadTimeSyncStatus = async () => {
+    try {
+      const out = await api<TimeSyncStatus>('/api/v1/time-sync');
+      setTimeSyncStatus(out);
+    } catch {
+      setTimeSyncStatus(null);
+    }
+  };
+
   const loadThreatIntel = async () => {
     try {
       const [cfg, feeds, allow, blockedSummary] = await Promise.all([
@@ -459,6 +534,12 @@ function App() {
         enabled: !!cfg.enabled,
         mode: (cfg.mode || 'monitor_only') as 'monitor_only' | 'auto_mode',
         syncHours: Number(cfg.syncHours || 24),
+        eventMinHits: Number(cfg.eventMinHits || 2),
+        offenderMinHits: Number(cfg.offenderMinHits || 10),
+        monitorMaxLevel: Number(cfg.monitorMaxLevel || 2),
+        softMinLevel: Number(cfg.softMinLevel || 3),
+        hardLevel: Number(cfg.hardLevel || 6),
+        softBlockMinutes: Number(cfg.softBlockMinutes || 15),
       });
       setTiFeeds(feeds.items || []);
       setTiAllowlist(allow.items || []);
@@ -539,6 +620,14 @@ function App() {
   }, [tab, tiHours, tiDecision, tiQuery, tiPage, tiPageSize, tiView, tiBlockedOpen]);
 
   useEffect(() => {
+    if (identity?.role !== 'admin') return;
+    if (tab !== 'settings' && tab !== 'dashboard') return;
+    void loadTimeSyncStatus();
+    const t = window.setInterval(() => { void loadTimeSyncStatus(); }, 20000);
+    return () => window.clearInterval(t);
+  }, [tab, identity?.role]);
+
+  useEffect(() => {
     setTiPage(1);
   }, [tiHours, tiDecision, tiQuery, tiView, tiPageSize]);
 
@@ -582,6 +671,9 @@ function App() {
       setSettingsBaseDomain('');
       setSettingsStyleProfile('monolith');
       setSettingsStyleCustom('');
+      setSettingsTimeSyncMode('system_only');
+      setSettingsTimeSyncLAN('');
+      setTimeSyncStatus(null);
       void loadPublicStyle();
     } catch (e) {
       setError((e as Error).message);
@@ -1173,11 +1265,17 @@ function App() {
           baseDomain: settingsBaseDomain,
           styleProfile: settingsStyleProfile,
           styleCustom: settingsStyleCustom,
+          timeSyncMode: settingsTimeSyncMode,
+          timeSyncLANServers: settingsTimeSyncLAN,
+          logServers: settingsLogServers,
+          logHttpBearer: settingsLogHTTPBearer,
         }),
       });
       setSettingsCFToken('');
+      setSettingsLogHTTPBearer('');
       setSettingsMessage(out.message || 'Settings saved.');
       await refresh();
+      await loadTimeSyncStatus();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -1855,17 +1953,28 @@ function App() {
             <img src="/logo.png" alt="DomNexDomain" />
           </div>
           <nav className="menu">
-            <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
-            <button className={tab === 'metricCenter' ? 'active' : ''} onClick={() => setTab('metricCenter')}>MetricCenter</button>
-            <button className={tab === 'threatIntel' ? 'active' : ''} onClick={() => setTab('threatIntel')}>Threat Intel</button>
-            <button className={tab === 'domains' ? 'active' : ''} onClick={() => setTab('domains')}>Domains</button>
-            <button className={tab === 'hosts' ? 'active' : ''} onClick={() => setTab('hosts')}>Subdomains</button>
-            {identity?.role === 'admin' ? <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button> : null}
-            {identity?.role === 'admin' ? <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Settings</button> : null}
-            {identity?.role === 'admin' ? <button className={tab === 'api' ? 'active' : ''} onClick={() => setTab('api')}>API Mgmt</button> : null}
-            {identity?.role === 'admin' ? <button className={tab === 'apiDocs' ? 'active' : ''} onClick={() => setTab('apiDocs')}>API Docs</button> : null}
-            {identity?.role === 'admin' ? <button className={tab === 'ssh' ? 'active' : ''} onClick={() => setTab('ssh')}>SSH Bastion</button> : null}
-            <button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Logs</button>
+            <div className="menu-group">
+              <div className="menu-title">Operations</div>
+              <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
+              <button className={tab === 'metricCenter' ? 'active' : ''} onClick={() => setTab('metricCenter')}>MetricCenter</button>
+              <button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>LogCenter</button>
+            </div>
+            <div className="menu-group">
+              <div className="menu-title">Routing</div>
+              <button className={tab === 'domains' ? 'active' : ''} onClick={() => setTab('domains')}>Domains</button>
+              <button className={tab === 'hosts' ? 'active' : ''} onClick={() => setTab('hosts')}>Subdomains</button>
+              <button className={tab === 'threatIntel' ? 'active' : ''} onClick={() => setTab('threatIntel')}>Threat Intel</button>
+              {identity?.role === 'admin' ? <button className={tab === 'ssh' ? 'active' : ''} onClick={() => setTab('ssh')}>SSH Bastion</button> : null}
+            </div>
+            {identity?.role === 'admin' ? (
+              <div className="menu-group">
+                <div className="menu-title">Administration</div>
+                <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button>
+                <button className={tab === 'api' ? 'active' : ''} onClick={() => setTab('api')}>API Mgmt</button>
+                <button className={tab === 'apiDocs' ? 'active' : ''} onClick={() => setTab('apiDocs')}>API Docs</button>
+                <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Settings</button>
+              </div>
+            ) : null}
           </nav>
         </aside>
 
@@ -1935,22 +2044,46 @@ function App() {
                     </div>
                   </div>
                 </div>
-                <div className="card">
-                  <div className="card-head"><h3>Recent Events</h3></div>
-                  <div className="event-list">
-                    {audit.length === 0 ? (
-                      <div className="muted">No events yet.</div>
-                    ) : (
-                      audit.slice(0, 10).map((e) => (
-                        <div className="event-item" key={e.id}>
-                          <div className="event-top">
-                            <strong>{e.action}</strong>
-                            <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
+                <div className="dashboard-side">
+                  <div className="card">
+                    <div className="card-head"><h3>Control Plane Health</h3></div>
+                    <div className="metric-grid">
+                      <MetricTile label="Cloudflare Token" value={settings?.hasCloudflareToken ? 'set' : 'missing'} hint="Global API token state" />
+                      <MetricTile label="ACME Mode" value={settingsAcmeStaging ? 'staging' : 'production'} hint="Certificate endpoint" />
+                      <MetricTile label="Time Sync Mode" value={settingsTimeSyncMode} hint="Clock source policy" />
+                      <MetricTile label="Time Sync State" value={timeSyncStatus ? (timeSyncStatus.severity || 'unknown').toUpperCase() : '-'} hint={timeSyncStatus?.summary || 'No check yet'} />
+                    </div>
+                    {timeSyncStatus ? (
+                      <div className="event-list" style={{ marginTop: '.55rem' }}>
+                        {(timeSyncStatus.probes || []).slice(0, 3).map((p, idx) => (
+                          <div className="event-item" key={`dash-ts-${idx}`}>
+                            <div className="event-top">
+                              <strong>{p.target || p.name}</strong>
+                              <span className={`badge ${p.ok ? 'ok' : 'err'}`}>{p.ok ? 'ok' : 'fail'}</span>
+                            </div>
+                            <div className="muted">offset {String(p.offsetMs || 0)}ms · rtt {String(p.rttMs || 0)}ms</div>
                           </div>
-                          <div className="muted">{e.actor} {'->'} {e.target}</div>
-                        </div>
-                      ))
-                    )}
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="card">
+                    <div className="card-head"><h3>Recent Events</h3></div>
+                    <div className="event-list">
+                      {audit.length === 0 ? (
+                        <div className="muted">No events yet.</div>
+                      ) : (
+                        audit.slice(0, 10).map((e) => (
+                          <div className="event-item" key={e.id}>
+                            <div className="event-top">
+                              <strong>{e.action}</strong>
+                              <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
+                            </div>
+                            <div className="muted">{e.actor} {'->'} {e.target}</div>
+                          </div>
+                        ))
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -2093,33 +2226,12 @@ function App() {
             <section className="entity-page threatintel-page">
               <div className="entity-main">
                 <section className="card">
-                  <div className="card-head"><h3>Threat Intel Policy</h3></div>
-                  <div className="row">
-                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '.45rem' }}>
-                      <input type="checkbox" checked={!!tiConfig.enabled} onChange={(e) => setTiConfig((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
-                      Opt-in enabled
-                    </label>
-                    <select value={tiConfig.mode} onChange={(e) => setTiConfig((p) => ({ ...p, mode: e.target.value as 'monitor_only' | 'auto_mode' }))} disabled={isReadOnlyRole || identity?.role !== 'admin'}>
-                      <option value="monitor_only">Monitor only</option>
-                      <option value="auto_mode">Auto mode (soft + hard)</option>
-                    </select>
-                    <input type="number" min={1} max={168} value={String(tiConfig.syncHours || 24)} onChange={(e) => setTiConfig((p) => ({ ...p, syncHours: Number(e.target.value) || 24 }))} placeholder="sync hours" disabled={isReadOnlyRole || identity?.role !== 'admin'} />
-                    <button className="btn" onClick={saveThreatIntelConfig} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Save Policy</button>
-                    <button className="btn" onClick={syncThreatIntelNow} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Sync Now</button>
-                    <button className="btn" onClick={() => setTiFeedsOpen(true)}>Feeds</button>
-                    <button className="btn" onClick={() => setTiAllowOpen(true)}>Allowlist</button>
-                    <button className="btn danger" onClick={openThreatIntelBlocked}>Blocked ({tiTotalBlocked})</button>
-                  </div>
-                  <div className="muted">
-                    Default feed: <code>https://lists.blocklist.de/lists/all.txt</code> · Data view optimized for large datasets with paging.
-                  </div>
-                  {tiConfigSavedAt ? <div className="muted">Policy saved: {new Date(tiConfigSavedAt).toLocaleString()}</div> : null}
-                </section>
-
-                <section className="card">
                   <div className="card-head">
                     <h3>Threat Data</h3>
-                    <button className="btn danger" onClick={openThreatIntelBlocked}>Blocked ({tiTotalBlocked})</button>
+                    <div className="row" style={{ marginBottom: 0 }}>
+                      <button className="btn" onClick={() => setTiAllowOpen(true)}>Allowlist</button>
+                      <button className="btn danger" onClick={openThreatIntelBlocked}>Blocked ({tiTotalBlocked})</button>
+                    </div>
                   </div>
                   <div className="row">
                     <div className="wizard-steps" style={{ marginBottom: 0 }}>
@@ -2151,7 +2263,7 @@ function App() {
                     <input value={tiQuery} onChange={(e) => setTiQuery(e.target.value)} placeholder="Search ip/host/path/feed/country" />
                   </div>
                   <div className="muted" style={{ marginBottom: '.55rem' }}>
-                    Showing page {tiPage} / {tiPageCount} · total records: {tiTotalCurrent} · Events: repeated IPs only (hits {'>='} 2) · Offenders: burst offenders (hits {'>'} 10 in short window) · Tiering: XP + Level + State
+                    Showing page {tiPage} / {tiPageCount} · total records: {tiTotalCurrent} · Events: repeated IPs only (hits {'>='} {tiConfig.eventMinHits || 2}, {'<'} {tiConfig.offenderMinHits || 10}) · Offenders: burst offenders (hits {'>='} {tiConfig.offenderMinHits || 10}) · Tiering: XP + Level + State
                   </div>
                   <div className="log-table-wrap">
                     {tiView === 'events' ? (
@@ -2214,7 +2326,7 @@ function App() {
                         </thead>
                         <tbody>
                           {tiOffenders.length === 0 ? (
-                            <tr><td colSpan={8} className="muted">No burst offenders ({'>'}10 hits) in current filter.</td></tr>
+                            <tr><td colSpan={8} className="muted">No burst offenders ({'>='}{tiConfig.offenderMinHits || 10} hits) in current filter.</td></tr>
                           ) : tiOffenders.map((o) => (
                             <tr key={`ti-off-${o.ip}`}>
                               <td><code>{o.ip}</code></td>
@@ -2779,70 +2891,246 @@ function App() {
               <div className="entity-main">
                 <section className="card">
                   <div className="card-head"><h3>Runtime Settings</h3></div>
-                  <div className="row">
-                    <input value={settingsAcmeEmail} onChange={(e) => setSettingsAcmeEmail(e.target.value)} placeholder="ACME Email (e.g. admin@jigcinema.com)" />
-                    <label className="check"><input type="checkbox" checked={settingsAcmeStaging} onChange={(e) => setSettingsAcmeStaging(e.target.checked)} /> ACME Staging</label>
+                  <div className="wizard-steps" style={{ marginBottom: '.75rem' }}>
+                    <button className={settingsTab === 'general' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('general')}>General</button>
+                    <button className={settingsTab === 'security' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('security')}>Security &amp; Time</button>
+                    <button className={settingsTab === 'logservers' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('logservers')}>Logservers</button>
+                    <button className={settingsTab === 'appearance' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('appearance')}>Appearance</button>
+                    <button className={settingsTab === 'advanced' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('advanced')}>Advanced</button>
                   </div>
-                  <div className="row">
-                    <select value={settingsBaseDomain} onChange={(e) => setSettingsBaseDomain(e.target.value)}>
-                      <option value="">No base domain selected</option>
-                      {domains.map((d) => (
-                        <option key={d.id} value={d.name}>{d.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="muted" style={{ marginBottom: '.6rem' }}>
-                    Selecting a base domain provisions `admin.&lt;domain&gt;` automatically. For Cloudflare domains, DNS records are provisioned automatically.
-                  </div>
-                  <div className="row">
-                    <input value={settingsCFToken} onChange={(e) => setSettingsCFToken(e.target.value)} placeholder={settings?.hasCloudflareToken ? 'Cloudflare API Token (leave empty = unchanged)' : 'Cloudflare API Token'} />
-                  </div>
-                  <div className="row">
-                    <input value={settingsPublicIPv4} onChange={(e) => setSettingsPublicIPv4(e.target.value)} placeholder="Preferred Public IPv4 (e.g. 203.0.113.10)" />
-                  </div>
-                  <div className="row">
-                    <select value={settingsStyleProfile} onChange={(e) => setSettingsStyleProfile(e.target.value as StyleProfile)}>
-                      <option value="monolith">Monolith</option>
-                      <option value="cybermonolith">CyberMonolith</option>
-                      <option value="custom">Custom</option>
-                    </select>
-                  </div>
-                  <div className="muted" style={{ marginBottom: '.35rem' }}>
-                    Style profile controls the full UI palette. `Custom` uses JSON overrides (theme key to color/value).
-                  </div>
-                  <textarea
-                    value={settingsStyleCustom}
-                    onChange={(e) => setSettingsStyleCustom(e.target.value)}
-                    placeholder='{"accent":"#8b5cf6","surface":"#1c1c22","text":"#e6e6f0","border":"#2a2a36"}'
-                    rows={4}
-                  />
-                  <div className="muted" style={{ marginBottom: '.6rem' }}>
-                    Detected automatically on first start via external IP check and stored here. For multi-WAN setups, you can override the target IP manually.
-                  </div>
+                  {settingsTab === 'general' ? (
+                    <>
+                      <div className="row">
+                        <input value={settingsAcmeEmail} onChange={(e) => setSettingsAcmeEmail(e.target.value)} placeholder="ACME Email (e.g. admin@jigcinema.com)" />
+                        <label className="check"><input type="checkbox" checked={settingsAcmeStaging} onChange={(e) => setSettingsAcmeStaging(e.target.checked)} /> ACME Staging</label>
+                      </div>
+                      <div className="row">
+                        <select value={settingsBaseDomain} onChange={(e) => setSettingsBaseDomain(e.target.value)}>
+                          <option value="">No base domain selected</option>
+                          {domains.map((d) => (
+                            <option key={d.id} value={d.name}>{d.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="muted" style={{ marginBottom: '.6rem' }}>
+                        Selecting a base domain provisions `admin.&lt;domain&gt;` automatically. For Cloudflare domains, DNS records are provisioned automatically.
+                      </div>
+                    </>
+                  ) : null}
+                  {settingsTab === 'security' ? (
+                    <>
+                      <div className="field">
+                        <label>Cloudflare API Token</label>
+                        <input value={settingsCFToken} onChange={(e) => setSettingsCFToken(e.target.value)} placeholder={settings?.hasCloudflareToken ? 'Leave empty to keep current token' : 'Cloudflare API Token'} />
+                      </div>
+                      <div className="field">
+                        <label>Preferred Public IPv4</label>
+                        <input value={settingsPublicIPv4} onChange={(e) => setSettingsPublicIPv4(e.target.value)} placeholder="e.g. 203.0.113.10" />
+                        <div className="muted">Auto-detected on first start. Override for multi-WAN or custom edge routing.</div>
+                      </div>
+                      <div className="field">
+                        <label>Time Sync Mode</label>
+                        <select value={settingsTimeSyncMode} onChange={(e) => setSettingsTimeSyncMode(e.target.value as 'system_only' | 'external_public' | 'external_lan')}>
+                          <option value="system_only">System clock (internal NTP)</option>
+                          <option value="external_public">External Public NTP (Top 3)</option>
+                          <option value="external_lan">External LAN NTP server(s)</option>
+                        </select>
+                      </div>
+                      {settingsTimeSyncMode === 'external_lan' ? (
+                        <div className="field">
+                          <label>LAN NTP Servers</label>
+                          <textarea
+                            value={settingsTimeSyncLAN}
+                            onChange={(e) => setSettingsTimeSyncLAN(e.target.value)}
+                            placeholder="192.168.1.1, ntp.local, 192.168.1.10:123"
+                            rows={3}
+                          />
+                          <div className="muted">Comma or newline separated list.</div>
+                        </div>
+                      ) : null}
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>Threat Intel Tuning</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Threat Intel Enabled</label>
+                            <label className="check"><input type="checkbox" checked={!!tiConfig.enabled} onChange={(e) => setTiConfig((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> Opt-in enabled</label>
+                          </div>
+                          <div className="field">
+                            <label>Mode</label>
+                            <select value={tiConfig.mode} onChange={(e) => setTiConfig((p) => ({ ...p, mode: e.target.value as 'monitor_only' | 'auto_mode' }))} disabled={isReadOnlyRole || identity?.role !== 'admin'}>
+                              <option value="monitor_only">Monitor only</option>
+                              <option value="auto_mode">Auto mode (soft + hard)</option>
+                            </select>
+                          </div>
+                          <div className="field">
+                            <label>Feed Sync Interval (hours)</label>
+                            <input type="number" min={1} max={168} value={String(tiConfig.syncHours || 24)} onChange={(e) => setTiConfig((p) => ({ ...p, syncHours: Number(e.target.value) || 24 }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                          </div>
+                        </div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Event Threshold (hits)</label>
+                            <input type="number" min={1} max={100} value={String(tiConfig.eventMinHits || 2)} onChange={(e) => setTiConfig((p) => ({ ...p, eventMinHits: Number(e.target.value) || 2 }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                          </div>
+                          <div className="field">
+                            <label>Offender Threshold (hits)</label>
+                            <input type="number" min={2} max={10000} value={String(tiConfig.offenderMinHits || 10)} onChange={(e) => setTiConfig((p) => ({ ...p, offenderMinHits: Number(e.target.value) || 10 }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                          </div>
+                          <div className="field">
+                            <label>Monitor Max Level</label>
+                            <input type="number" min={0} max={32} value={String(tiConfig.monitorMaxLevel || 2)} onChange={(e) => setTiConfig((p) => ({ ...p, monitorMaxLevel: Number(e.target.value) || 2 }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                          </div>
+                          <div className="field">
+                            <label>Soft Block Min Level</label>
+                            <input type="number" min={1} max={32} value={String(tiConfig.softMinLevel || 3)} onChange={(e) => setTiConfig((p) => ({ ...p, softMinLevel: Number(e.target.value) || 3 }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                          </div>
+                          <div className="field">
+                            <label>Hard Block Level</label>
+                            <input type="number" min={2} max={64} value={String(tiConfig.hardLevel || 6)} onChange={(e) => setTiConfig((p) => ({ ...p, hardLevel: Number(e.target.value) || 6 }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                          </div>
+                          <div className="field">
+                            <label>Soft Block Duration (minutes)</label>
+                            <input type="number" min={1} max={1440} value={String(tiConfig.softBlockMinutes || 15)} onChange={(e) => setTiConfig((p) => ({ ...p, softBlockMinutes: Number(e.target.value) || 15 }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                          </div>
+                        </div>
+                        <div className="row" style={{ marginBottom: 0 }}>
+                          <button className="btn" onClick={syncThreatIntelNow} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Sync Now</button>
+                          <button className="btn" onClick={() => setTiFeedsOpen(true)} disabled={isReadOnlyRole || identity?.role !== 'admin'}>Manage Feeds</button>
+                          <button className="btn" onClick={saveThreatIntelConfig} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Save Threat Intel Policy</button>
+                        </div>
+                        {tiConfigSavedAt ? <div className="muted" style={{ marginTop: '.5rem' }}>Policy saved: {new Date(tiConfigSavedAt).toLocaleString()}</div> : null}
+                      </div>
+                    </>
+                  ) : null}
+                  {settingsTab === 'appearance' ? (
+                    <>
+                      <div className="row">
+                        <select value={settingsStyleProfile} onChange={(e) => setSettingsStyleProfile(e.target.value as StyleProfile)}>
+                          <option value="monolith">Monolith</option>
+                          <option value="cybermonolith">CyberMonolith</option>
+                          <option value="custom">Custom</option>
+                        </select>
+                      </div>
+                      <div className="muted" style={{ marginBottom: '.35rem' }}>
+                        Style profile controls the full UI palette. `Custom` uses JSON overrides (theme key to color/value).
+                      </div>
+                      <textarea
+                        value={settingsStyleCustom}
+                        onChange={(e) => setSettingsStyleCustom(e.target.value)}
+                        placeholder='{"accent":"#8b5cf6","surface":"#1c1c22","text":"#e6e6f0","border":"#2a2a36"}'
+                        rows={4}
+                      />
+                    </>
+                  ) : null}
+                  {settingsTab === 'logservers' ? (
+                    <>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>Syslog Delivery</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Enabled</label>
+                            <label className="check"><input type="checkbox" checked={!!settingsLogServers.syslog.enabled} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, enabled: e.target.checked } }))} /> Forward to Syslog</label>
+                          </div>
+                          <div className="field">
+                            <label>Protocol</label>
+                            <select value={settingsLogServers.syslog.protocol} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, protocol: e.target.value as 'udp' | 'tcp' } }))}>
+                              <option value="udp">UDP</option>
+                              <option value="tcp">TCP</option>
+                            </select>
+                          </div>
+                          <div className="field">
+                            <label>Address (host:port)</label>
+                            <input value={settingsLogServers.syslog.address} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, address: e.target.value } }))} placeholder="192.168.1.224:514" />
+                          </div>
+                          <div className="field">
+                            <label>Minimum Level</label>
+                            <select value={settingsLogServers.syslog.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
+                              <option value="info">info</option>
+                              <option value="warn">warn</option>
+                              <option value="error">error</option>
+                            </select>
+                          </div>
+                          <div className="field">
+                            <label>App Name</label>
+                            <input value={settingsLogServers.syslog.appName} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, appName: e.target.value } }))} placeholder="DomNexDomain" />
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>HTTP JSON Delivery</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Enabled</label>
+                            <label className="check"><input type="checkbox" checked={!!settingsLogServers.http.enabled} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, enabled: e.target.checked } }))} /> Forward via HTTP POST</label>
+                          </div>
+                          <div className="field">
+                            <label>Endpoint URL</label>
+                            <input value={settingsLogServers.http.url} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, url: e.target.value } }))} placeholder="https://siem.local/ingest/domnex" />
+                          </div>
+                          <div className="field">
+                            <label>Timeout (seconds)</label>
+                            <input type="number" min={1} max={30} value={String(settingsLogServers.http.timeoutSec || 4)} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, timeoutSec: Number(e.target.value) || 4 } }))} />
+                          </div>
+                          <div className="field">
+                            <label>Minimum Level</label>
+                            <select value={settingsLogServers.http.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
+                              <option value="info">info</option>
+                              <option value="warn">warn</option>
+                              <option value="error">error</option>
+                            </select>
+                          </div>
+                          <div className="field">
+                            <label>TLS Verify</label>
+                            <label className="check"><input type="checkbox" checked={!settingsLogServers.http.insecure} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, insecure: !e.target.checked } }))} /> Verify remote TLS certificate</label>
+                          </div>
+                          <div className="field">
+                            <label>Bearer Token (optional)</label>
+                            <input value={settingsLogHTTPBearer} onChange={(e) => setSettingsLogHTTPBearer(e.target.value)} placeholder={settings?.hasLogHTTPBearer ? 'Stored. Enter only to rotate token' : 'Bearer token'} />
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>TCP JSON Delivery</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Enabled</label>
+                            <label className="check"><input type="checkbox" checked={!!settingsLogServers.tcpJson.enabled} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, enabled: e.target.checked } }))} /> Forward NDJSON over TCP</label>
+                          </div>
+                          <div className="field">
+                            <label>Address (host:port)</label>
+                            <input value={settingsLogServers.tcpJson.address} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, address: e.target.value } }))} placeholder="192.168.1.224:5514" />
+                          </div>
+                          <div className="field">
+                            <label>Timeout (seconds)</label>
+                            <input type="number" min={1} max={30} value={String(settingsLogServers.tcpJson.timeoutSec || 3)} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, timeoutSec: Number(e.target.value) || 3 } }))} />
+                          </div>
+                          <div className="field">
+                            <label>Minimum Level</label>
+                            <select value={settingsLogServers.tcpJson.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
+                              <option value="info">info</option>
+                              <option value="warn">warn</option>
+                              <option value="error">error</option>
+                            </select>
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+                  {settingsTab === 'advanced' ? (
+                    <div className="muted">
+                      Runtime settings are persisted in SQLite and applied by the service runtime. Use `Reload Service` after updates that affect edge behavior.
+                    </div>
+                  ) : null}
                   <div className="row">
                     <button className="btn" onClick={saveSettings} disabled={loading}>Save Settings</button>
                     <button className="btn" onClick={reloadService} disabled={loading}>Reload Service</button>
+                    <button className="btn" onClick={loadTimeSyncStatus} disabled={loading}>Check Time Sync</button>
                   </div>
                   {settingsMessage ? <div className="muted">{settingsMessage}</div> : null}
                 </section>
               </div>
-              <aside className="entity-side">
-                <section className="card">
-                  <div className="card-head"><h3>Environment Snapshot</h3></div>
-                  <div className="metric-grid">
-                    <MetricTile label="Cloudflare Token" value={settings?.hasCloudflareToken ? 'set' : 'missing'} hint="Global API token state" />
-                    <MetricTile label="ACME Mode" value={settingsAcmeStaging ? 'staging' : 'production'} hint="Certificate endpoint" />
-                    <MetricTile label="Public IPv4" value={settingsPublicIPv4 || settings?.publicIpv4 || '-'} hint="Preferred outbound target" />
-                    <MetricTile label="Base Domain" value={settingsBaseDomain || settings?.baseDomain || '-'} hint="Used for admin endpoint" />
-                    <MetricTile label="Admin Endpoint" value={settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '-')} hint="Control plane hostname" />
-                    <MetricTile label="Style Profile" value={settingsStyleProfile} hint="UI palette preset" />
-                  </div>
-                </section>
-                <section className="card">
-                  <div className="card-head"><h3>Raw Settings</h3></div>
-                  <pre>{JSON.stringify(settings, null, 2)}</pre>
-                </section>
-              </aside>
             </section>
           ) : null}
 
@@ -3510,7 +3798,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
                       <tr key={`ti-blocked-${b.ip}`}>
                         <td><code>{b.ip}</code></td>
                         <td>{b.reason || '-'}</td>
-                        <td className="muted">{b.history || '-'}</td>
+                        <td className="muted">{humanizeThreatDecisionText(b.history || '') || '-'}</td>
                         <td>{b.totalHits || 0}</td>
                         <td>{b.distinctFeeds || 0}</td>
                         <td>{b.distinctHosts || 0}</td>
@@ -3603,6 +3891,8 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
           mask-composite: intersect;
         }
         .menu { display:grid; gap:.25rem; padding:0 .5rem; }
+        .menu-group { display:grid; gap:.25rem; margin-bottom:.35rem; }
+        .menu-title { color:var(--text-dim); font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; padding:.35rem .9rem .15rem; }
         .menu button { text-align:left; background:transparent; border:1px solid transparent; color:var(--text-dim); padding:.85rem 1rem; border-radius:10px; cursor:pointer; }
         .menu button:hover, .menu button.active { background:var(--accent-soft); color:var(--accent); }
         .main { padding:2.5rem 3rem; }
@@ -3614,6 +3904,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .kpi-row { display:grid; gap:1rem; grid-template-columns:repeat(4,minmax(0,1fr)); }
         .dashboard-layout { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
         .dashboard-main { display:grid; gap:1rem; }
+        .dashboard-side { display:grid; gap:1rem; min-width:0; }
         .entity-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
         .entity-main { display:grid; gap:1rem; }
         .entity-side { display:grid; gap:1rem; }
@@ -3656,9 +3947,9 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .gauge-title { font-size:.82rem; text-align:center; }
         .gauge-sub { font-size:.74rem; color:var(--text-dim); text-align:center; }
         .metric-grid { display:grid; gap:.8rem; grid-template-columns:repeat(2,minmax(0,1fr)); }
-        .metric-tile { background:var(--panel); border:1px solid var(--border); border-radius:11px; padding:.75rem; }
+        .metric-tile { background:var(--panel); border:1px solid var(--border); border-radius:11px; padding:.75rem; min-width:0; }
         .metric-label { color:var(--text-dim); font-size:.78rem; margin-bottom:.35rem; }
-        .metric-value { font-size:1.4rem; font-weight:700; line-height:1; margin-bottom:.25rem; }
+        .metric-value { font-size:1.2rem; font-weight:700; line-height:1.2; margin-bottom:.25rem; overflow-wrap:anywhere; word-break:break-word; }
         .metric-hint { color:var(--text-dim); font-size:.75rem; }
         .event-list { display:grid; gap:.55rem; max-height:360px; overflow:auto; }
         .event-item { padding:.55rem .6rem; border:1px solid var(--border); border-radius:9px; background:var(--panel); }
@@ -3701,6 +3992,9 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .btn.danger:hover { background:#991b1b; }
         .btn:disabled { opacity:.6; cursor:not-allowed; }
         .row { display:flex; gap:.6rem; flex-wrap:wrap; margin-bottom:.8rem; }
+        .field { display:grid; gap:.35rem; margin-bottom:.8rem; min-width:0; }
+        .field > label { font-size:.78rem; color:var(--text-dim); letter-spacing:.02em; }
+        .field-grid { display:grid; gap:.6rem; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); margin-bottom:.8rem; }
         input, select, textarea { background:var(--input-bg); border:1px solid var(--border); color:var(--text); border-radius:9px; padding:.6rem .75rem; }
         textarea { min-height:6rem; width:100%; }
         .wizard-steps { display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap; }
@@ -3786,9 +4080,12 @@ function threatDecisionBadge(decision: string): { cls: 'ok' | 'warn' | 'err'; la
   if (d === 'soft_block_active') return { cls: 'warn', label: 'Soft active' };
   if (d === 'hard_block_set') return { cls: 'err', label: 'Hard set' };
   if (d === 'hard_block_permanent') return { cls: 'err', label: 'Hard active' };
-  if (d.includes('hard') || d.includes('block')) return { cls: 'err', label: decision || 'Block' };
-  if (d.includes('soft') || d.includes('check')) return { cls: 'warn', label: decision || 'Soft' };
-  return { cls: 'ok', label: decision || 'Monitor' };
+  if (d.includes('hard')) return { cls: 'err', label: 'Hard' };
+  if (d.includes('soft')) return { cls: 'warn', label: 'Soft' };
+  if (d.includes('block')) return { cls: 'err', label: 'Block' };
+  if (d.includes('check')) return { cls: 'warn', label: 'Check' };
+  if (d.includes('monitor') || d.includes('observe')) return { cls: 'ok', label: 'Monitor' };
+  return { cls: 'ok', label: 'Other' };
 }
 
 function threatDecisionList(decisions: string): string[] {
@@ -3803,6 +4100,17 @@ function threatDecisionList(decisions: string): string[] {
     out.push(d);
   }
   return out.length > 0 ? out : ['monitor_observe'];
+}
+
+function humanizeThreatDecisionText(input: string): string {
+  let s = (input || '').trim();
+  if (!s) return '';
+  s = s.replaceAll('monitor_observe', 'Monitor');
+  s = s.replaceAll('soft_block_set', 'Soft set');
+  s = s.replaceAll('soft_block_active', 'Soft active');
+  s = s.replaceAll('hard_block_set', 'Hard set');
+  s = s.replaceAll('hard_block_permanent', 'Hard active');
+  return s;
 }
 
 function classifyAuditLevel(action: string, target: string): 'critical' | 'warn' | 'info' {

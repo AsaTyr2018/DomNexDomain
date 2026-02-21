@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -19,7 +20,9 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db          *sql.DB
+	hookMu      sync.RWMutex
+	auditHookFn func(model.AuditEvent)
 }
 
 func Open(path string) (*Store, error) {
@@ -37,6 +40,12 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) SetAuditHook(fn func(model.AuditEvent)) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.auditHookFn = fn
+}
 
 func (s *Store) migrate(ctx context.Context) error {
 	const schema = `
@@ -786,6 +795,11 @@ ON CONFLICT(key_name) DO UPDATE SET enc_value=excluded.enc_value, updated_at=exc
 	return err
 }
 
+func (s *Store) DeleteSecret(ctx context.Context, keyName string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM secrets WHERE key_name=?`, keyName)
+	return err
+}
+
 func (s *Store) GetSecret(ctx context.Context, keyName string) (string, error) {
 	var v string
 	err := s.db.QueryRowContext(ctx, `SELECT enc_value FROM secrets WHERE key_name=?`, keyName).Scan(&v)
@@ -793,7 +807,19 @@ func (s *Store) GetSecret(ctx context.Context, keyName string) (string, error) {
 }
 
 func (s *Store) AddAuditEvent(ctx context.Context, e model.AuditEvent) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO audit_events(actor, action, target, meta, created_at) VALUES(?,?,?,?,?)`, e.Actor, e.Action, e.Target, e.Meta, time.Now().UTC().Format(time.RFC3339Nano))
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO audit_events(actor, action, target, meta, created_at) VALUES(?,?,?,?,?)`, e.Actor, e.Action, e.Target, e.Meta, now.Format(time.RFC3339Nano))
+	if err != nil {
+		return err
+	}
+	e.CreatedAt = now
+	e.SourceIP = parseSourceFromMeta(e.Meta)
+	s.hookMu.RLock()
+	hook := s.auditHookFn
+	s.hookMu.RUnlock()
+	if hook != nil {
+		hook(e)
+	}
 	return err
 }
 
@@ -1632,9 +1658,15 @@ ON CONFLICT(url) DO UPDATE SET
 
 func (s *Store) GetThreatIntelConfig(ctx context.Context) (model.ThreatIntelConfig, error) {
 	cfg := model.ThreatIntelConfig{
-		Enabled:   false,
-		Mode:      "monitor_only",
-		SyncHours: 24,
+		Enabled:          false,
+		Mode:             "monitor_only",
+		SyncHours:        24,
+		EventMinHits:     2,
+		OffenderMinHits:  10,
+		MonitorMaxLevel:  2,
+		SoftMinLevel:     3,
+		HardLevel:        6,
+		SoftBlockMinutes: 15,
 	}
 	if v, err := s.GetSetting(ctx, "threatintel.enabled"); err == nil {
 		cfg.Enabled = strings.EqualFold(strings.TrimSpace(v), "true")
@@ -1655,6 +1687,45 @@ func (s *Store) GetThreatIntelConfig(ctx context.Context) (model.ThreatIntelConf
 			cfg.SyncHours = n
 		}
 	}
+	if v, err := s.GetSetting(ctx, "threatintel.event_min_hits"); err == nil {
+		if n, nErr := strconv.Atoi(strings.TrimSpace(v)); nErr == nil && n >= 1 && n <= 100 {
+			cfg.EventMinHits = n
+		}
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.offender_min_hits"); err == nil {
+		if n, nErr := strconv.Atoi(strings.TrimSpace(v)); nErr == nil && n >= 2 && n <= 10000 {
+			cfg.OffenderMinHits = n
+		}
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.monitor_max_level"); err == nil {
+		if n, nErr := strconv.Atoi(strings.TrimSpace(v)); nErr == nil && n >= 0 && n <= 32 {
+			cfg.MonitorMaxLevel = n
+		}
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.soft_min_level"); err == nil {
+		if n, nErr := strconv.Atoi(strings.TrimSpace(v)); nErr == nil && n >= 1 && n <= 32 {
+			cfg.SoftMinLevel = n
+		}
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.hard_level"); err == nil {
+		if n, nErr := strconv.Atoi(strings.TrimSpace(v)); nErr == nil && n >= 2 && n <= 64 {
+			cfg.HardLevel = n
+		}
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.soft_block_minutes"); err == nil {
+		if n, nErr := strconv.Atoi(strings.TrimSpace(v)); nErr == nil && n >= 1 && n <= 24*60 {
+			cfg.SoftBlockMinutes = n
+		}
+	}
+	if cfg.OffenderMinHits <= cfg.EventMinHits {
+		cfg.OffenderMinHits = cfg.EventMinHits + 1
+	}
+	if cfg.SoftMinLevel <= cfg.MonitorMaxLevel {
+		cfg.SoftMinLevel = cfg.MonitorMaxLevel + 1
+	}
+	if cfg.HardLevel <= cfg.SoftMinLevel {
+		cfg.HardLevel = cfg.SoftMinLevel + 1
+	}
 	return cfg, nil
 }
 
@@ -1674,13 +1745,52 @@ func (s *Store) SetThreatIntelConfig(ctx context.Context, cfg model.ThreatIntelC
 	if cfg.SyncHours > 168 {
 		cfg.SyncHours = 168
 	}
+	if cfg.EventMinHits <= 0 {
+		cfg.EventMinHits = 2
+	}
+	if cfg.OffenderMinHits <= cfg.EventMinHits {
+		cfg.OffenderMinHits = cfg.EventMinHits + 1
+	}
+	if cfg.MonitorMaxLevel < 0 {
+		cfg.MonitorMaxLevel = 0
+	}
+	if cfg.SoftMinLevel <= cfg.MonitorMaxLevel {
+		cfg.SoftMinLevel = cfg.MonitorMaxLevel + 1
+	}
+	if cfg.HardLevel <= cfg.SoftMinLevel {
+		cfg.HardLevel = cfg.SoftMinLevel + 1
+	}
+	if cfg.SoftBlockMinutes <= 0 {
+		cfg.SoftBlockMinutes = 15
+	}
+	if cfg.SoftBlockMinutes > 24*60 {
+		cfg.SoftBlockMinutes = 24 * 60
+	}
 	if err := s.SetSetting(ctx, "threatintel.enabled", strconv.FormatBool(cfg.Enabled)); err != nil {
 		return err
 	}
 	if err := s.SetSetting(ctx, "threatintel.mode", mode); err != nil {
 		return err
 	}
-	return s.SetSetting(ctx, "threatintel.sync_hours", strconv.Itoa(cfg.SyncHours))
+	if err := s.SetSetting(ctx, "threatintel.sync_hours", strconv.Itoa(cfg.SyncHours)); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, "threatintel.event_min_hits", strconv.Itoa(cfg.EventMinHits)); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, "threatintel.offender_min_hits", strconv.Itoa(cfg.OffenderMinHits)); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, "threatintel.monitor_max_level", strconv.Itoa(cfg.MonitorMaxLevel)); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, "threatintel.soft_min_level", strconv.Itoa(cfg.SoftMinLevel)); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, "threatintel.hard_level", strconv.Itoa(cfg.HardLevel)); err != nil {
+		return err
+	}
+	return s.SetSetting(ctx, "threatintel.soft_block_minutes", strconv.Itoa(cfg.SoftBlockMinutes))
 }
 
 func (s *Store) PromoteThreatIntelHardBlocks(ctx context.Context, hardLevel int) (int64, error) {
@@ -2027,17 +2137,75 @@ ON CONFLICT(ip) DO UPDATE SET
 	return err
 }
 
-func (s *Store) ListThreatIntelMatches(ctx context.Context, since time.Time, decision, q string, limit, offset int) ([]model.ThreatIntelMatch, int64, error) {
+func (s *Store) ListThreatIntelIPStates(ctx context.Context, limit int) ([]model.ThreatIntelIPState, error) {
+	if limit <= 0 || limit > 50000 {
+		limit = 10000
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT ip, xp, level, risk_state, ban_until, perm_block, temp_block_count, last_seen_at, top_signal, signal_counts
+FROM threat_intel_ip_state
+ORDER BY updated_at DESC
+LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.ThreatIntelIPState{}
+	for rows.Next() {
+		var st model.ThreatIntelIPState
+		var banUntil, lastSeen, signalCounts string
+		var permBlocked int
+		if err := rows.Scan(&st.IP, &st.XP, &st.Level, &st.RiskState, &banUntil, &permBlocked, &st.TempBlockCount, &lastSeen, &st.TopSignal, &signalCounts); err != nil {
+			return nil, err
+		}
+		st.PermBlocked = permBlocked != 0
+		st.BanUntil = parseTimeOrZero(banUntil)
+		st.LastSeenAt = parseTimeOrZero(lastSeen)
+		st.SignalCounts = map[string]int{}
+		if strings.TrimSpace(signalCounts) != "" {
+			_ = json.Unmarshal([]byte(signalCounts), &st.SignalCounts)
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteThreatIntelState(ctx context.Context, ip string) error {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM threat_intel_ip_state WHERE ip=?`, ip)
+	return err
+}
+
+func (s *Store) DeleteThreatIntelMatchesByIP(ctx context.Context, ip string) error {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM threat_intel_matches WHERE ip=?`, ip)
+	return err
+}
+
+func (s *Store) ListThreatIntelMatches(ctx context.Context, since time.Time, decision, q string, eventMinHits, offenderMinHits, limit, offset int) ([]model.ThreatIntelMatch, int64, error) {
 	if limit <= 0 || limit > 5000 {
 		limit = 1000
 	}
 	if offset < 0 {
 		offset = 0
 	}
+	if eventMinHits <= 0 {
+		eventMinHits = 2
+	}
+	if offenderMinHits <= eventMinHits {
+		offenderMinHits = eventMinHits + 1
+	}
 	decision = strings.ToLower(strings.TrimSpace(decision))
 	q = strings.TrimSpace(q)
-	baseArgs := []any{since.UTC().Format(time.RFC3339Nano)}
-	where := []string{"m.last_seen_at >= ?", "m.ip NOT IN (SELECT ip FROM blocked_ips)"}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	baseArgs := []any{since.UTC().Format(time.RFC3339Nano), now}
+	where := []string{"m.last_seen_at >= ?", "m.ip NOT IN (SELECT ip FROM blocked_ips)", "(s.level > 0 OR s.xp > 0 OR (s.ban_until != '' AND s.ban_until > ?))"}
 	if decision != "" && decision != "all" {
 		where = append(where, "m.decision = ?")
 		baseArgs = append(baseArgs, decision)
@@ -2047,9 +2215,18 @@ func (s *Store) ListThreatIntelMatches(ctx context.Context, since time.Time, dec
 		like := "%" + q + "%"
 		baseArgs = append(baseArgs, like, like, like, like, like, like)
 	}
-	countQuery := `SELECT COUNT(1) FROM (SELECT m.ip FROM threat_intel_matches m WHERE ` + strings.Join(where, " AND ") + ` GROUP BY m.ip HAVING SUM(m.hits) >= 2) t`
+	countQuery := `SELECT COUNT(1) FROM (
+SELECT m.ip
+FROM threat_intel_matches m
+LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
+WHERE ` + strings.Join(where, " AND ") + `
+GROUP BY m.ip
+HAVING SUM(m.hits) >= ? AND SUM(m.hits) < ?
+) t`
 	var total int64
-	if err := s.db.QueryRowContext(ctx, countQuery, baseArgs...).Scan(&total); err != nil {
+	countArgs := append([]any{}, baseArgs...)
+	countArgs = append(countArgs, eventMinHits, offenderMinHits)
+	if err := s.db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	args := append([]any{}, baseArgs...)
@@ -2086,9 +2263,10 @@ FROM threat_intel_matches m
 LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
 WHERE ` + strings.Join(where, " AND ") + `
 GROUP BY m.ip
-HAVING SUM(m.hits) >= 2
+HAVING SUM(m.hits) >= ? AND SUM(m.hits) < ?
 ORDER BY SUM(m.hits) DESC, MAX(m.last_seen_at) DESC
 LIMIT ? OFFSET ?`
+	args = append(args, eventMinHits, offenderMinHits)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, err
@@ -2143,23 +2321,28 @@ LIMIT ?`, ip, since.UTC().Format(time.RFC3339Nano), limit)
 	return out, rows.Err()
 }
 
-func (s *Store) ListThreatIntelOffenders(ctx context.Context, since time.Time, limit, offset int) ([]model.ThreatIntelOffender, int64, error) {
+func (s *Store) ListThreatIntelOffenders(ctx context.Context, since time.Time, offenderMinHits, limit, offset int) ([]model.ThreatIntelOffender, int64, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
 	}
 	if offset < 0 {
 		offset = 0
 	}
+	if offenderMinHits <= 1 {
+		offenderMinHits = 10
+	}
 	var total int64
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := s.db.QueryRowContext(ctx, `
 SELECT COUNT(1) FROM (
   SELECT m.ip
   FROM threat_intel_matches m
   LEFT JOIN blocked_ips b ON b.ip = m.ip
-  WHERE m.last_seen_at >= ? AND b.ip IS NULL
+  LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
+  WHERE m.last_seen_at >= ? AND b.ip IS NULL AND (s.level > 0 OR s.xp > 0 OR (s.ban_until != '' AND s.ban_until > ?))
   GROUP BY m.ip
-  HAVING SUM(m.hits) > 10
-) t`, since.UTC().Format(time.RFC3339Nano)).Scan(&total); err != nil {
+  HAVING SUM(m.hits) >= ?
+) t`, since.UTC().Format(time.RFC3339Nano), now, offenderMinHits).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
@@ -2188,10 +2371,11 @@ LEFT JOIN blocked_ips b ON b.ip = m.ip
 LEFT JOIN threat_intel_allowlist a ON a.ip = m.ip
 LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
 WHERE m.last_seen_at >= ? AND b.ip IS NULL
+  AND (s.level > 0 OR s.xp > 0 OR (s.ban_until != '' AND s.ban_until > ?))
 GROUP BY m.ip, b.ip, a.ip
-HAVING SUM(m.hits) > 10
+HAVING SUM(m.hits) >= ?
 ORDER BY total_hits DESC, MAX(m.last_seen_at) DESC
-LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), limit, offset)
+LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), now, offenderMinHits, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}

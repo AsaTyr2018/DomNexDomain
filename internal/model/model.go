@@ -121,9 +121,15 @@ type SSHBastionKeyAuth struct {
 }
 
 type ThreatIntelConfig struct {
-	Enabled   bool   `json:"enabled"`
-	Mode      string `json:"mode"`
-	SyncHours int    `json:"syncHours"`
+	Enabled          bool   `json:"enabled"`
+	Mode             string `json:"mode"`
+	SyncHours        int    `json:"syncHours"`
+	EventMinHits     int    `json:"eventMinHits"`
+	OffenderMinHits  int    `json:"offenderMinHits"`
+	MonitorMaxLevel  int    `json:"monitorMaxLevel"`
+	SoftMinLevel     int    `json:"softMinLevel"`
+	HardLevel        int    `json:"hardLevel"`
+	SoftBlockMinutes int    `json:"softBlockMinutes"`
 }
 
 type ThreatIntelFeed struct {
@@ -141,10 +147,16 @@ type ThreatIntelFeed struct {
 }
 
 type ThreatIntelSnapshot struct {
-	Enabled   bool
-	Mode      string
-	Allowlist map[string]bool
-	FeedByIP  map[string][]string
+	Enabled          bool
+	Mode             string
+	EventMinHits     int
+	OffenderMinHits  int
+	MonitorMaxLevel  int
+	SoftMinLevel     int
+	HardLevel        int
+	SoftBlockMinutes int
+	Allowlist        map[string]bool
+	FeedByIP         map[string][]string
 }
 
 type ThreatIntelMatchEvent struct {

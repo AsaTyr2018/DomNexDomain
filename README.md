@@ -152,6 +152,15 @@ npm install
 npm run build
 ```
 
+Safe local publish (recommended):
+
+```bash
+cd /opt/domnexdomain
+make publish-local
+```
+
+`publish-local` enforces serial build order (`UI -> Go binary -> service restart`) and verifies the live served UI asset hash to prevent stale deploys.
+
 ### 3. Install filesystem layout
 
 ```bash

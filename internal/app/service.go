@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -21,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +45,11 @@ type Service struct {
 	log      *logx.Logger
 	publicIP string
 	backoff  map[int64]time.Time
+	logMu    sync.RWMutex
+	logCfg   LogServerSettings
+	logToken string
+	logCh    chan model.AuditEvent
+	hostName string
 	tiMu     sync.RWMutex
 	tiSnap   model.ThreatIntelSnapshot
 	tiWinMu  sync.Mutex
@@ -57,24 +64,54 @@ type tiWindow struct {
 
 const settingPublicIPv4 = "network.public_ipv4"
 const defaultThreatIntelFeedURL = "https://lists.blocklist.de/lists/all.txt"
+const (
+	settingTimeSyncMode       = "runtime.time_sync_mode"
+	settingTimeSyncLANServers = "runtime.time_sync_lan_servers"
+	settingLogServers         = "runtime.log_servers"
+)
 
 const (
-	tiMonitorMaxLevel = 2
-	tiSoftMinLevel    = 3
-	tiSoftMaxLevel    = 5
-	tiHardLevel       = 6
+	defaultTIMonitorMaxLevel  = 2
+	defaultTISoftMinLevel     = 3
+	defaultTIHardLevel        = 6
+	defaultTISoftBlockMinutes = 15
 )
 
 type RuntimeSettings struct {
-	Domain       string `json:"domain"`
-	BaseDomain   string `json:"baseDomain"`
-	AdminFQDN    string `json:"adminFqdn"`
-	ACMEEmail    string `json:"acmeEmail"`
-	ACMEStaging  bool   `json:"acmeStaging"`
-	HasCFToken   bool   `json:"hasCloudflareToken"`
-	PublicIPv4   string `json:"publicIpv4"`
-	StyleProfile string `json:"styleProfile"`
-	StyleCustom  string `json:"styleCustom"`
+	Domain             string   `json:"domain"`
+	BaseDomain         string   `json:"baseDomain"`
+	AdminFQDN          string   `json:"adminFqdn"`
+	ACMEEmail          string   `json:"acmeEmail"`
+	ACMEStaging        bool     `json:"acmeStaging"`
+	HasCFToken         bool     `json:"hasCloudflareToken"`
+	PublicIPv4         string   `json:"publicIpv4"`
+	StyleProfile       string   `json:"styleProfile"`
+	StyleCustom        string   `json:"styleCustom"`
+	TimeSyncMode       string   `json:"timeSyncMode"`
+	TimeSyncLANServers []string `json:"timeSyncLANServers"`
+	LogServers         LogServerSettings `json:"logServers"`
+	HasLogHTTPBearer   bool              `json:"hasLogHTTPBearer"`
+}
+
+type TimeSyncProbe struct {
+	Name     string `json:"name"`
+	Target   string `json:"target"`
+	OK       bool   `json:"ok"`
+	OffsetMS int64  `json:"offsetMs"`
+	RTTMS    int64  `json:"rttMs"`
+	Error    string `json:"error,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+type TimeSyncStatus struct {
+	Mode     string          `json:"mode"`
+	Healthy  bool            `json:"healthy"`
+	Severity string          `json:"severity"`
+	Summary  string          `json:"summary"`
+	Source   string          `json:"source"`
+	OffsetMS int64           `json:"offsetMs"`
+	Checked  time.Time       `json:"checkedAt"`
+	Probes   []TimeSyncProbe `json:"probes"`
 }
 
 type ManagedUser struct {
@@ -297,20 +334,39 @@ func normalizeRequestClass(class string) string {
 }
 
 func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dns.Provider, log *logx.Logger) *Service {
-	return &Service{
+	hname, _ := os.Hostname()
+	svc := &Service{
 		cfg:      cfg,
 		store:    st,
 		keystore: ks,
 		dns:      dnsProvider,
 		log:      log,
 		backoff:  map[int64]time.Time{},
+		logCfg:   defaultLogServerSettings(),
+		logCh:    make(chan model.AuditEvent, 2048),
+		hostName: strings.TrimSpace(hname),
 		tiSnap: model.ThreatIntelSnapshot{
-			Mode:      "monitor_only",
-			Allowlist: map[string]bool{},
-			FeedByIP:  map[string][]string{},
+			Mode:             "monitor_only",
+			EventMinHits:     2,
+			OffenderMinHits:  10,
+			MonitorMaxLevel:  defaultTIMonitorMaxLevel,
+			SoftMinLevel:     defaultTISoftMinLevel,
+			HardLevel:        defaultTIHardLevel,
+			SoftBlockMinutes: defaultTISoftBlockMinutes,
+			Allowlist:        map[string]bool{},
+			FeedByIP:         map[string][]string{},
 		},
 		tiWin: map[string]tiWindow{},
 	}
+	if svc.hostName == "" {
+		svc.hostName = "domnexdomain"
+	}
+	st.SetAuditHook(func(e model.AuditEvent) {
+		svc.enqueueRemoteAudit(e)
+	})
+	svc.syncLogServerSettings(context.Background())
+	go svc.runRemoteAuditDispatcher()
+	return svc
 }
 
 func (s *Service) Store() *store.Store { return s.store }
@@ -464,6 +520,8 @@ func (s *Service) GetRuntimeSettings(ctx context.Context) (RuntimeSettings, erro
 		ACMEEmail:    s.cfg.ACMEEmail,
 		ACMEStaging:  s.cfg.ACMEStaging,
 		StyleProfile: "monolith",
+		TimeSyncMode: "system_only",
+		LogServers:   defaultLogServerSettings(),
 	}
 	if v, err := s.store.GetSetting(ctx, "runtime.base_domain"); err == nil && strings.TrimSpace(v) != "" {
 		out.BaseDomain = strings.ToLower(strings.TrimSpace(v))
@@ -500,10 +558,20 @@ func (s *Service) GetRuntimeSettings(ctx context.Context) (RuntimeSettings, erro
 	if v, err := s.store.GetSetting(ctx, "runtime.style_custom"); err == nil {
 		out.StyleCustom = strings.TrimSpace(v)
 	}
+	if v, err := s.store.GetSetting(ctx, settingTimeSyncMode); err == nil && strings.TrimSpace(v) != "" {
+		out.TimeSyncMode = normalizeTimeSyncMode(v)
+	}
+	if v, err := s.store.GetSetting(ctx, settingTimeSyncLANServers); err == nil {
+		out.TimeSyncLANServers = parseTimeSyncServerList(v)
+	}
+	if cfg, _, hasToken, err := s.loadLogServerSettings(ctx); err == nil {
+		out.LogServers = cfg
+		out.HasLogHTTPBearer = hasToken
+	}
 	return out, nil
 }
 
-func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom string) error {
+func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom, timeSyncMode, timeSyncLANServers string, logServers LogServerSettings, logHTTPBearer string) error {
 	acmeEmail = strings.TrimSpace(acmeEmail)
 	if acmeEmail != "" {
 		if err := s.store.SetSetting(ctx, "acme.email", acmeEmail); err != nil {
@@ -575,6 +643,20 @@ func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acme
 	if err := s.store.SetSetting(ctx, "runtime.style_custom", styleCustom); err != nil {
 		return err
 	}
+	timeSyncMode = normalizeTimeSyncMode(timeSyncMode)
+	lanServers := parseTimeSyncServerList(timeSyncLANServers)
+	if timeSyncMode == "external_lan" && len(lanServers) == 0 {
+		return fmt.Errorf("at least one LAN NTP server is required for external_lan mode")
+	}
+	if err := s.store.SetSetting(ctx, settingTimeSyncMode, timeSyncMode); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingTimeSyncLANServers, strings.Join(lanServers, ",")); err != nil {
+		return err
+	}
+	if err := s.applyLogServerSettings(ctx, logServers, logHTTPBearer); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -591,6 +673,210 @@ func (s *Service) GetStyleSettings(ctx context.Context) (string, string, error) 
 		custom = strings.TrimSpace(v)
 	}
 	return profile, custom, nil
+}
+
+func normalizeTimeSyncMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "system_only", "external_public", "external_lan":
+		return strings.ToLower(strings.TrimSpace(v))
+	default:
+		return "system_only"
+	}
+}
+
+func parseTimeSyncServerList(raw string) []string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	})
+	seen := map[string]bool{}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(strings.ToLower(p))
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func (s *Service) GetTimeSyncStatus(ctx context.Context) (TimeSyncStatus, error) {
+	mode := "system_only"
+	if v, err := s.store.GetSetting(ctx, settingTimeSyncMode); err == nil && strings.TrimSpace(v) != "" {
+		mode = normalizeTimeSyncMode(v)
+	}
+	status := TimeSyncStatus{
+		Mode:    mode,
+		Checked: time.Now().UTC(),
+	}
+	switch mode {
+	case "external_public":
+		return s.checkExternalNTP(ctx, mode, []string{"time.cloudflare.com", "time.google.com", "time.apple.com"}), nil
+	case "external_lan":
+		lan := []string{}
+		if v, err := s.store.GetSetting(ctx, settingTimeSyncLANServers); err == nil {
+			lan = parseTimeSyncServerList(v)
+		}
+		if len(lan) == 0 {
+			status.Severity = "critical"
+			status.Summary = "No LAN NTP server configured."
+			return status, nil
+		}
+		return s.checkExternalNTP(ctx, mode, lan), nil
+	default:
+		return s.checkSystemClock(ctx), nil
+	}
+}
+
+func (s *Service) checkSystemClock(ctx context.Context) TimeSyncStatus {
+	status := TimeSyncStatus{
+		Mode:     "system_only",
+		Checked:  time.Now().UTC(),
+		Severity: "critical",
+		Summary:  "System clock sync status unknown.",
+	}
+	p := TimeSyncProbe{Name: "system_clock", Target: "timedatectl"}
+	cmd := exec.CommandContext(ctx, "timedatectl", "show", "-p", "NTPSynchronized", "-p", "SystemClockSynchronized", "-p", "NTPService")
+	out, err := cmd.Output()
+	if err != nil {
+		p.OK = false
+		p.Error = err.Error()
+		status.Probes = []TimeSyncProbe{p}
+		status.Source = "timedatectl"
+		status.Summary = "Unable to read system NTP sync state."
+		return status
+	}
+	kv := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.Contains(line, "=") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		kv[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+	}
+	ntpOK := strings.EqualFold(kv["NTPSynchronized"], "yes")
+	sysOK := strings.EqualFold(kv["SystemClockSynchronized"], "yes")
+	p.OK = ntpOK || sysOK
+	p.Detail = "NTPSynchronized=" + kv["NTPSynchronized"] + ";SystemClockSynchronized=" + kv["SystemClockSynchronized"]
+	status.Probes = []TimeSyncProbe{p}
+	status.Source = strings.TrimSpace(kv["NTPService"])
+	if status.Source == "" {
+		status.Source = "system"
+	}
+	if p.OK {
+		status.Healthy = true
+		status.Severity = "ok"
+		status.Summary = "System clock is synchronized."
+	} else {
+		status.Healthy = false
+		status.Severity = "critical"
+		status.Summary = "System clock is not synchronized."
+	}
+	return status
+}
+
+func (s *Service) checkExternalNTP(ctx context.Context, mode string, servers []string) TimeSyncStatus {
+	status := TimeSyncStatus{
+		Mode:    mode,
+		Checked: time.Now().UTC(),
+	}
+	offsets := make([]int64, 0, len(servers))
+	success := 0
+	probes := make([]TimeSyncProbe, 0, len(servers))
+	for _, server := range servers {
+		p := probeNTPServer(ctx, server)
+		probes = append(probes, p)
+		if p.OK {
+			success++
+			offsets = append(offsets, p.OffsetMS)
+		}
+	}
+	status.Probes = probes
+	status.Source = "ntp"
+	required := 1
+	if mode == "external_public" {
+		required = 2
+	}
+	if success < required || len(offsets) == 0 {
+		status.Healthy = false
+		status.Severity = "critical"
+		status.Summary = "NTP check failed or insufficient successful probes."
+		return status
+	}
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+	median := offsets[len(offsets)/2]
+	status.OffsetMS = median
+	abs := median
+	if abs < 0 {
+		abs = -abs
+	}
+	if abs >= 5000 {
+		status.Healthy = false
+		status.Severity = "critical"
+		status.Summary = "Clock drift is critical (" + strconv.FormatInt(median, 10) + "ms)."
+		return status
+	}
+	if abs >= 1000 {
+		status.Healthy = true
+		status.Severity = "warn"
+		status.Summary = "Clock drift warning (" + strconv.FormatInt(median, 10) + "ms)."
+		return status
+	}
+	status.Healthy = true
+	status.Severity = "ok"
+	status.Summary = "Clock drift within safe range (" + strconv.FormatInt(median, 10) + "ms)."
+	return status
+}
+
+func probeNTPServer(ctx context.Context, server string) TimeSyncProbe {
+	p := TimeSyncProbe{Name: "ntp", Target: server}
+	target := strings.TrimSpace(server)
+	if target == "" {
+		p.Error = "empty target"
+		return p
+	}
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		target = net.JoinHostPort(target, "123")
+	}
+	var d net.Dialer
+	d.Timeout = 2 * time.Second
+	conn, err := d.DialContext(ctx, "udp", target)
+	if err != nil {
+		p.Error = err.Error()
+		return p
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	req := make([]byte, 48)
+	req[0] = 0x1B
+	t0 := time.Now()
+	if _, err := conn.Write(req); err != nil {
+		p.Error = err.Error()
+		return p
+	}
+	resp := make([]byte, 48)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		p.Error = err.Error()
+		return p
+	}
+	t1 := time.Now()
+	secs := binary.BigEndian.Uint32(resp[40:44])
+	frac := binary.BigEndian.Uint32(resp[44:48])
+	const ntpUnixOffset = 2208988800
+	if secs < ntpUnixOffset {
+		p.Error = "invalid ntp timestamp"
+		return p
+	}
+	unixSec := int64(secs) - ntpUnixOffset
+	nsec := (int64(frac) * 1e9) >> 32
+	serverTime := time.Unix(unixSec, nsec)
+	mid := t0.Add(t1.Sub(t0) / 2)
+	p.OK = true
+	p.OffsetMS = serverTime.Sub(mid).Milliseconds()
+	p.RTTMS = t1.Sub(t0).Milliseconds()
+	return p
 }
 
 func (s *Service) ensureAdminHostForDomain(ctx context.Context, domainName string) error {
@@ -1488,7 +1774,12 @@ func (s *Service) GetHostsDiagnostics(ctx context.Context) ([]HostDiagnostic, er
 	}
 	out := make([]HostDiagnostic, 0, len(hosts))
 	for _, h := range hosts {
-		d := s.diagnoseHost(ctx, h.FQDN)
+		probeEnabled := true
+		switch strings.ToLower(strings.TrimSpace(h.State)) {
+		case "disabled", "maintenance":
+			probeEnabled = false
+		}
+		d := s.diagnoseHost(ctx, h.FQDN, probeEnabled)
 		if h.HAEnabled && len(h.HABackends) > 0 {
 			d.HAEnabled = true
 			d.HAMode = h.HAMode
@@ -1769,7 +2060,7 @@ func parseIPv4(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
-func (s *Service) diagnoseHost(ctx context.Context, fqdn string) HostDiagnostic {
+func (s *Service) diagnoseHost(ctx context.Context, fqdn string, probeEnabled bool) HostDiagnostic {
 	d := HostDiagnostic{FQDN: fqdn}
 	rctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
@@ -1782,6 +2073,12 @@ func (s *Service) diagnoseHost(ctx context.Context, fqdn string) HostDiagnostic 
 		}
 	} else {
 		d.Error = "dns: unresolved (" + err.Error() + ")"
+	}
+	if !probeEnabled {
+		if d.Error == "" {
+			d.Error = "probes skipped (host state disables active checks)"
+		}
+		return d
 	}
 
 	primaryIP := ""
@@ -2270,7 +2567,7 @@ func (s *Service) SetThreatIntelConfig(ctx context.Context, cfg model.ThreatInte
 		return err
 	}
 	if cfg.Enabled && cfg.Mode == "auto_mode" {
-		if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, tiHardLevel); err != nil {
+		if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, cfg.HardLevel); err != nil {
 			s.log.Warn("threat intel hard-block reconcile failed", map[string]any{"err": err.Error()})
 		}
 	}
@@ -2396,7 +2693,7 @@ func (s *Service) RefreshThreatIntelSnapshot(ctx context.Context) (model.ThreatI
 		return model.ThreatIntelSnapshot{}, err
 	}
 	if cfg.Enabled && normalizeThreatIntelMode(cfg.Mode) == "auto_mode" {
-		if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, tiHardLevel); err != nil {
+		if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, cfg.HardLevel); err != nil {
 			s.log.Warn("threat intel hard-block reconcile failed", map[string]any{"err": err.Error()})
 		}
 	}
@@ -2413,10 +2710,16 @@ func (s *Service) RefreshThreatIntelSnapshot(ctx context.Context) (model.ThreatI
 		allow[strings.TrimSpace(b.IP)] = true
 	}
 	snap := model.ThreatIntelSnapshot{
-		Enabled:   cfg.Enabled,
-		Mode:      normalizeThreatIntelMode(cfg.Mode),
-		Allowlist: allow,
-		FeedByIP:  feedByIP,
+		Enabled:          cfg.Enabled,
+		Mode:             normalizeThreatIntelMode(cfg.Mode),
+		EventMinHits:     cfg.EventMinHits,
+		OffenderMinHits:  cfg.OffenderMinHits,
+		MonitorMaxLevel:  cfg.MonitorMaxLevel,
+		SoftMinLevel:     cfg.SoftMinLevel,
+		HardLevel:        cfg.HardLevel,
+		SoftBlockMinutes: cfg.SoftBlockMinutes,
+		Allowlist:        allow,
+		FeedByIP:         feedByIP,
 	}
 	s.tiMu.Lock()
 	s.tiSnap = snap
@@ -2425,12 +2728,6 @@ func (s *Service) RefreshThreatIntelSnapshot(ctx context.Context) (model.ThreatI
 }
 
 func (s *Service) GetThreatIntelSnapshot(ctx context.Context) (model.ThreatIntelSnapshot, error) {
-	s.tiMu.RLock()
-	snap := s.tiSnap
-	s.tiMu.RUnlock()
-	if snap.FeedByIP != nil && snap.Allowlist != nil {
-		return snap, nil
-	}
 	return s.RefreshThreatIntelSnapshot(ctx)
 }
 
@@ -2447,6 +2744,25 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 	in.Mode = normalizeThreatIntelMode(in.Mode)
 	if in.Mode == "" {
 		in.Mode = "monitor_only"
+	}
+	tiCfg, _ := s.GetThreatIntelConfig(ctx)
+	hardLevel := tiCfg.HardLevel
+	if hardLevel <= 0 {
+		hardLevel = defaultTIHardLevel
+	}
+	softMinLevel := tiCfg.SoftMinLevel
+	if softMinLevel <= 0 {
+		softMinLevel = defaultTISoftMinLevel
+	}
+	if softMinLevel >= hardLevel {
+		softMinLevel = hardLevel - 1
+	}
+	if softMinLevel < 1 {
+		softMinLevel = 1
+	}
+	softBlockMinutes := tiCfg.SoftBlockMinutes
+	if softBlockMinutes <= 0 {
+		softBlockMinutes = defaultTISoftBlockMinutes
 	}
 	now := time.Now().UTC()
 
@@ -2478,20 +2794,20 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 	}
 	for {
 		req := threatLevelThreshold(st.Level)
-		if st.Level >= tiHardLevel || st.XP < req {
+		if st.Level >= hardLevel || st.XP < req {
 			break
 		}
 		st.XP -= req
 		st.Level++
 	}
 	// Keep XP bounded once max level is reached so UI/analytics scales remain stable.
-	if st.Level >= tiHardLevel {
-		maxXP := threatLevelThreshold(tiHardLevel)
+	if st.Level >= hardLevel {
+		maxXP := threatLevelThreshold(hardLevel)
 		if st.XP > maxXP {
 			st.XP = maxXP
 		}
 	}
-	st.RiskState = threatRiskState(st.Level)
+	st.RiskState = threatRiskState(st.Level, softMinLevel, hardLevel)
 	st.LastSeenAt = now
 	if st.PermBlocked {
 		res.Blocked = true
@@ -2505,22 +2821,16 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 	if !res.Blocked {
 		switch in.Mode {
 		case "auto_mode":
-			if st.Level >= tiHardLevel {
+			if st.Level >= hardLevel {
 				st.PermBlocked = true
 				st.BanUntil = time.Time{}
 				res.Blocked = true
 				res.HardBlock = true
 				res.Decision = "hard_block_set"
 				_ = s.store.UpsertBlockedIP(ctx, in.IP, "threat_intel_auto:"+topSignal)
-			} else if st.Level >= tiSoftMinLevel {
+			} else if st.Level >= softMinLevel {
 				st.TempBlockCount++
-				d := 15 * time.Minute
-				if st.TempBlockCount == 2 {
-					d = 30 * time.Minute
-				}
-				if st.TempBlockCount >= 3 {
-					d = 60 * time.Minute
-				}
+				d := time.Duration(softBlockMinutes) * time.Minute
 				st.BanUntil = now.Add(d)
 				res.Blocked = true
 				res.BanUntil = st.BanUntil
@@ -2691,11 +3001,11 @@ func threatLevelThreshold(level int) int {
 	return int(math.Round(10 * math.Pow(1.6, float64(level))))
 }
 
-func threatRiskState(level int) string {
+func threatRiskState(level, softMinLevel, hardLevel int) string {
 	switch {
-	case level >= tiHardLevel:
+	case level >= hardLevel:
 		return "hardblock"
-	case level >= tiSoftMinLevel:
+	case level >= softMinLevel:
 		return "softblock"
 	default:
 		return "monitoring"
@@ -2705,9 +3015,6 @@ func threatRiskState(level int) string {
 func threatTier(level int) string {
 	if level < 0 {
 		level = 0
-	}
-	if level > tiHardLevel {
-		level = tiHardLevel
 	}
 	return "tier" + strconv.Itoa(level)
 }
@@ -2730,7 +3037,8 @@ func (s *Service) ListThreatIntelMatches(ctx context.Context, hours int, decisio
 	}
 	offset := (page - 1) * pageSize
 	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
-	items, total, err := s.store.ListThreatIntelMatches(ctx, since, decision, q, pageSize, offset)
+	cfg, _ := s.store.GetThreatIntelConfig(ctx)
+	items, total, err := s.store.ListThreatIntelMatches(ctx, since, decision, q, cfg.EventMinHits, cfg.OffenderMinHits, pageSize, offset)
 	if err != nil {
 		return ThreatIntelMatchesPage{}, err
 	}
@@ -2759,7 +3067,8 @@ func (s *Service) ListThreatIntelOffenders(ctx context.Context, hours int, page,
 		shortHours = 6
 	}
 	since := time.Now().UTC().Add(-time.Duration(shortHours) * time.Hour)
-	items, total, err := s.store.ListThreatIntelOffenders(ctx, since, pageSize, offset)
+	cfg, _ := s.store.GetThreatIntelConfig(ctx)
+	items, total, err := s.store.ListThreatIntelOffenders(ctx, since, cfg.OffenderMinHits, pageSize, offset)
 	if err != nil {
 		return ThreatIntelOffendersPage{}, err
 	}
@@ -2826,13 +3135,29 @@ func (s *Service) RemoveThreatIntelAllowIP(ctx context.Context, ip string) error
 }
 
 func (s *Service) StartThreatIntelSync(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
+	syncTicker := time.NewTicker(1 * time.Hour)
+	decayTicker := time.NewTicker(5 * time.Minute)
+	defer syncTicker.Stop()
+	defer decayTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-decayTicker.C:
+			rehab, err := s.ReconcileThreatIntelDecay(ctx)
+			if err != nil {
+				s.log.Warn("threat intel decay reconcile failed", map[string]any{"err": err.Error()})
+				continue
+			}
+			if rehab > 0 {
+				_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
+					Actor:  "system",
+					Action: "threatintel.rehabilitated.cleanup",
+					Target: "threat-intel",
+					Meta:   "count=" + strconv.Itoa(rehab),
+				})
+			}
+		case <-syncTicker.C:
 			cfg, err := s.store.GetThreatIntelConfig(ctx)
 			if err != nil || !cfg.Enabled {
 				continue
@@ -2860,6 +3185,49 @@ func (s *Service) StartThreatIntelSync(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
+	states, err := s.store.ListThreatIntelIPStates(ctx, 20000)
+	if err != nil {
+		return 0, err
+	}
+	allowEntries, err := s.store.ListThreatIntelAllowIPs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	allow := map[string]bool{}
+	for _, a := range allowEntries {
+		allow[strings.TrimSpace(a.IP)] = true
+	}
+	now := time.Now().UTC()
+	rehab := 0
+	for _, st := range states {
+		if st.IP == "" {
+			continue
+		}
+		decayThreatState(&st, now)
+		if !st.BanUntil.IsZero() && !st.BanUntil.After(now) {
+			st.BanUntil = time.Time{}
+		}
+		// If an IP has fully cooled down, drop it from active threat state/history.
+		if st.XP <= 0 && !st.PermBlocked && st.BanUntil.IsZero() {
+			st.XP = 0
+			st.Level = 0
+			st.RiskState = "monitoring"
+			st.TempBlockCount = 0
+			if !allow[st.IP] {
+				_ = s.store.DeleteThreatIntelMatchesByIP(ctx, st.IP)
+				_ = s.store.DeleteThreatIntelState(ctx, st.IP)
+				rehab++
+				continue
+			}
+		}
+		if err := s.store.UpsertThreatIntelIPState(ctx, st); err != nil {
+			s.log.Warn("threat intel state reconcile failed", map[string]any{"ip": st.IP, "err": err.Error()})
+		}
+	}
+	return rehab, nil
 }
 
 func (s *Service) IsIPBlocked(ctx context.Context, ip string) (bool, error) {
