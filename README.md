@@ -1,10 +1,8 @@
-# DomNexDomain
+<img width="999" height="442" alt="logo" src="https://github.com/user-attachments/assets/71b5ed38-e6c8-4e2a-a9b5-dac75e1144c9" />
 
 Build and run secure public self-hosting with one hardened edge control plane: proxy, TLS, DNS automation, access control, and observability in a single Linux service.
 
 DomNexDomain combines reverse proxying, TLS automation, DNS automation, RBAC, API tokens, audit logging, and Web UI/API management in a single process.
-
-<img width="1906" height="814" alt="grafik" src="https://github.com/user-attachments/assets/8b9b1547-dc8d-4b60-a21c-c1f4562cbdc7" />
 
 ## Why DomNexDomain
 
@@ -353,3 +351,10 @@ Use it for endpoint descriptions, permission context, and ready-to-run request e
   ]
 }
 ```
+
+## Screenshots
+
+<img width="1900" height="840" alt="grafik" src="https://github.com/user-attachments/assets/cbf69637-7f7c-4306-8853-ee10099a4898" />
+<img width="1905" height="882" alt="grafik" src="https://github.com/user-attachments/assets/c2548fa2-4cf7-485f-b562-e9bf0dd1fd82" />
+<img width="1910" height="782" alt="grafik" src="https://github.com/user-attachments/assets/7bea719c-811b-4ee0-a235-2d32cb9ab173" />
+<img width="1904" height="825" alt="grafik" src="https://github.com/user-attachments/assets/835b045c-4019-4150-982f-9582538612d3" />
