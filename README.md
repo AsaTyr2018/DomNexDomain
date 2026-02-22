@@ -26,7 +26,7 @@ It assumes your edge is reachable from the internet on the intended entry points
 
 Two official operations profiles help teams ramp from simple to hardened setups:
 
-- `Quickstart Gate` (default): TLS, admin CIDR gate, baseline threat controls, single upstream, logs enabled.
+- `Quickstart Gate` (default): TLS, per-user admin IP policy, baseline threat controls, single upstream, logs enabled.
 - `Warden Gate` (hardening): Threat Intel auto mode, geo policy, HA routing, external SIEM, stricter admin/API posture.
 
 Details and rollout guidance are documented in the wiki.
