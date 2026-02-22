@@ -3723,6 +3723,10 @@ func (s *Service) ListThreatIntelAllowlist(ctx context.Context) ([]model.Blocked
 	return s.store.ListThreatIntelAllowIPs(ctx)
 }
 
+func (s *Service) ListThreatIntelGeoPoints(ctx context.Context) ([]model.ThreatIntelGeoPoint, error) {
+	return s.store.ListThreatIntelGeoPoints(ctx)
+}
+
 func (s *Service) AddThreatIntelAllowIP(ctx context.Context, ip, reason string) error {
 	if err := s.store.UpsertThreatIntelAllowIP(ctx, ip, reason); err != nil {
 		return err

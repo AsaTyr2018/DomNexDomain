@@ -237,6 +237,13 @@ type ThreatIntelBlocked struct {
 	RiskState     string    `json:"riskState"`
 }
 
+type ThreatIntelGeoPoint struct {
+	Country string `json:"country"`
+	State   string `json:"state"` // monitor | soft | hard
+	IPs     int64  `json:"ips"`
+	Hits    int64  `json:"hits"`
+}
+
 type ThreatIntelIPState struct {
 	IP             string
 	XP             int

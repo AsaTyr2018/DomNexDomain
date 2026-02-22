@@ -2667,6 +2667,74 @@ LIMIT ? OFFSET ?`, queryArgs...)
 	return out, total, nil
 }
 
+func (s *Store) ListThreatIntelGeoPoints(ctx context.Context) ([]model.ThreatIntelGeoPoint, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	rows, err := s.db.QueryContext(ctx, `
+WITH candidate_ips AS (
+  SELECT ip FROM threat_intel_ip_state
+  WHERE level > 0 OR xp > 0 OR risk_state <> 'monitoring' OR (ban_until <> '' AND ban_until > ?)
+  UNION
+  SELECT ip FROM blocked_ips
+  UNION
+  SELECT ip FROM threat_intel_matches
+),
+latest_country AS (
+  SELECT m.ip, m.country
+  FROM threat_intel_matches m
+  JOIN (
+    SELECT ip, MAX(last_seen_at) AS last_seen_at
+    FROM threat_intel_matches
+    GROUP BY ip
+  ) lm ON lm.ip = m.ip AND lm.last_seen_at = m.last_seen_at
+),
+hit_totals AS (
+  SELECT ip, SUM(hits) AS total_hits
+  FROM threat_intel_matches
+  GROUP BY ip
+)
+SELECT
+  CASE
+    WHEN UPPER(TRIM(COALESCE(lc.country, ''))) GLOB '[A-Z][A-Z]' THEN UPPER(TRIM(lc.country))
+    ELSE 'ZZ'
+  END AS country,
+  CASE
+    WHEN b.ip IS NOT NULL OR COALESCE(s.risk_state, '') = 'hardblock' THEN 'hard'
+    WHEN (COALESCE(s.ban_until, '') <> '' AND s.ban_until > ?) OR COALESCE(s.risk_state, '') = 'softblock' THEN 'soft'
+    ELSE 'monitor'
+  END AS state,
+  COUNT(1) AS ip_count,
+  COALESCE(SUM(ht.total_hits), 0) AS total_hits
+FROM candidate_ips c
+LEFT JOIN threat_intel_ip_state s ON s.ip = c.ip
+LEFT JOIN blocked_ips b ON b.ip = c.ip
+LEFT JOIN latest_country lc ON lc.ip = c.ip
+LEFT JOIN hit_totals ht ON ht.ip = c.ip
+GROUP BY country, state
+ORDER BY ip_count DESC, total_hits DESC, country ASC`, now, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.ThreatIntelGeoPoint{}
+	for rows.Next() {
+		var p model.ThreatIntelGeoPoint
+		if err := rows.Scan(&p.Country, &p.State, &p.IPs, &p.Hits); err != nil {
+			return nil, err
+		}
+		p.Country = strings.ToUpper(strings.TrimSpace(p.Country))
+		if len(p.Country) != 2 {
+			p.Country = "ZZ"
+		}
+		switch p.State {
+		case "hard", "soft", "monitor":
+		default:
+			p.State = "monitor"
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func parseNullableTime(v sql.NullString) time.Time {
 	if !v.Valid || strings.TrimSpace(v.String) == "" {
 		return time.Time{}

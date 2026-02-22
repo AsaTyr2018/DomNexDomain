@@ -16,11 +16,12 @@ import (
 )
 
 type Resolver struct {
-	mu    sync.RWMutex
-	cache map[string]cacheItem
-	http  *http.Client
-	ttl   time.Duration
-	mmdb  *maxminddb.Reader
+	mu     sync.RWMutex
+	cache  map[string]cacheItem
+	http   *http.Client
+	ttl    time.Duration
+	mmdbs  []*maxminddb.Reader
+	labels []string
 }
 
 type cacheItem struct {
@@ -32,12 +33,13 @@ func New(ttl time.Duration) *Resolver {
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
-	reader, _ := openLocalMMDB()
+	readers, labels := openLocalMMDBs()
 	return &Resolver{
-		cache: map[string]cacheItem{},
-		http:  &http.Client{Timeout: 1200 * time.Millisecond},
-		ttl:   ttl,
-		mmdb:  reader,
+		cache:  map[string]cacheItem{},
+		http:   &http.Client{Timeout: 1200 * time.Millisecond},
+		ttl:    ttl,
+		mmdbs:  readers,
+		labels: labels,
 	}
 }
 
@@ -60,7 +62,7 @@ func (r *Resolver) CountryCode(ctx context.Context, ip string) string {
 	}
 
 	country := ""
-	if r.mmdb != nil {
+	if len(r.mmdbs) > 0 {
 		country = r.lookupCountryCodeMMDB(parsed)
 	}
 	if country == "" {
@@ -76,63 +78,85 @@ func (r *Resolver) CountryCode(ctx context.Context, ip string) string {
 }
 
 func (r *Resolver) lookupCountryCodeMMDB(ip net.IP) string {
-	if r.mmdb == nil || ip == nil {
+	if len(r.mmdbs) == 0 || ip == nil {
 		return ""
 	}
-	var payload struct {
-		Country struct {
-			ISOCode     string `maxminddb:"iso_code"`
+	for _, db := range r.mmdbs {
+		var payload struct {
+			Country struct {
+				ISOCode     string `maxminddb:"iso_code"`
+				CountryCode string `maxminddb:"country_code"`
+			} `maxminddb:"country"`
+			RegisteredCountry struct {
+				ISOCode     string `maxminddb:"iso_code"`
+				CountryCode string `maxminddb:"country_code"`
+			} `maxminddb:"registered_country"`
 			CountryCode string `maxminddb:"country_code"`
-		} `maxminddb:"country"`
-		RegisteredCountry struct {
-			ISOCode     string `maxminddb:"iso_code"`
-			CountryCode string `maxminddb:"country_code"`
-		} `maxminddb:"registered_country"`
-		CountryCode string `maxminddb:"country_code"`
+		}
+		if err := db.Lookup(ip, &payload); err != nil {
+			continue
+		}
+		if code := normalizeCountryCode(payload.Country.ISOCode); code != "" {
+			return code
+		}
+		if code := normalizeCountryCode(payload.Country.CountryCode); code != "" {
+			return code
+		}
+		if code := normalizeCountryCode(payload.RegisteredCountry.ISOCode); code != "" {
+			return code
+		}
+		if code := normalizeCountryCode(payload.RegisteredCountry.CountryCode); code != "" {
+			return code
+		}
+		if code := normalizeCountryCode(payload.CountryCode); code != "" {
+			return code
+		}
 	}
-	if err := r.mmdb.Lookup(ip, &payload); err != nil {
-		return ""
-	}
-	if code := normalizeCountryCode(payload.Country.ISOCode); code != "" {
-		return code
-	}
-	if code := normalizeCountryCode(payload.Country.CountryCode); code != "" {
-		return code
-	}
-	if code := normalizeCountryCode(payload.RegisteredCountry.ISOCode); code != "" {
-		return code
-	}
-	if code := normalizeCountryCode(payload.RegisteredCountry.CountryCode); code != "" {
-		return code
-	}
-	return normalizeCountryCode(payload.CountryCode)
+	return ""
 }
 
-func openLocalMMDB() (*maxminddb.Reader, string) {
+func openLocalMMDBs() ([]*maxminddb.Reader, []string) {
 	paths := []string{}
+	if envs := strings.TrimSpace(os.Getenv("DOMNEX_GEOIP_MMDBS")); envs != "" {
+		for _, p := range strings.Split(envs, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				paths = append(paths, p)
+			}
+		}
+	}
 	if env := strings.TrimSpace(os.Getenv("DOMNEX_GEOIP_MMDB")); env != "" {
 		paths = append(paths, env)
 	}
 	paths = append(paths,
+		"/var/lib/domnexdomain/geoip/dbip-country-lite.mmdb",
+		"/var/lib/domnexdomain/geoip/dbip-country-lite-2026-02.mmdb",
+		"/var/lib/domnexdomain/geoip/DBIP-Country-Lite.mmdb",
 		"/var/lib/domnexdomain/geoip/IP2LOCATION-LITE-DB1.MMDB",
 		"/var/lib/domnexdomain/geoip/GeoLite2-Country.mmdb",
+		"/etc/domnexdomain/dbip-country-lite.mmdb",
 		"/etc/domnexdomain/IP2LOCATION-LITE-DB1.MMDB",
 		"/media/i2l/IP2LOCATION-LITE-DB1.MMDB",
 	)
+	seen := map[string]bool{}
+	readers := make([]*maxminddb.Reader, 0, len(paths))
+	labels := make([]string, 0, len(paths))
 	for _, p := range paths {
 		p = strings.TrimSpace(p)
-		if p == "" {
+		if p == "" || seen[p] {
 			continue
 		}
+		seen[p] = true
 		if _, err := os.Stat(p); err != nil {
 			continue
 		}
 		reader, err := maxminddb.Open(p)
 		if err == nil {
-			return reader, p
+			readers = append(readers, reader)
+			labels = append(labels, p)
 		}
 	}
-	return nil, ""
+	return readers, labels
 }
 
 func (r *Resolver) lookupCountryCode(ctx context.Context, ip string) string {

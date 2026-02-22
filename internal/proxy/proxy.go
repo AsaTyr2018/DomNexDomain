@@ -47,6 +47,7 @@ type Engine struct {
 	m        *metrics.Collector
 	geo      *geoip.Resolver
 	tr       *traffic.Recorder
+	live     *traffic.LiveHub
 	publicIP string
 	mu       sync.RWMutex
 	routes   map[string]*routeEntry
@@ -79,13 +80,14 @@ type edgeTheme struct {
 	heroB   string
 }
 
-func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.Recorder) *Engine {
+func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.Recorder, live *traffic.LiveHub) *Engine {
 	return &Engine{
 		source:   source,
 		log:      log,
 		m:        m,
 		geo:      geoip.New(1 * time.Hour),
 		tr:       tr,
+		live:     live,
 		routes:   map[string]*routeEntry{},
 		managed:  map[string]bool{},
 		auth:     map[string]authSession{},
@@ -299,7 +301,9 @@ func (e *Engine) Handler() http.Handler {
 		var selectedRoute *routeEntry
 		var country string
 		var clientIP string
+		var publicIP string
 		var blocked bool
+		var scannerSignal bool
 		defer func() {
 			hostLabel := "_unknown"
 			host := r.Host
@@ -312,6 +316,47 @@ func (e *Engine) Handler() http.Handler {
 			}
 			if e.m != nil {
 				e.m.ProxyRequests.WithLabelValues(hostLabel, strconv.Itoa(sw.StatusCode())).Inc()
+			}
+			if e.live != nil && e.live.SubscriberCount() > 0 && clientIP != "" {
+				liveCountry := strings.TrimSpace(strings.ToUpper(country))
+				if liveCountry == "" {
+					liveCountry = countryFromHeaders(r)
+				}
+				if liveCountry == "" {
+					liveCountry = e.geo.CountryCode(r.Context(), clientIP)
+				}
+				if liveCountry == "" {
+					liveCountry = "ZZ"
+				}
+				sourceType := requestScope(clientIP, publicIP)
+				fqdn := hostLabel
+				hostID := int64(0)
+				domainID := int64(0)
+				if selectedRoute != nil {
+					fqdn = selectedRoute.host.FQDN
+					hostID = selectedRoute.host.ID
+					domainID = selectedRoute.host.DomainID
+				}
+				class := "human"
+				if isLikelyCrawlerUA(r.UserAgent()) {
+					class = "crawler"
+				}
+				if strings.TrimSpace(r.UserAgent()) == "" {
+					class = "unknown"
+				}
+				isScanner := scannerSignal || class == "crawler"
+				e.live.Publish(traffic.LiveTraceEvent{
+					Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+					HostID:     hostID,
+					DomainID:   domainID,
+					FQDN:       fqdn,
+					Country:    liveCountry,
+					Class:      class,
+					Scanner:    isScanner,
+					Status:     sw.StatusCode(),
+					Path:       r.URL.Path,
+					SourceType: sourceType,
+				})
 			}
 			edgeError := strings.EqualFold(strings.TrimSpace(sw.Header().Get("X-DomNex-Edge-Error")), "1")
 			if e.tr != nil && selectedRoute != nil && !edgeError {
@@ -344,8 +389,9 @@ func (e *Engine) Handler() http.Handler {
 
 		host := normalizeHostHeader(r.Host)
 		clientIP = clientIPFromRequest(r)
+		scannerSignal = isLikelyCrawlerUA(r.UserAgent())
 		e.mu.RLock()
-		publicIP := e.publicIP
+		publicIP = e.publicIP
 		route, ok := e.routes[host]
 		managedApex := e.managed[host]
 		tiSnap := e.tiSnap
@@ -353,6 +399,7 @@ func (e *Engine) Handler() http.Handler {
 		selectedRoute = route
 		if isBlockedIP, _ := e.source.IsIPBlocked(r.Context(), clientIP); isBlockedIP {
 			blocked = true
+			scannerSignal = true
 			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.block.hard_drop", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";reason=blocked_ip")
 			dropConnection(sw)
@@ -368,6 +415,7 @@ func (e *Engine) Handler() http.Handler {
 		hasThreatSignal := len(allFeeds) > 0 && !isLANClient(clientIP, publicIP)
 		threatIntelRecognized := hasThreatSignal
 		if hasThreatSignal {
+			scannerSignal = true
 			if country == "" {
 				country = countryFromHeaders(r)
 				if country == "" {
@@ -398,6 +446,7 @@ func (e *Engine) Handler() http.Handler {
 				e.log.Warn("threat intel apply failed", map[string]any{"ip": clientIP, "err": err.Error()})
 			}
 			if out.Blocked {
+				scannerSignal = true
 				if out.HardBlock {
 					blocked = true
 					e.auditProxyEvent(r.Context(), "proxy.block.hard_drop", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";reason=threat_intel_hardblock")
@@ -419,6 +468,7 @@ func (e *Engine) Handler() http.Handler {
 			}
 		}
 		if isBlocked, until, _ := e.wafIsBlocked(clientIP, publicIP); isBlocked {
+			scannerSignal = true
 			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.waf.temp_block.hit", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";until="+until.UTC().Format(time.RFC3339))
 			e.renderSmartErrorPage(sw, r, smartErrorPage{
@@ -435,6 +485,7 @@ func (e *Engine) Handler() http.Handler {
 			return
 		}
 		if !ok {
+			scannerSignal = true
 			if managedApex {
 				traceID, _ := randomHex(8)
 				e.renderManagedDomainPage(host, traceID, sw, r)
@@ -457,6 +508,7 @@ func (e *Engine) Handler() http.Handler {
 			triggered, until, hits := e.wafTrackUnknownHost(clientIP, publicIP)
 			traceID, _ := randomHex(8)
 			if triggered {
+				scannerSignal = true
 				e.log.Warn("waf temporary block set", map[string]any{
 					"source":  clientIP,
 					"host":    host,
@@ -510,6 +562,7 @@ func (e *Engine) Handler() http.Handler {
 		}
 		if deny, mode := e.isGeoBlocked(country, route.host); deny {
 			blocked = true
+			scannerSignal = true
 			traceID, _ := randomHex(8)
 			if e.m != nil {
 				e.m.GeoBlocks.WithLabelValues(route.host.FQDN, country, mode).Inc()
@@ -548,6 +601,7 @@ func (e *Engine) Handler() http.Handler {
 		if route.host.HAEnabled && len(route.backends) > 0 {
 			idx, online, total, offline := e.selectBackendIndex(route)
 			if idx < 0 {
+				scannerSignal = true
 				traceID, _ := randomHex(8)
 				scope := requestScope(clientIP, publicIP)
 				e.log.Warn("ha all backends unreachable", map[string]any{
@@ -707,6 +761,26 @@ func uniqueThreatFeeds(in []string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+func isLikelyCrawlerUA(ua string) bool {
+	ua = strings.ToLower(strings.TrimSpace(ua))
+	if ua == "" {
+		return false
+	}
+	botHints := []string{
+		"bot", "crawler", "spider", "slurp",
+		"googlebot", "bingbot", "duckduckbot", "yandexbot", "baiduspider",
+		"semrush", "ahrefs", "mj12bot", "dotbot", "petalbot", "facebookexternalhit",
+		"curl/", "wget/", "python-requests", "go-http-client",
+		"scanner", "nmap", "zgrab", "nikto", "masscan", "sqlmap",
+	}
+	for _, h := range botHints {
+		if strings.Contains(ua, h) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeThreatPath(p string) string {

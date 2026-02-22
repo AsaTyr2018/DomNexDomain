@@ -28,6 +28,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/logx"
 	"github.com/domnexdomain/domnexdomain/internal/metrics"
 	"github.com/domnexdomain/domnexdomain/internal/model"
+	"github.com/domnexdomain/domnexdomain/internal/traffic"
 )
 
 //go:embed all:dist
@@ -38,10 +39,11 @@ type Server struct {
 	auth    *auth.Service
 	log     *logx.Logger
 	metrics *metrics.Collector
+	live    *traffic.LiveHub
 }
 
-func New(appSvc *app.Service, authSvc *auth.Service, log *logx.Logger, m *metrics.Collector) *Server {
-	return &Server{app: appSvc, auth: authSvc, log: log, metrics: m}
+func New(appSvc *app.Service, authSvc *auth.Service, log *logx.Logger, m *metrics.Collector, live *traffic.LiveHub) *Server {
+	return &Server{app: appSvc, auth: authSvc, log: log, metrics: m, live: live}
 }
 
 func (s *Server) Router() http.Handler {
@@ -75,6 +77,7 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/traffic/overview", s.handleTrafficOverview)
 		pr.Get("/api/v1/traffic/hosts/{id}", s.handleHostTraffic)
 		pr.Get("/api/v1/traffic/countries", s.handleTrafficCountries)
+		pr.Get("/api/v1/traffic/live", s.handleTrafficLive)
 		pr.Get("/api/v1/audit", s.handleListAudit)
 		pr.Get("/api/v1/security/ip-blocks", s.handleListBlockedIPs)
 		pr.Get("/api/v1/threat-intel/config", s.handleThreatIntelConfigGet)
@@ -83,6 +86,7 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/threat-intel/matches/{ip}/targets", s.handleThreatIntelTargetsByIP)
 		pr.Get("/api/v1/threat-intel/offenders", s.handleThreatIntelOffendersList)
 		pr.Get("/api/v1/threat-intel/blocked", s.handleThreatIntelBlockedList)
+		pr.Get("/api/v1/threat-intel/geo", s.handleThreatIntelGeoList)
 		pr.Get("/api/v1/threat-intel/allowlist", s.handleThreatIntelAllowlistList)
 		pr.Get("/api/v1/settings", s.handleGetSettings)
 		pr.Get("/api/v1/time-sync", s.handleGetTimeSyncStatus)
@@ -1119,6 +1123,74 @@ func (s *Server) handleTrafficCountries(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (s *Server) handleTrafficLive(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "hosts:read") {
+		return
+	}
+	if s.live == nil {
+		writeErr(w, http.StatusServiceUnavailable, "live trace unavailable")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	_, ch, cancel := s.live.Subscribe(512)
+	defer cancel()
+	keepAlive := time.NewTicker(15 * time.Second)
+	defer keepAlive.Stop()
+
+	allowedDomain := map[int64]bool{}
+	if id.Role == model.RoleDomainAdmin || tokenHasDomainRestriction(id) {
+		for _, did := range id.DomainIDs {
+			allowedDomain[did] = true
+		}
+	}
+
+	writeEvent := func(ev traffic.LiveTraceEvent) bool {
+		b, err := json.Marshal(ev)
+		if err != nil {
+			return true
+		}
+		if _, err := w.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-keepAlive.C:
+			if _, err := w.Write([]byte(": ping\n\n")); err != nil {
+				return
+			}
+			flusher.Flush()
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			if len(allowedDomain) > 0 {
+				if ev.DomainID <= 0 || !allowedDomain[ev.DomainID] {
+					continue
+				}
+			}
+			if !writeEvent(ev) {
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
 	if !requireTokenScope(w, id, "hosts:write") {
@@ -2034,6 +2106,22 @@ func (s *Server) handleThreatIntelBlockedList(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleThreatIntelGeoList(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "audit:read") {
+		return
+	}
+	items, err := s.app.ListThreatIntelGeoPoints(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"generatedAt": time.Now().UTC().Format(time.RFC3339),
+		"items":       items,
+	})
 }
 
 func (s *Server) handleThreatIntelTargetsByIP(w http.ResponseWriter, r *http.Request) {

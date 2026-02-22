@@ -107,8 +107,9 @@ func main() {
 	}
 	m := metrics.New()
 	tr := traffic.NewRecorder(st, log)
+	liveHub := traffic.NewLiveHub()
 
-	apiSrv := api.New(appSvc, authSvc, log, m)
+	apiSrv := api.New(appSvc, authSvc, log, m, liveHub)
 	adminServer := &http.Server{
 		Addr:              cfg.AdminBindAddr,
 		Handler:           apiSrv.Router(),
@@ -119,7 +120,7 @@ func main() {
 		ErrorLog:          logx.StdLogger(log),
 	}
 
-	px := proxy.New(appSvc, log, m, tr)
+	px := proxy.New(appSvc, log, m, tr, liveHub)
 	if err := px.Refresh(context.Background()); err != nil {
 		log.Warn("initial proxy refresh failed", map[string]any{"err": err.Error()})
 	}

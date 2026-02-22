@@ -73,6 +73,33 @@ type HostTrafficDetails = { hours: number; hostId: number; fqdn: string; request
 type CountryTraffic = { country: string; requests: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; bytesOut: number };
 type HostCountryTraffic = { hostId: number; fqdn: string; requests: number; blocked: number; status2xx: number; status3xx: number; status4xx: number; status5xx: number; bytesOut: number };
 type TrafficCountryOverview = { hours: number; generatedAt: string; requestClass?: string; hostId?: number; hostFqdn?: string; totalRequests: number; totalBlocked: number; totalBytesOut: number; countries: CountryTraffic[]; unknownBreakdown?: HostCountryTraffic[] };
+type TrafficLiveEvent = {
+  ts: string;
+  hostId: number;
+  domainId: number;
+  fqdn: string;
+  country: string;
+  class: 'human' | 'crawler' | 'unknown';
+  scanner: boolean;
+  status: number;
+  path: string;
+  sourceType: 'internal' | 'external';
+};
+type LiveTracePoint = {
+  id: string;
+  seenAt: number;
+  country: string;
+  hostId: number;
+  fqdn: string;
+  scanner: boolean;
+  class: 'human' | 'crawler' | 'unknown';
+};
+type ThreatGeoPoint = {
+  country: string;
+  state: 'monitor' | 'soft' | 'hard';
+  ips: number;
+  hits: number;
+};
 type SSHBastionRoute = { id: number; fqdn: string; targetHost: string; targetPort: number; enabled: boolean; createdAt: string; updatedAt: string };
 type SSHBastionKey = { id: number; name: string; publicKey: string; fingerprint: string; enabled: boolean; routeIds: number[]; createdAt: string; updatedAt: string };
 type SSHBastionGenerate = { key: SSHBastionKey; privateKey?: string; privateKeyPpk?: string; publicKeyRfc4716?: string; ppkError?: string };
@@ -497,6 +524,11 @@ function App() {
   const [metricClass, setMetricClass] = useState<'all' | 'human' | 'crawler' | 'unknown'>('all');
   const [metricCountryFocus, setMetricCountryFocus] = useState('all');
   const [metricMapOpen, setMetricMapOpen] = useState(false);
+  const [metricMapMode, setMetricMapMode] = useState<'historical' | 'live' | 'threat'>('historical');
+  const [metricLivePoints, setMetricLivePoints] = useState<LiveTracePoint[]>([]);
+  const [metricLiveConnected, setMetricLiveConnected] = useState(false);
+  const [metricThreatGeo, setMetricThreatGeo] = useState<ThreatGeoPoint[]>([]);
+  const [metricThreatGeoAt, setMetricThreatGeoAt] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -1646,6 +1678,78 @@ function App() {
       setMetricCountryOverview(null);
     }
   };
+
+  const loadThreatGeoMap = async () => {
+    try {
+      const out = await api<{ generatedAt: string; items: ThreatGeoPoint[] }>('/api/v1/threat-intel/geo');
+      setMetricThreatGeo(Array.isArray(out.items) ? out.items : []);
+      setMetricThreatGeoAt(String(out.generatedAt || ''));
+    } catch {
+      setMetricThreatGeo([]);
+      setMetricThreatGeoAt('');
+    }
+  };
+
+  useEffect(() => {
+    if (!identity || !metricMapOpen || metricMapMode !== 'live') {
+      setMetricLiveConnected(false);
+      return;
+    }
+    const ttlMs = 10_000;
+    const maxPoints = 3000;
+    const es = new EventSource('/api/v1/traffic/live');
+    setMetricLiveConnected(false);
+    es.onopen = () => setMetricLiveConnected(true);
+    es.onerror = () => setMetricLiveConnected(false);
+    es.onmessage = (msg) => {
+      try {
+        const ev = JSON.parse(msg.data || '{}') as TrafficLiveEvent;
+        const cc = String(ev.country || '').trim().toUpperCase();
+        if (!cc || !COUNTRY_LONLAT[cc]) return;
+        if (metricHostFilter !== 'all' && Number(metricHostFilter) !== Number(ev.hostId || 0)) return;
+        const cls = (ev.class === 'crawler' || ev.class === 'unknown') ? ev.class : 'human';
+        if (metricClass !== 'all' && cls !== metricClass) return;
+        if (metricCountryFocus !== 'all' && cc !== metricCountryFocus.toUpperCase()) return;
+        if (String(ev.sourceType || '').toLowerCase() === 'internal') return;
+        const seenAt = Date.now();
+        const p: LiveTracePoint = {
+          id: `${seenAt}-${Math.random().toString(16).slice(2, 8)}`,
+          seenAt,
+          country: cc,
+          hostId: Number(ev.hostId || 0),
+          fqdn: String(ev.fqdn || ''),
+          scanner: !!ev.scanner || cls === 'crawler',
+          class: cls,
+        };
+        setMetricLivePoints((prev) => {
+          const cut = seenAt - ttlMs;
+          const next = [...prev.filter((it) => it.seenAt >= cut), p];
+          if (next.length <= maxPoints) return next;
+          return next.slice(next.length - maxPoints);
+        });
+      } catch {
+      }
+    };
+    const gc = window.setInterval(() => {
+      const cut = Date.now() - ttlMs;
+      setMetricLivePoints((prev) => prev.filter((it) => it.seenAt >= cut));
+    }, 500);
+    return () => {
+      window.clearInterval(gc);
+      es.close();
+      setMetricLiveConnected(false);
+      setMetricLivePoints([]);
+    };
+  }, [identity, metricMapOpen, metricMapMode, metricHostFilter, metricClass, metricCountryFocus]);
+
+  useEffect(() => {
+    if (!identity || !metricMapOpen || metricMapMode !== 'threat') return;
+    void loadThreatGeoMap();
+    const timer = window.setInterval(() => {
+      void loadThreatGeoMap();
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [identity, metricMapOpen, metricMapMode]);
 
   const activeHosts = hosts.filter((h) => h.state === 'active').length;
   const errorHosts = hosts.filter((h) => h.state === 'error').length;
@@ -5552,17 +5656,37 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
 
       {identity && metricMapOpen ? (
         <div className="overlay modal-overlay">
-          <div className="login-card modal-card" style={{ maxWidth: '1280px', width: '98vw' }}>
+          <div className="login-card modal-card geo-modal-card" style={{ maxWidth: '1280px', width: '98vw' }}>
             <div className="modal-head">
               <h3>Global Geo Map</h3>
             </div>
             <div className="row modal-controls">
-              <div className="muted">Click country bubbles to focus. Current filter: {metricCountryFocus.toUpperCase()}</div>
+              <div className="muted">
+                {metricMapMode === 'live'
+                  ? `Live Trace ${metricLiveConnected ? 'connected' : 'disconnected'} · TTL 10s · Current filter: ${metricCountryFocus.toUpperCase()}`
+                  : metricMapMode === 'threat'
+                    ? `Threat Intel Map · ${metricThreatGeoAt ? `snapshot ${new Date(metricThreatGeoAt).toLocaleTimeString()}` : 'loading'} · Current filter: ${metricCountryFocus.toUpperCase()}`
+                  : `Click country bubbles to focus. Current filter: ${metricCountryFocus.toUpperCase()}`}
+              </div>
+              <select value={metricMapMode} onChange={(e) => setMetricMapMode(e.target.value === 'live' ? 'live' : e.target.value === 'threat' ? 'threat' : 'historical')}>
+                <option value="historical">Historical</option>
+                <option value="live">Live Trace</option>
+                <option value="threat">Threat Intel Map</option>
+              </select>
               <button className="btn" onClick={() => setMetricCountryFocus('all')}>Reset Country Filter</button>
+              {metricMapMode === 'threat' ? (
+                <button className="btn" onClick={loadThreatGeoMap}>Refresh Threat Map</button>
+              ) : null}
               <button className="btn" onClick={() => setMetricMapOpen(false)}>Close</button>
             </div>
-            <div className="modal-body">
-              <GeoScatterMap countries={metricFilteredCountries} onSelectCountry={(code) => setMetricCountryFocus(code)} />
+            <div className="modal-body geo-modal-body">
+              {metricMapMode === 'live' ? (
+                <GeoLiveTraceMap points={metricLivePoints} onSelectCountry={(code) => setMetricCountryFocus(code)} />
+              ) : metricMapMode === 'threat' ? (
+                <GeoThreatIntelMap points={metricThreatGeo} countryFocus={metricCountryFocus} onSelectCountry={(code) => setMetricCountryFocus(code)} />
+              ) : (
+                <GeoScatterMap countries={metricFilteredCountries} onSelectCountry={(code) => setMetricCountryFocus(code)} />
+              )}
             </div>
           </div>
         </div>
@@ -5778,6 +5902,21 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .modal-head { flex:0 0 auto; }
         .modal-controls { flex:0 0 auto; }
         .modal-body { flex:1 1 auto; min-height:0; overflow:auto; }
+        .geo-modal-card { max-height:calc(100vh - 2rem); }
+        .geo-modal-body { overflow:hidden; }
+        .geo-modal-body .geo-map-wrap {
+          height:calc(100vh - 220px);
+          max-height:760px;
+          min-height:320px;
+          display:flex;
+          flex-direction:column;
+        }
+        .geo-modal-body .geo-map-svg {
+          flex:1 1 auto;
+          min-height:0;
+          width:100%;
+          height:100%;
+        }
         .modal-table-wrap { max-height:none; height:100%; min-height:0; }
         .modal-table-wrap .log-table th { position:static; top:auto; z-index:auto; }
         .auth-login-card { width:min(460px,100%); border-color:#2b3445; background:linear-gradient(180deg, rgba(18,22,32,.95), rgba(15,18,28,.95)); }
@@ -6040,6 +6179,7 @@ const COUNTRY_LONLAT: Record<string, { lon: number; lat: number }> = {
   DE: { lon: 10, lat: 51 }, NL: { lon: 5, lat: 52 }, BE: { lon: 4, lat: 50.5 }, IT: { lon: 12, lat: 42 }, CH: { lon: 8, lat: 47 },
   AT: { lon: 14, lat: 47.5 }, PL: { lon: 19, lat: 52 }, SE: { lon: 16, lat: 62 }, NO: { lon: 10, lat: 62 }, FI: { lon: 26, lat: 64 },
   DK: { lon: 10, lat: 56 }, CZ: { lon: 15, lat: 49.8 }, RO: { lon: 25, lat: 45.8 }, HU: { lon: 19, lat: 47.2 }, GR: { lon: 22, lat: 39 },
+  AD: { lon: 1.6, lat: 42.5 }, LT: { lon: 23.9, lat: 55.2 }, DO: { lon: -70.2, lat: 18.9 },
   TR: { lon: 35, lat: 39 }, UA: { lon: 31, lat: 49 }, RU: { lon: 90, lat: 60 },
   MA: { lon: -7, lat: 31 }, DZ: { lon: 3, lat: 28 }, EG: { lon: 30, lat: 27 }, NG: { lon: 8, lat: 9 }, ZA: { lon: 24, lat: -29 }, KE: { lon: 37, lat: 0.5 },
   SA: { lon: 45, lat: 24 }, AE: { lon: 54, lat: 24 }, IL: { lon: 35, lat: 31 }, IN: { lon: 78, lat: 22 }, PK: { lon: 70, lat: 30 },
@@ -6171,6 +6311,163 @@ function GeoScatterMap({ countries, onSelectCountry }: { countries: CountryTraff
       </svg>
       <div className="muted" style={{ marginTop: '.45rem' }}>
         Bubble size = request volume in selected window.
+      </div>
+    </div>
+  );
+}
+
+function GeoLiveTraceMap({ points, onSelectCountry }: { points: LiveTracePoint[]; onSelectCountry?: (code: string) => void }) {
+  const [mapInner, setMapInner] = useState<string>('');
+  useEffect(() => {
+    let canceled = false;
+    fetch('/metric-worldmap.svg')
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`map fetch failed: ${r.status}`))))
+      .then((txt) => {
+        if (!canceled) setMapInner(extractSvgInnerMarkup(txt));
+      })
+      .catch(() => {
+        if (!canceled) setMapInner('');
+      });
+    return () => {
+      canceled = true;
+    };
+  }, []);
+  if (!mapInner) {
+    return <div className="muted">Loading map geometry...</div>;
+  }
+  const now = Date.now();
+  const ttlMs = 10_000;
+  const visible = points.filter((p) => now - p.seenAt <= ttlMs && COUNTRY_LONLAT[p.country]);
+  return (
+    <div className="geo-map-wrap">
+      <svg className="geo-map-svg" viewBox={`0 0 ${METRIC_WORLD_VIEWBOX.w} ${METRIC_WORLD_VIEWBOX.h}`} role="img" aria-label="Live trace geo map">
+        <g className="geo-map-vector" dangerouslySetInnerHTML={{ __html: mapInner }} />
+        {[0.2, 0.4, 0.6, 0.8].map((r, i) => (
+          <line key={`h-live-${i}`} x1={0} y1={METRIC_WORLD_VIEWBOX.h * r} x2={METRIC_WORLD_VIEWBOX.w} y2={METRIC_WORLD_VIEWBOX.h * r} className="geo-map-grid" />
+        ))}
+        {[0.2, 0.4, 0.6, 0.8].map((r, i) => (
+          <line key={`v-live-${i}`} x1={METRIC_WORLD_VIEWBOX.w * r} y1={0} x2={METRIC_WORLD_VIEWBOX.w * r} y2={METRIC_WORLD_VIEWBOX.h} className="geo-map-grid" />
+        ))}
+        {CONTINENT_LABELS.map((it) => (
+          <text key={`live-${it.text}`} x={it.x} y={it.y} className="geo-map-label muted">{it.text}</text>
+        ))}
+        {visible.map((p) => {
+          const ll = COUNTRY_LONLAT[p.country];
+          const base = projectToMetricSvg(ll.lon, ll.lat);
+          const jitterSeed = p.id.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+          const jx = ((jitterSeed % 7) - 3) * 1.35;
+          const jy = (((Math.floor(jitterSeed / 7)) % 7) - 3) * 1.35;
+          const age = Math.max(0, now - p.seenAt);
+          const life = 1 - (age / ttlMs);
+          const radius = p.scanner ? 4.8 : 3.8;
+          const fill = p.scanner ? '#ef4444' : '#22c55e';
+          const stroke = p.scanner ? '#fecaca' : '#a7f3d0';
+          return (
+            <g key={p.id} onClick={() => onSelectCountry?.(p.country)} style={{ cursor: onSelectCountry ? 'pointer' : 'default' }}>
+              <circle cx={base.x + jx} cy={base.y + jy} r={radius + (1 - life) * 2} fill={fill} opacity={Math.max(0.12, life * 0.42)} />
+              <circle cx={base.x + jx} cy={base.y + jy} r={radius} fill={fill} stroke={stroke} strokeWidth={1.2} opacity={Math.max(0.2, life)} />
+            </g>
+          );
+        })}
+      </svg>
+      <div className="row" style={{ marginTop: '.45rem', marginBottom: 0, justifyContent: 'space-between' }}>
+        <div className="muted">Live points: {visible.length} (TTL 10s)</div>
+        <div className="row" style={{ marginBottom: 0 }}>
+          <span className="badge ok">Normal</span>
+          <span className="badge err">Bot/Scanner</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GeoThreatIntelMap({ points, countryFocus, onSelectCountry }: { points: ThreatGeoPoint[]; countryFocus: string; onSelectCountry?: (code: string) => void }) {
+  const [mapInner, setMapInner] = useState<string>('');
+  const [showMonitor, setShowMonitor] = useState(true);
+  const [showSoft, setShowSoft] = useState(true);
+  const [showHard, setShowHard] = useState(true);
+  useEffect(() => {
+    let canceled = false;
+    fetch('/metric-worldmap.svg')
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`map fetch failed: ${r.status}`))))
+      .then((txt) => {
+        if (!canceled) setMapInner(extractSvgInnerMarkup(txt));
+      })
+      .catch(() => {
+        if (!canceled) setMapInner('');
+      });
+    return () => {
+      canceled = true;
+    };
+  }, []);
+  if (!mapInner) {
+    return <div className="muted">Loading map geometry...</div>;
+  }
+  const normalized = (points || [])
+    .map((p) => ({
+      country: String(p.country || '').trim().toUpperCase(),
+      state: p.state === 'hard' ? 'hard' : p.state === 'soft' ? 'soft' : 'monitor',
+      ips: Number(p.ips || 0),
+      hits: Number(p.hits || 0),
+    }))
+    .filter((p) => p.country && COUNTRY_LONLAT[p.country] && p.ips > 0);
+  const stateVisible = (state: 'monitor' | 'soft' | 'hard') =>
+    (state === 'monitor' && showMonitor) || (state === 'soft' && showSoft) || (state === 'hard' && showHard);
+  const filteredByState = normalized.filter((p) => stateVisible(p.state));
+  const filtered = countryFocus === 'all' ? filteredByState : filteredByState.filter((p) => p.country === countryFocus.toUpperCase());
+  if (filtered.length === 0) {
+    return <div className="muted">No threat geo points for this filter.</div>;
+  }
+  const maxIPs = Math.max(1, ...filtered.map((p) => p.ips));
+  const stateColor = (state: 'monitor' | 'soft' | 'hard') => {
+    if (state === 'hard') return { fill: '#ef4444', stroke: '#fecaca' };
+    if (state === 'soft') return { fill: '#f59e0b', stroke: '#fde68a' };
+    return { fill: '#22c55e', stroke: '#a7f3d0' };
+  };
+  const unknown = (points || []).filter((p) => String(p.country || '').trim().toUpperCase() === 'ZZ').reduce((acc, p) => acc + Number(p.ips || 0), 0);
+  const monitorIPs = normalized.filter((p) => p.state === 'monitor').reduce((acc, p) => acc + p.ips, 0);
+  const softIPs = normalized.filter((p) => p.state === 'soft').reduce((acc, p) => acc + p.ips, 0);
+  const hardIPs = normalized.filter((p) => p.state === 'hard').reduce((acc, p) => acc + p.ips, 0);
+  return (
+    <div className="geo-map-wrap">
+      <svg className="geo-map-svg" viewBox={`0 0 ${METRIC_WORLD_VIEWBOX.w} ${METRIC_WORLD_VIEWBOX.h}`} role="img" aria-label="Threat intel geo map">
+        <g className="geo-map-vector" dangerouslySetInnerHTML={{ __html: mapInner }} />
+        {[0.2, 0.4, 0.6, 0.8].map((r, i) => (
+          <line key={`h-ti-${i}`} x1={0} y1={METRIC_WORLD_VIEWBOX.h * r} x2={METRIC_WORLD_VIEWBOX.w} y2={METRIC_WORLD_VIEWBOX.h * r} className="geo-map-grid" />
+        ))}
+        {[0.2, 0.4, 0.6, 0.8].map((r, i) => (
+          <line key={`v-ti-${i}`} x1={METRIC_WORLD_VIEWBOX.w * r} y1={0} x2={METRIC_WORLD_VIEWBOX.w * r} y2={METRIC_WORLD_VIEWBOX.h} className="geo-map-grid" />
+        ))}
+        {CONTINENT_LABELS.map((it) => (
+          <text key={`ti-${it.text}`} x={it.x} y={it.y} className="geo-map-label muted">{it.text}</text>
+        ))}
+        {filtered.map((p) => {
+          const ll = COUNTRY_LONLAT[p.country];
+          const pos = projectToMetricSvg(ll.lon, ll.lat);
+          const radius = Math.min(18, 5 + Math.round((p.ips / maxIPs) * 13));
+          const c = stateColor(p.state);
+          return (
+            <g key={`${p.country}-${p.state}`} onClick={() => onSelectCountry?.(p.country)} style={{ cursor: onSelectCountry ? 'pointer' : 'default' }}>
+              <circle cx={pos.x} cy={pos.y} r={radius + 2} fill={c.fill} opacity={0.2} />
+              <circle cx={pos.x} cy={pos.y} r={radius} fill={c.fill} stroke={c.stroke} strokeWidth={1.4} opacity={0.95} />
+              <text x={pos.x + radius + 3} y={pos.y + 3} className="geo-map-label">{p.country}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <div className="row" style={{ marginTop: '.45rem', marginBottom: 0, justifyContent: 'space-between' }}>
+        <div className="muted">Threat IPs mapped: {filtered.reduce((acc, p) => acc + p.ips, 0)} · Unknown (ZZ): {unknown}</div>
+        <div className="row" style={{ marginBottom: 0 }}>
+          <button className="btn ghost" style={{ opacity: showMonitor ? 1 : 0.45 }} onClick={() => setShowMonitor((v) => !v)}>
+            <span className="badge ok" style={{ marginRight: '.35rem' }}>Monitor</span>{monitorIPs}
+          </button>
+          <button className="btn ghost" style={{ opacity: showSoft ? 1 : 0.45 }} onClick={() => setShowSoft((v) => !v)}>
+            <span className="badge warn" style={{ marginRight: '.35rem' }}>Soft block</span>{softIPs}
+          </button>
+          <button className="btn ghost" style={{ opacity: showHard ? 1 : 0.45 }} onClick={() => setShowHard((v) => !v)}>
+            <span className="badge err" style={{ marginRight: '.35rem' }}>Hard block</span>{hardIPs}
+          </button>
+        </div>
       </div>
     </div>
   );
