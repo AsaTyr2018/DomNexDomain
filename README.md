@@ -60,3 +60,10 @@ Technical setup and operations are maintained in the wiki:
 
 - GitHub Issues: https://github.com/AsaTyr2018/DomNexDomain/issues
 - Discord: https://discord.gg/GnAUmXhfeG
+
+## Screenshots
+
+<img width="1900" height="840" alt="grafik" src="https://github.com/user-attachments/assets/cbf69637-7f7c-4306-8853-ee10099a4898" />
+<img width="1905" height="882" alt="grafik" src="https://github.com/user-attachments/assets/c2548fa2-4cf7-485f-b562-e9bf0dd1fd82" />
+<img width="1910" height="782" alt="grafik" src="https://github.com/user-attachments/assets/7bea719c-811b-4ee0-a235-2d32cb9ab173" />
+<img width="1904" height="825" alt="grafik" src="https://github.com/user-attachments/assets/835b045c-4019-4150-982f-9582538612d3" />
