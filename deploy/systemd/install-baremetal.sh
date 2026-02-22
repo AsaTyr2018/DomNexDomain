@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN_SRC="${1:-./build/domnexdomain}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+BIN_SRC="${1:-${REPO_ROOT}/build/domnexdomain}"
 BIN_DST="/usr/bin/domnexdomain"
 SVC_FILE="/etc/systemd/system/domnexdomain.service"
 ENV_FILE="/etc/domnexdomain/domnexdomain.env"
@@ -27,7 +30,7 @@ install -m 0755 "$BIN_SRC" "$BIN_DST"
 
 echo "[3/7] Install environment template"
 if [[ ! -f "$ENV_FILE" ]]; then
-  install -m 0640 /DomNex/config/domnexdomain.env.example "$ENV_FILE"
+  install -m 0640 "${REPO_ROOT}/config/domnexdomain.env.example" "$ENV_FILE"
 fi
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -35,7 +38,7 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 echo "[4/7] Install systemd unit"
-install -m 0644 /DomNex/deploy/systemd/domnexdomain.service "$SVC_FILE"
+install -m 0644 "${REPO_ROOT}/deploy/systemd/domnexdomain.service" "$SVC_FILE"
 
 echo "[5/7] Reload and start service"
 systemctl daemon-reload

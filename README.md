@@ -62,6 +62,12 @@ Details and rollout guidance are documented in the wiki.
 
 Technical setup and operations are maintained in the wiki:
 
+For appliance-style onboarding, use:
+
+```bash
+sudo ./deploy/systemd/setup-appliance.sh
+```
+
 - **Wiki Home:** https://github.com/AsaTyr2018/DomNexDomain/wiki
 - **Quick Start:** https://github.com/AsaTyr2018/DomNexDomain/wiki/00-Quick-Start
 - **Installation (Bare Metal):** https://github.com/AsaTyr2018/DomNexDomain/wiki/01-Installation-Bare-Metal
