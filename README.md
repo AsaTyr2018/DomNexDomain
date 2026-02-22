@@ -2,9 +2,19 @@
 
 # DomNexDomain
 
-**All-in-one edge control plane for secure public self-hosting.**
+**From lean reverse proxy to full edge control plane for secure self-hosting.**
 
-DomNexDomain combines reverse proxy, TLS automation, DNS automation, access control, observability, and security policy in one Linux-native service.
+DomNexDomain started as a focused routing layer.  
+It has evolved into an integrated edge platform that combines routing, DNS and certificate automation, threat-aware policy enforcement, observability, and day-2 operations in one Linux-native service.
+
+## Product Positioning
+
+DomNexDomain is a **self-hosted Edge Control Plane**:
+
+- expose internal services safely
+- enforce security posture at the edge
+- operate everything from one UI/API
+- keep runtime simple (single Go binary, systemd-first)
 
 ## Connectivity Prerequisite
 
@@ -12,57 +22,39 @@ DomNexDomain is the gatekeeper, not the connectivity provider.
 
 It assumes your edge is reachable from the internet on the intended entry points. Provider constraints (CGNAT, IPv6-only edge gaps, tunnel strategy) are currently out of product scope and tracked separately in roadmap guidance (`P11`).
 
-## Why It Stands Out
+## Why DomNexDomain
 
-- One statically linked Go binary
-- Linux + systemd first (Debian/Ubuntu LTS)
-- Integrated Web UI + API control plane
-- ACME + DNS automation with Cloudflare-first provider model
-- Built-in Threat Intel, WAF baseline, and audit visibility
-- HA routing and SSH Bastion in the same platform
-- SQLite persistence with encrypted secrets
+- **Integrated edge stack**: reverse proxy, DNS automation, ACME, authn/authz, threat controls, metrics, logs.
+- **Security-first flow**: Threat Intel + WAF baseline + geo policy + traceable edge error handling.
+- **Operational clarity**: LogCenter and MetricCenter for investigation, traffic distribution, and policy feedback.
+- **Linux-native runtime**: statically linked Go binary, systemd deployment, no Node.js requirement in production.
+- **Pragmatic persistence**: SQLite + encrypted secrets for v1 simplicity.
 
-## First-Boot Experience
+## Core Capabilities
 
-- Fresh installs can run in guided setup mode (no static bootstrap login required)
-- Setup is unlocked with a one-time setup code (OTS)
-- Setup supports fresh provisioning and restore-based initialization
-- Control-plane API stays setup-gated until initialization is complete
-
-## Operating Profiles
-
-Two official operations profiles help teams ramp from simple to hardened setups:
-
-- `Quickstart Gate` (default): TLS, per-user admin IP policy, baseline threat controls, single upstream, logs enabled.
-- `Warden Gate` (hardening): Threat Intel auto mode, geo policy, HA routing, external SIEM, stricter admin/API posture.
-
-Details and rollout guidance are documented in the wiki.
+- Host-based HTTP/HTTPS routing with WebSocket and HTTP/2 support
+- Optional HA per subdomain (`failover` / `round-robin`)
+- SSH Bastion gateway mode
+- Automated DNS + certificate workflows (Cloudflare-first)
+- Smart branded edge error pages with trace ID correlation
+- Role model: `admin`, `domain-admin`, `read-only`
+- Scoped API tokens (global/domain/system)
+- Data retention controls + daily purge jobs
+- Encrypted backup/restore pipeline with scheduled jobs and post-restore checks
+- Setup Assistant with OTS unlock and restore-first onboarding
+- UI style profiles (`Monolith`, `CyberMonolith`, `Custom`)
 
 ## Built For
 
-- Security-focused homelab operators
-- Small teams running multiple internal services
-- Anyone who wants fewer moving parts than classic proxy stacks
-
-## Key Product Capabilities
-
-- Reverse proxy with host-based routing, WebSocket, HTTP/2
-- Optional per-subdomain HA (failover or round-robin)
-- Smart edge error pages with trace IDs and LogCenter correlation
-- Role-based access (`admin`, `domain-admin`, `read-only`)
-- API tokens with scopes and domain boundaries
-- MetricCenter + LogCenter for operations and investigations
-- Retention policy controls with automatic daily data purge
-- Dedicated Backup menu with encrypted packages (`.dnxbak`) and restore tooling
-- Scheduled encrypted backups with optional FTP upload target
-- Post-restore verification with certificate warmup attempts
-- Style profiles (`Monolith`, `CyberMonolith`, `Custom`) across UI, login, and edge pages
+- security-focused homelabs
+- small infra teams and operators
+- self-hosters who want fewer moving parts than stitching Nginx/Caddy + scripts + extra tooling
 
 ## Documentation
 
-Technical setup and operations are maintained in the wiki:
+Detailed setup and operations are maintained in the wiki:
 
-For appliance-style onboarding, use:
+For appliance-style onboarding:
 
 ```bash
 sudo ./deploy/systemd/setup-appliance.sh
@@ -74,6 +66,13 @@ sudo ./deploy/systemd/setup-appliance.sh
 - **Initial Setup Assistant and OTS:** https://github.com/AsaTyr2018/DomNexDomain/wiki/23-Initial-Setup-Assistant-and-OTS
 - **Backup and Restore:** https://github.com/AsaTyr2018/DomNexDomain/wiki/10-Backup-and-Restore
 - **API Usage Guide:** https://github.com/AsaTyr2018/DomNexDomain/wiki/13-API-Usage-Guide
+
+## Operating Profiles
+
+- `Quickstart Gate` (default): strong baseline with minimal friction
+- `Warden Gate` (hardening): stricter security posture for exposed production edges
+
+Profile guidance is documented in the wiki.
 
 ## Compliance Notice
 
