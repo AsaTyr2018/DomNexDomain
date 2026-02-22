@@ -1,0 +1,18 @@
+polkit.addRule(function(action, subject) {
+  if (subject.user !== "domnexdomain") {
+    return polkit.Result.NOT_HANDLED;
+  }
+
+  var allowed = [
+    "org.freedesktop.timedate1.set-ntp",
+    "org.freedesktop.network1.set-ntp-servers",
+    "org.freedesktop.network1.revert-ntp",
+    "org.freedesktop.timesync1.set-runtime-servers"
+  ];
+
+  if (allowed.indexOf(action.id) >= 0) {
+    return polkit.Result.YES;
+  }
+
+  return polkit.Result.NOT_HANDLED;
+});

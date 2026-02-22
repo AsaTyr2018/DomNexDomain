@@ -725,6 +725,9 @@ func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acme
 	if timeSyncMode == "external_lan" && len(lanServers) == 0 {
 		return fmt.Errorf("at least one LAN NTP server is required for external_lan mode")
 	}
+	if err := s.applySystemTimeSyncPolicy(ctx, timeSyncMode, lanServers); err != nil {
+		return err
+	}
 	if err := s.store.SetSetting(ctx, settingTimeSyncMode, timeSyncMode); err != nil {
 		return err
 	}
@@ -735,6 +738,79 @@ func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acme
 		return err
 	}
 	return nil
+}
+
+func (s *Service) ApplyStoredTimeSyncPolicy(ctx context.Context) error {
+	mode := "system_only"
+	if v, err := s.store.GetSetting(ctx, settingTimeSyncMode); err == nil && strings.TrimSpace(v) != "" {
+		mode = normalizeTimeSyncMode(v)
+	}
+	lan := []string{}
+	if v, err := s.store.GetSetting(ctx, settingTimeSyncLANServers); err == nil && strings.TrimSpace(v) != "" {
+		lan = parseTimeSyncServerList(v)
+	}
+	return s.applySystemTimeSyncPolicy(ctx, mode, lan)
+}
+
+func (s *Service) applySystemTimeSyncPolicy(ctx context.Context, mode string, lanServers []string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	mode = normalizeTimeSyncMode(mode)
+	iface, err := defaultRouteInterface(ctx)
+	if err != nil {
+		return err
+	}
+	var servers []string
+	switch mode {
+	case "external_public":
+		servers = []string{"time.cloudflare.com", "time.google.com", "time.apple.com"}
+	case "external_lan":
+		servers = append(servers, lanServers...)
+		if len(servers) == 0 {
+			return fmt.Errorf("at least one LAN NTP server is required for external_lan mode")
+		}
+	default:
+		servers = nil
+	}
+	enable := exec.CommandContext(ctx, "timedatectl", "--no-ask-password", "set-ntp", "true")
+	if out, err := enable.CombinedOutput(); err != nil {
+		return fmt.Errorf("enable ntp failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if len(servers) == 0 {
+		revert := exec.CommandContext(ctx, "timedatectl", "--no-ask-password", "revert", iface)
+		if out, err := revert.CombinedOutput(); err != nil {
+			return fmt.Errorf("revert ntp servers failed: %w (%s)", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	args := []string{"--no-ask-password", "ntp-servers", iface}
+	args = append(args, servers...)
+	setServers := exec.CommandContext(ctx, "timedatectl", args...)
+	if out, err := setServers.CombinedOutput(); err != nil {
+		return fmt.Errorf("set ntp servers failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func defaultRouteInterface(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "ip", "-4", "route", "show", "default")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("detect default route interface failed: %w", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] == "dev" {
+				iface := strings.TrimSpace(fields[i+1])
+				if iface != "" {
+					return iface, nil
+				}
+			}
+		}
+	}
+	return "", fmt.Errorf("no default route interface found")
 }
 
 func (s *Service) GetStyleSettings(ctx context.Context) (string, string, error) {

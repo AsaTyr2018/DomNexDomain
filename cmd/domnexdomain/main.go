@@ -86,6 +86,9 @@ func main() {
 
 	appSvc := app.New(cfg, st, ks, dnsProvider, log)
 	appSvc.InitializePublicIPv4(context.Background())
+	if err := appSvc.ApplyStoredTimeSyncPolicy(context.Background()); err != nil {
+		log.Warn("time sync policy apply failed", map[string]any{"err": err.Error()})
+	}
 	if err := appSvc.Bootstrap(context.Background(), cfg.BootstrapUser, cfg.BootstrapPass); err != nil {
 		log.Error("bootstrap failed", map[string]any{"err": err.Error()})
 		os.Exit(1)
