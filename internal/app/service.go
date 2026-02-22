@@ -69,9 +69,16 @@ type tiWindow struct {
 const settingPublicIPv4 = "network.public_ipv4"
 const defaultThreatIntelFeedURL = "https://lists.blocklist.de/lists/all.txt"
 const (
-	settingTimeSyncMode       = "runtime.time_sync_mode"
-	settingTimeSyncLANServers = "runtime.time_sync_lan_servers"
-	settingLogServers         = "runtime.log_servers"
+	settingTimeSyncMode          = "runtime.time_sync_mode"
+	settingTimeSyncLANServers    = "runtime.time_sync_lan_servers"
+	settingLogServers            = "runtime.log_servers"
+	settingRetentionAuditDays    = "runtime.retention.audit_days"
+	settingRetentionTrafficDays  = "runtime.retention.traffic_days"
+	settingRetentionVisitorsDays = "runtime.retention.visitors_days"
+	settingRetentionThreatDays   = "runtime.retention.threat_days"
+	settingRetentionBlockedDays  = "runtime.retention.blocked_days"
+	settingRetentionLoginDays    = "runtime.retention.login_days"
+	settingRetentionResetDays    = "runtime.retention.password_reset_days"
 )
 
 const (
@@ -97,6 +104,32 @@ type RuntimeSettings struct {
 	TimeSyncLANServers []string          `json:"timeSyncLANServers"`
 	LogServers         LogServerSettings `json:"logServers"`
 	HasLogHTTPBearer   bool              `json:"hasLogHTTPBearer"`
+	Retention          RetentionPolicy   `json:"retention"`
+}
+
+type RetentionPolicy struct {
+	AuditDays         int `json:"auditDays"`
+	TrafficDays       int `json:"trafficDays"`
+	VisitorsDays      int `json:"visitorsDays"`
+	ThreatDays        int `json:"threatDays"`
+	BlockedDays       int `json:"blockedDays"`
+	LoginAttemptDays  int `json:"loginAttemptDays"`
+	PasswordResetDays int `json:"passwordResetDays"`
+}
+
+type RetentionPurgeResult struct {
+	AuditEvents         int64 `json:"auditEvents"`
+	TrafficBuckets      int64 `json:"trafficBuckets"`
+	VisitorHashes       int64 `json:"visitorHashes"`
+	ThreatMatches       int64 `json:"threatMatches"`
+	ThreatStates        int64 `json:"threatStates"`
+	BlockedIPs          int64 `json:"blockedIps"`
+	LoginAttempts       int64 `json:"loginAttempts"`
+	PasswordResetTokens int64 `json:"passwordResetTokens"`
+}
+
+func (r RetentionPurgeResult) Total() int64 {
+	return r.AuditEvents + r.TrafficBuckets + r.VisitorHashes + r.ThreatMatches + r.ThreatStates + r.BlockedIPs + r.LoginAttempts + r.PasswordResetTokens
 }
 
 type TimeSyncProbe struct {
@@ -599,6 +632,7 @@ func (s *Service) GetRuntimeSettings(ctx context.Context) (RuntimeSettings, erro
 		StyleProfile: "monolith",
 		TimeSyncMode: "system_only",
 		LogServers:   defaultLogServerSettings(),
+		Retention:    defaultRetentionPolicy(),
 	}
 	if v, err := s.store.GetSetting(ctx, "runtime.base_domain"); err == nil && strings.TrimSpace(v) != "" {
 		out.BaseDomain = strings.ToLower(strings.TrimSpace(v))
@@ -645,10 +679,11 @@ func (s *Service) GetRuntimeSettings(ctx context.Context) (RuntimeSettings, erro
 		out.LogServers = cfg
 		out.HasLogHTTPBearer = hasToken
 	}
+	out.Retention = s.getRetentionPolicy(ctx)
 	return out, nil
 }
 
-func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom, timeSyncMode, timeSyncLANServers string, logServers LogServerSettings, logHTTPBearer string) error {
+func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom, timeSyncMode, timeSyncLANServers string, logServers LogServerSettings, logHTTPBearer string, retention RetentionPolicy) error {
 	acmeEmail = strings.TrimSpace(acmeEmail)
 	if acmeEmail != "" {
 		if err := s.store.SetSetting(ctx, "acme.email", acmeEmail); err != nil {
@@ -737,7 +772,129 @@ func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acme
 	if err := s.applyLogServerSettings(ctx, logServers, logHTTPBearer); err != nil {
 		return err
 	}
+	retention = normalizeRetentionPolicy(retention)
+	if err := s.store.SetSetting(ctx, settingRetentionAuditDays, strconv.Itoa(retention.AuditDays)); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingRetentionTrafficDays, strconv.Itoa(retention.TrafficDays)); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingRetentionVisitorsDays, strconv.Itoa(retention.VisitorsDays)); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingRetentionThreatDays, strconv.Itoa(retention.ThreatDays)); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingRetentionBlockedDays, strconv.Itoa(retention.BlockedDays)); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingRetentionLoginDays, strconv.Itoa(retention.LoginAttemptDays)); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingRetentionResetDays, strconv.Itoa(retention.PasswordResetDays)); err != nil {
+		return err
+	}
 	return nil
+}
+
+func defaultRetentionPolicy() RetentionPolicy {
+	return RetentionPolicy{
+		AuditDays:         90,
+		TrafficDays:       30,
+		VisitorsDays:      30,
+		ThreatDays:        60,
+		BlockedDays:       60,
+		LoginAttemptDays:  30,
+		PasswordResetDays: 7,
+	}
+}
+
+func normalizeRetentionPolicy(in RetentionPolicy) RetentionPolicy {
+	def := defaultRetentionPolicy()
+	out := in
+	if out.AuditDays < 1 {
+		out.AuditDays = def.AuditDays
+	}
+	if out.TrafficDays < 1 {
+		out.TrafficDays = def.TrafficDays
+	}
+	if out.VisitorsDays < 1 {
+		out.VisitorsDays = def.VisitorsDays
+	}
+	if out.ThreatDays < 1 {
+		out.ThreatDays = def.ThreatDays
+	}
+	if out.BlockedDays < 1 {
+		out.BlockedDays = def.BlockedDays
+	}
+	if out.LoginAttemptDays < 1 {
+		out.LoginAttemptDays = def.LoginAttemptDays
+	}
+	if out.PasswordResetDays < 1 {
+		out.PasswordResetDays = def.PasswordResetDays
+	}
+	if out.AuditDays > 3650 {
+		out.AuditDays = 3650
+	}
+	if out.TrafficDays > 3650 {
+		out.TrafficDays = 3650
+	}
+	if out.VisitorsDays > 3650 {
+		out.VisitorsDays = 3650
+	}
+	if out.ThreatDays > 3650 {
+		out.ThreatDays = 3650
+	}
+	if out.BlockedDays > 3650 {
+		out.BlockedDays = 3650
+	}
+	if out.LoginAttemptDays > 3650 {
+		out.LoginAttemptDays = 3650
+	}
+	if out.PasswordResetDays > 3650 {
+		out.PasswordResetDays = 3650
+	}
+	return out
+}
+
+func (s *Service) getRetentionPolicy(ctx context.Context) RetentionPolicy {
+	out := defaultRetentionPolicy()
+	if v, err := s.store.GetSetting(ctx, settingRetentionAuditDays); err == nil {
+		if n, nerr := strconv.Atoi(strings.TrimSpace(v)); nerr == nil {
+			out.AuditDays = n
+		}
+	}
+	if v, err := s.store.GetSetting(ctx, settingRetentionTrafficDays); err == nil {
+		if n, nerr := strconv.Atoi(strings.TrimSpace(v)); nerr == nil {
+			out.TrafficDays = n
+		}
+	}
+	if v, err := s.store.GetSetting(ctx, settingRetentionVisitorsDays); err == nil {
+		if n, nerr := strconv.Atoi(strings.TrimSpace(v)); nerr == nil {
+			out.VisitorsDays = n
+		}
+	}
+	if v, err := s.store.GetSetting(ctx, settingRetentionThreatDays); err == nil {
+		if n, nerr := strconv.Atoi(strings.TrimSpace(v)); nerr == nil {
+			out.ThreatDays = n
+		}
+	}
+	if v, err := s.store.GetSetting(ctx, settingRetentionBlockedDays); err == nil {
+		if n, nerr := strconv.Atoi(strings.TrimSpace(v)); nerr == nil {
+			out.BlockedDays = n
+		}
+	}
+	if v, err := s.store.GetSetting(ctx, settingRetentionLoginDays); err == nil {
+		if n, nerr := strconv.Atoi(strings.TrimSpace(v)); nerr == nil {
+			out.LoginAttemptDays = n
+		}
+	}
+	if v, err := s.store.GetSetting(ctx, settingRetentionResetDays); err == nil {
+		if n, nerr := strconv.Atoi(strings.TrimSpace(v)); nerr == nil {
+			out.PasswordResetDays = n
+		}
+	}
+	return normalizeRetentionPolicy(out)
 }
 
 func (s *Service) ApplyStoredTimeSyncPolicy(ctx context.Context) error {
@@ -3559,6 +3716,85 @@ func (s *Service) StartThreatIntelSync(ctx context.Context) {
 			if _, err := s.SyncThreatIntelFeeds(ctx); err != nil {
 				s.log.Warn("threat intel scheduled sync failed", map[string]any{"err": err.Error()})
 			}
+		}
+	}
+}
+
+func (s *Service) RunRetentionPurge(ctx context.Context) (RetentionPurgeResult, error) {
+	policy := s.getRetentionPolicy(ctx)
+	now := time.Now().UTC()
+	var out RetentionPurgeResult
+	var err error
+	if out.AuditEvents, err = s.store.PurgeAuditEventsBefore(ctx, now.AddDate(0, 0, -policy.AuditDays)); err != nil {
+		return out, err
+	}
+	if out.TrafficBuckets, err = s.store.PurgeTrafficBucketsBefore(ctx, now.AddDate(0, 0, -policy.TrafficDays)); err != nil {
+		return out, err
+	}
+	if out.VisitorHashes, err = s.store.PurgeVisitorHashesBeforeDay(ctx, now.AddDate(0, 0, -policy.VisitorsDays)); err != nil {
+		return out, err
+	}
+	if out.ThreatMatches, err = s.store.PurgeThreatIntelMatchesBefore(ctx, now.AddDate(0, 0, -policy.ThreatDays)); err != nil {
+		return out, err
+	}
+	if out.ThreatStates, err = s.store.PurgeThreatIntelStateBefore(ctx, now.AddDate(0, 0, -policy.ThreatDays)); err != nil {
+		return out, err
+	}
+	if out.BlockedIPs, err = s.store.PurgeBlockedIPsBefore(ctx, now.AddDate(0, 0, -policy.BlockedDays)); err != nil {
+		return out, err
+	}
+	if out.LoginAttempts, err = s.store.PurgeLoginAttemptsBefore(ctx, now.AddDate(0, 0, -policy.LoginAttemptDays)); err != nil {
+		return out, err
+	}
+	if out.PasswordResetTokens, err = s.store.PurgePasswordResetTokensBefore(ctx, now.AddDate(0, 0, -policy.PasswordResetDays)); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func (s *Service) StartRetentionWorker(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	lastRunDay := ""
+	run := func() {
+		result, err := s.RunRetentionPurge(ctx)
+		if err != nil {
+			s.log.Warn("retention purge failed", map[string]any{"err": err.Error()})
+			return
+		}
+		total := result.Total()
+		if total <= 0 {
+			return
+		}
+		meta := "audit=" + strconv.FormatInt(result.AuditEvents, 10) +
+			";traffic=" + strconv.FormatInt(result.TrafficBuckets, 10) +
+			";visitors=" + strconv.FormatInt(result.VisitorHashes, 10) +
+			";threat_matches=" + strconv.FormatInt(result.ThreatMatches, 10) +
+			";threat_states=" + strconv.FormatInt(result.ThreatStates, 10) +
+			";blocked=" + strconv.FormatInt(result.BlockedIPs, 10) +
+			";login_attempts=" + strconv.FormatInt(result.LoginAttempts, 10) +
+			";password_reset_tokens=" + strconv.FormatInt(result.PasswordResetTokens, 10) +
+			";total=" + strconv.FormatInt(total, 10)
+		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
+			Actor:  "system",
+			Action: "retention.purge",
+			Target: "runtime",
+			Meta:   meta,
+		})
+	}
+	run()
+	lastRunDay = time.Now().UTC().Format("2006-01-02")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			day := time.Now().UTC().Format("2006-01-02")
+			if day == lastRunDay {
+				continue
+			}
+			lastRunDay = day
+			run()
 		}
 	}
 }

@@ -15,7 +15,8 @@ type LogServerSyslogSettings = { enabled: boolean; protocol: 'udp' | 'tcp'; addr
 type LogServerHTTPSettings = { enabled: boolean; url: string; timeoutSec: number; minLevel: 'info' | 'warn' | 'error'; insecure: boolean };
 type LogServerTCPJSONSettings = { enabled: boolean; address: string; timeoutSec: number; minLevel: 'info' | 'warn' | 'error' };
 type LogServerSettings = { syslog: LogServerSyslogSettings; http: LogServerHTTPSettings; tcpJson: LogServerTCPJSONSettings };
-type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean };
+type RetentionPolicy = { auditDays: number; trafficDays: number; visitorsDays: number; threatDays: number; blockedDays: number; loginAttemptDays: number; passwordResetDays: number };
+type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean; retention?: RetentionPolicy };
 type TimeSyncProbe = { name: string; target: string; ok: boolean; offsetMs: number; rttMs: number; error?: string; detail?: string };
 type TimeSyncStatus = { mode: 'system_only' | 'external_public' | 'external_lan'; healthy: boolean; severity: 'ok' | 'warn' | 'critical'; summary: string; source?: string; offsetMs?: number; checkedAt: string; probes: TimeSyncProbe[] };
 type SystemHealth = {
@@ -103,6 +104,15 @@ const defaultLogServers = (): LogServerSettings => ({
   syslog: { enabled: false, protocol: 'udp', address: '', minLevel: 'info', appName: 'DomNexDomain' },
   http: { enabled: false, url: '', timeoutSec: 4, minLevel: 'warn', insecure: false },
   tcpJson: { enabled: false, address: '', timeoutSec: 3, minLevel: 'info' },
+});
+const defaultRetentionPolicy = (): RetentionPolicy => ({
+  auditDays: 90,
+  trafficDays: 30,
+  visitorsDays: 30,
+  threatDays: 60,
+  blockedDays: 60,
+  loginAttemptDays: 30,
+  passwordResetDays: 7,
 });
 const MONOLITH_THEME: ThemeVars = {
   bg: '#0f0f11',
@@ -354,6 +364,7 @@ function App() {
   const [settingsTimeSyncLAN, setSettingsTimeSyncLAN] = useState('');
   const [settingsLogServers, setSettingsLogServers] = useState<LogServerSettings>(defaultLogServers());
   const [settingsLogHTTPBearer, setSettingsLogHTTPBearer] = useState('');
+  const [settingsRetention, setSettingsRetention] = useState<RetentionPolicy>(defaultRetentionPolicy());
   const [timeSyncStatus, setTimeSyncStatus] = useState<TimeSyncStatus | null>(null);
   const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
@@ -478,6 +489,7 @@ function App() {
         setSettingsTimeSyncMode((s.timeSyncMode as 'system_only' | 'external_public' | 'external_lan') || 'system_only');
         setSettingsTimeSyncLAN((s.timeSyncLANServers || []).join(', '));
         setSettingsLogServers(s.logServers || defaultLogServers());
+        setSettingsRetention(s.retention || defaultRetentionPolicy());
       } catch {
         setSettings(null);
         setSettingsPublicIPv4('');
@@ -487,6 +499,7 @@ function App() {
         setSettingsTimeSyncMode('system_only');
         setSettingsTimeSyncLAN('');
         setSettingsLogServers(defaultLogServers());
+        setSettingsRetention(defaultRetentionPolicy());
       }
       try {
         const ts = await api<TimeSyncStatus>('/api/v1/time-sync');
@@ -729,6 +742,7 @@ function App() {
       setSettingsStyleCustom('');
       setSettingsTimeSyncMode('system_only');
       setSettingsTimeSyncLAN('');
+      setSettingsRetention(defaultRetentionPolicy());
       setTimeSyncStatus(null);
       setSystemHealth(null);
       void loadPublicStyle();
@@ -1348,6 +1362,7 @@ function App() {
           timeSyncLANServers: settingsTimeSyncLAN,
           logServers: settingsLogServers,
           logHttpBearer: settingsLogHTTPBearer,
+          retention: settingsRetention,
         }),
       });
       setSettingsCFToken('');
@@ -3250,9 +3265,42 @@ function App() {
                     </>
                   ) : null}
                   {settingsTab === 'advanced' ? (
-                    <div className="muted">
-                      Runtime settings are persisted in SQLite and applied by the service runtime. Use `Reload Service` after updates that affect edge behavior.
-                    </div>
+                    <>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>Data Retention Policy</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Audit Events (days)</label>
+                            <input type="number" min={1} max={3650} value={String(settingsRetention.auditDays || 90)} onChange={(e) => setSettingsRetention((p) => ({ ...p, auditDays: Number(e.target.value) || 90 }))} />
+                          </div>
+                          <div className="field">
+                            <label>Traffic Buckets (days)</label>
+                            <input type="number" min={1} max={3650} value={String(settingsRetention.trafficDays || 30)} onChange={(e) => setSettingsRetention((p) => ({ ...p, trafficDays: Number(e.target.value) || 30 }))} />
+                          </div>
+                          <div className="field">
+                            <label>Visitor Hashes (days)</label>
+                            <input type="number" min={1} max={3650} value={String(settingsRetention.visitorsDays || 30)} onChange={(e) => setSettingsRetention((p) => ({ ...p, visitorsDays: Number(e.target.value) || 30 }))} />
+                          </div>
+                          <div className="field">
+                            <label>Threat Intel Events (days)</label>
+                            <input type="number" min={1} max={3650} value={String(settingsRetention.threatDays || 60)} onChange={(e) => setSettingsRetention((p) => ({ ...p, threatDays: Number(e.target.value) || 60 }))} />
+                          </div>
+                          <div className="field">
+                            <label>Blocked IP Table (days)</label>
+                            <input type="number" min={1} max={3650} value={String(settingsRetention.blockedDays || 60)} onChange={(e) => setSettingsRetention((p) => ({ ...p, blockedDays: Number(e.target.value) || 60 }))} />
+                          </div>
+                          <div className="field">
+                            <label>Login Attempts (days)</label>
+                            <input type="number" min={1} max={3650} value={String(settingsRetention.loginAttemptDays || 30)} onChange={(e) => setSettingsRetention((p) => ({ ...p, loginAttemptDays: Number(e.target.value) || 30 }))} />
+                          </div>
+                          <div className="field">
+                            <label>Password Reset Tokens (days)</label>
+                            <input type="number" min={1} max={3650} value={String(settingsRetention.passwordResetDays || 7)} onChange={(e) => setSettingsRetention((p) => ({ ...p, passwordResetDays: Number(e.target.value) || 7 }))} />
+                          </div>
+                        </div>
+                        <div className="muted">Purge runs automatically in the background (daily). Values are persisted in runtime settings.</div>
+                      </div>
+                    </>
                   ) : null}
                   <div className="row">
                     <button className="btn" onClick={saveSettings} disabled={loading || isReadOnlyRole}>Save Settings</button>

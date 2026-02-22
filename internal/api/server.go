@@ -1363,17 +1363,18 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 		TimeSyncLANServers string                `json:"timeSyncLANServers"`
 		LogServers         app.LogServerSettings `json:"logServers"`
 		LogHTTPBearer      string                `json:"logHttpBearer"`
+		Retention          app.RetentionPolicy   `json:"retention"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom, in.TimeSyncMode, in.TimeSyncLANServers, in.LogServers, in.LogHTTPBearer); err != nil {
+	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom, in.TimeSyncMode, in.TimeSyncLANServers, in.LogServers, in.LogHTTPBearer, in.Retention); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actor := id.Username
-	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "settings.update", Target: "runtime", Meta: "acme/cloudflare/base-domain/time-sync/logservers"})
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "settings.update", Target: "runtime", Meta: "acme/cloudflare/base-domain/time-sync/logservers/retention"})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"restartNeeded": true,

@@ -194,6 +194,7 @@ func main() {
 	go pruneSessions(ctx, st, log)
 	go tr.Start(ctx)
 	go appSvc.StartThreatIntelSync(ctx)
+	go appSvc.StartRetentionWorker(ctx)
 
 	if cfg.SSHBastionOn {
 		sshBastion := bastion.New(cfg.SSHBastionAddr, cfg.SSHBastionKey, appSvc, log)

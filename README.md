@@ -45,6 +45,7 @@ Details and rollout guidance are documented in the wiki.
 - Role-based access (`admin`, `domain-admin`, `read-only`)
 - API tokens with scopes and domain boundaries
 - MetricCenter + LogCenter for operations and investigations
+- Retention policy controls with automatic daily data purge
 - Style profiles (`Monolith`, `CyberMonolith`, `Custom`) across UI, login, and edge pages
 
 ## Documentation

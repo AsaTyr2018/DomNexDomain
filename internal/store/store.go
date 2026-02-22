@@ -470,6 +470,94 @@ func (s *Store) PruneExpiredSessions(ctx context.Context) error {
 	return err
 }
 
+func (s *Store) PurgeAuditEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM audit_events WHERE created_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) PurgeTrafficBucketsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	cutoffRaw := cutoff.UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res1, err := tx.ExecContext(ctx, `DELETE FROM host_traffic_minute WHERE bucket_start < ?`, cutoffRaw)
+	if err != nil {
+		return 0, err
+	}
+	res2, err := tx.ExecContext(ctx, `DELETE FROM host_traffic_class_minute WHERE bucket_start < ?`, cutoffRaw)
+	if err != nil {
+		return 0, err
+	}
+	n1, _ := res1.RowsAffected()
+	n2, _ := res2.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n1 + n2, nil
+}
+
+func (s *Store) PurgeVisitorHashesBeforeDay(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM host_visitors_daily WHERE day < ?`, cutoff.UTC().Format("2006-01-02"))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) PurgeThreatIntelMatchesBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM threat_intel_matches WHERE last_seen_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) PurgeThreatIntelStateBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	cutoffRaw := cutoff.UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `
+DELETE FROM threat_intel_ip_state
+WHERE last_seen_at < ?
+  AND perm_block = 0
+  AND (ban_until = '' OR ban_until < ?)`, cutoffRaw, cutoffRaw)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) PurgeBlockedIPsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM blocked_ips WHERE updated_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) PurgeLoginAttemptsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM login_attempts WHERE last_failed_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) PurgePasswordResetTokensBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	cutoffRaw := cutoff.UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `
+DELETE FROM password_reset_tokens
+WHERE expires_at < ?
+   OR (used_at IS NOT NULL AND used_at < ?)`, cutoffRaw, cutoffRaw)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func HashToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
