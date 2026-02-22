@@ -2391,6 +2391,62 @@ func (s *Service) ensurePublicIPv4(ctx context.Context) (string, error) {
 	return ip, nil
 }
 
+func (s *Service) StartPublicIPSync(ctx context.Context) {
+	timer := time.NewTimer(untilNextFullHour(time.Now()))
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.syncPublicIPOnce(ctx)
+			timer.Reset(untilNextFullHour(time.Now()))
+		}
+	}
+}
+
+func untilNextFullHour(now time.Time) time.Duration {
+	next := now.Truncate(time.Hour).Add(time.Hour)
+	d := next.Sub(now)
+	if d <= 0 {
+		return time.Hour
+	}
+	return d
+}
+
+func (s *Service) syncPublicIPOnce(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, 12*time.Second)
+	defer cancel()
+
+	detected, err := detectPublicIPv4(ctx)
+	if err != nil {
+		s.log.Warn("public IP sync check failed", map[string]any{"err": err.Error()})
+		return
+	}
+	current, err := s.currentPublicIPv4(ctx)
+	if err != nil {
+		s.log.Warn("public IP sync current value unavailable", map[string]any{"err": err.Error()})
+		current = ""
+	}
+	if strings.TrimSpace(current) == strings.TrimSpace(detected) {
+		return
+	}
+	if err := s.store.SetSetting(ctx, settingPublicIPv4, detected); err != nil {
+		s.log.Warn("public IP sync settings update failed", map[string]any{"err": err.Error(), "new": detected})
+		return
+	}
+	if err := s.UpdatePublicIP(ctx, detected); err != nil {
+		s.log.Warn("public IP sync update failed", map[string]any{"err": err.Error(), "new": detected})
+		return
+	}
+	_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
+		Actor:  "system",
+		Action: "network.public_ip.changed.auto",
+		Target: detected,
+		Meta:   "old=" + strings.TrimSpace(current) + ";new=" + strings.TrimSpace(detected),
+	})
+}
+
 func parseIPv4(raw string) (string, error) {
 	parsed := net.ParseIP(strings.TrimSpace(raw))
 	if parsed == nil || parsed.To4() == nil {

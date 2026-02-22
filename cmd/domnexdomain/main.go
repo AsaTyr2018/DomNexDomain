@@ -195,6 +195,7 @@ func main() {
 	go tr.Start(ctx)
 	go appSvc.StartThreatIntelSync(ctx)
 	go appSvc.StartRetentionWorker(ctx)
+	go appSvc.StartPublicIPSync(ctx)
 
 	if cfg.SSHBastionOn {
 		sshBastion := bastion.New(cfg.SSHBastionAddr, cfg.SSHBastionKey, appSvc, log)
