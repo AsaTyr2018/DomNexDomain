@@ -66,6 +66,7 @@ func (s *Server) Router() http.Handler {
 	r.Group(func(pr chi.Router) {
 		pr.Use(s.requireAuth(model.RoleReadOnly, ""))
 		pr.Get("/api/v1/me", s.handleMe)
+		pr.Get("/api/v1/me/profile", s.handleMeProfileGet)
 		pr.Post("/api/v1/logout", s.handleLogout)
 		pr.Get("/api/v1/domains", s.handleListDomains)
 		pr.Get("/api/v1/domains/{id}/live-check", s.handleDomainLiveCheck)
@@ -98,6 +99,7 @@ func (s *Server) Router() http.Handler {
 		pr.Use(s.requireAuth(model.RoleReadOnly, ""))
 		pr.Use(s.requireCSRF)
 		pr.Post("/api/v1/me/password", s.handleChangeOwnPassword)
+		pr.Post("/api/v1/me/profile", s.handleMeProfileSet)
 	})
 
 	r.Group(func(pr chi.Router) {
@@ -690,6 +692,45 @@ func (s *Server) handleLogoutAll(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"identity": identityFrom(r.Context())})
+}
+
+func profileEmailSettingKey(username string) string {
+	return "profile.email." + strings.ToLower(strings.TrimSpace(username))
+}
+
+func (s *Server) handleMeProfileGet(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	email := ""
+	if v, err := s.app.Store().GetSetting(r.Context(), profileEmailSettingKey(id.Username)); err == nil {
+		email = strings.TrimSpace(v)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"email": email})
+}
+
+func (s *Server) handleMeProfileSet(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	var in struct {
+		Email string `json:"email"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	email := strings.TrimSpace(in.Email)
+	if len(email) > 254 {
+		writeErr(w, http.StatusBadRequest, "email too long")
+		return
+	}
+	if email != "" && (!strings.Contains(email, "@") || strings.ContainsAny(email, " \t\r\n")) {
+		writeErr(w, http.StatusBadRequest, "invalid email")
+		return
+	}
+	if err := s.app.Store().SetSetting(r.Context(), profileEmailSettingKey(id.Username), email); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "profile.email.update", Target: id.Username, Meta: ""})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "email": email})
 }
 
 func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {

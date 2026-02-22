@@ -95,8 +95,9 @@ type ThreatIntelBlocked = { ip: string; reason?: string; history?: string; updat
 type ThreatIntelMatchesPage = { items: ThreatIntelMatch[]; total: number; page: number; pageSize: number };
 type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; page: number; pageSize: number };
 type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
+type MeProfile = { email: string };
 
-type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'apiDocs' | 'ssh' | 'audit';
+type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'ssh' | 'audit' | 'account' | 'accessControl' | 'integrations' | 'help';
 type SettingsTab = 'general' | 'security' | 'logservers' | 'appearance' | 'advanced';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
@@ -499,7 +500,7 @@ function App() {
   const [editUserIPCheckDisabled, setEditUserIPCheckDisabled] = useState(false);
   const [usersRoleFilter, setUsersRoleFilter] = useState<'all' | 'admin' | 'domain-admin' | 'read-only'>('all');
   const [usersQuery, setUsersQuery] = useState('');
-  const [showPasswordDialog, setShowPasswordDialog] = useState(false);
+  const [selfNotifyEmail, setSelfNotifyEmail] = useState('');
   const [selfCurrentPassword, setSelfCurrentPassword] = useState('');
   const [selfNewPassword, setSelfNewPassword] = useState('');
   const [selfConfirmPassword, setSelfConfirmPassword] = useState('');
@@ -545,11 +546,18 @@ function App() {
         setDomains([]);
         setHosts([]);
         setAudit([]);
+        setSelfNotifyEmail('');
         return;
       }
       await api('/api/v1/csrf');
       const me = await api<{ identity: Identity }>('/api/v1/me');
       setIdentity(me.identity);
+      try {
+        const profile = await api<MeProfile>('/api/v1/me/profile');
+        setSelfNotifyEmail((profile.email || '').trim());
+      } catch {
+        setSelfNotifyEmail('');
+      }
       setSetupStatus(st && st.initialized ? st : null);
       const [d, h, a] = await Promise.all([
         api<{ items: Domain[] }>('/api/v1/domains'),
@@ -1210,6 +1218,10 @@ function App() {
       setBackupSettings(defaultBackupScheduleSettings());
       setBackupPassphrase('');
       setBackupRestorePassphrase('');
+      setSelfNotifyEmail('');
+      setSelfCurrentPassword('');
+      setSelfNewPassword('');
+      setSelfConfirmPassword('');
       setBackupRestoreConfirm('');
       setBackupRestoreFile(null);
       setBackupMetaPreview(null);
@@ -2274,7 +2286,24 @@ function App() {
       setSelfCurrentPassword('');
       setSelfNewPassword('');
       setSelfConfirmPassword('');
-      setShowPasswordDialog(false);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveMyProfile = async () => {
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      await api('/api/v1/me/profile', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ email: selfNotifyEmail.trim() }),
+      });
+      setSettingsMessage('Account profile saved.');
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -2555,6 +2584,23 @@ function App() {
 
   const tiTotalCurrent = tiView === 'events' ? tiTotalMatches : tiTotalOffenders;
   const tiPageCount = Math.max(1, Math.ceil(Math.max(0, tiTotalCurrent) / Math.max(1, tiPageSize)));
+  const tabTitle: Record<Tab, string> = {
+    dashboard: 'Dashboard',
+    metricCenter: 'Metric Center',
+    audit: 'Log Center',
+    domains: 'Domains',
+    hosts: 'Subdomains',
+    threatIntel: 'Threat Intel',
+    ssh: 'SSH Bastion',
+    backup: 'Backup Center',
+    settings: 'Settings',
+    users: 'Users',
+    api: 'API Management',
+    account: 'My Account',
+    accessControl: 'Access Control',
+    integrations: 'Integrations',
+    help: 'Help & Support',
+  };
 
   return (
     <>
@@ -2566,40 +2612,48 @@ function App() {
           </div>
           <nav className="menu">
             <div className="menu-group">
-              <div className="menu-title">Operations</div>
+              <div className="menu-title">Overview</div>
               <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
-              <button className={tab === 'metricCenter' ? 'active' : ''} onClick={() => setTab('metricCenter')}>MetricCenter</button>
-              <button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>LogCenter</button>
+              <button className={tab === 'metricCenter' ? 'active' : ''} onClick={() => setTab('metricCenter')}>Metric Center</button>
+              <button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Log Center</button>
             </div>
             <div className="menu-group">
-              <div className="menu-title">Routing</div>
+              <div className="menu-title">Edge Routing</div>
               <button className={tab === 'domains' ? 'active' : ''} onClick={() => setTab('domains')}>Domains</button>
               <button className={tab === 'hosts' ? 'active' : ''} onClick={() => setTab('hosts')}>Subdomains</button>
-              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'backup' ? 'active' : ''} onClick={() => setTab('backup')}>Backup</button> : null}
-              <button className={tab === 'threatIntel' ? 'active' : ''} onClick={() => setTab('threatIntel')}>Threat Intel</button>
               {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'ssh' ? 'active' : ''} onClick={() => setTab('ssh')}>SSH Bastion</button> : null}
             </div>
-            {(identity?.role === 'admin' || isReadOnlyRole) ? (
-              <div className="menu-group">
-                <div className="menu-title">Administration</div>
-                <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button>
-                <button className={tab === 'api' ? 'active' : ''} onClick={() => setTab('api')}>API Mgmt</button>
-                <button className={tab === 'apiDocs' ? 'active' : ''} onClick={() => setTab('apiDocs')}>API Docs</button>
-                <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Settings</button>
-              </div>
-            ) : null}
+            <div className="menu-group">
+              <div className="menu-title">Security</div>
+              <button className={tab === 'threatIntel' ? 'active' : ''} onClick={() => setTab('threatIntel')}>Threat Intel</button>
+              <button className={tab === 'accessControl' ? 'active' : ''} onClick={() => setTab('accessControl')}>Access Control</button>
+              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'api' ? 'active' : ''} onClick={() => setTab('api')}>API Management</button> : null}
+            </div>
+            <div className="menu-group">
+              <div className="menu-title">Identity</div>
+              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button> : null}
+              <button className={tab === 'account' ? 'active' : ''} onClick={() => setTab('account')}>My Account</button>
+            </div>
+            <div className="menu-group">
+              <div className="menu-title">Operations</div>
+              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'backup' ? 'active' : ''} onClick={() => setTab('backup')}>Backup Center</button> : null}
+              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Settings</button> : null}
+              <button className={tab === 'integrations' ? 'active' : ''} onClick={() => setTab('integrations')}>Integrations</button>
+            </div>
+            <div className="menu-group">
+              <button className={tab === 'help' ? 'active' : ''} onClick={() => setTab('help')}>Help &amp; Support</button>
+            </div>
           </nav>
         </aside>
 
         <main className="main">
           <header className="top">
             <div>
-              <h1>Overview</h1>
+              <h1>{tabTitle[tab] || 'DomNexDomain'}</h1>
               <p className="subtitle">{domains.length} Domains · {hosts.length} Subdomains</p>
             </div>
             <div className="top-actions">
               <button className="btn" onClick={refresh} disabled={loading}>Refresh</button>
-              {identity ? <button className="btn" onClick={() => setShowPasswordDialog(true)}>Change Password</button> : null}
               {identity ? <button className="btn" onClick={logout}>Logout</button> : null}
             </div>
           </header>
@@ -4155,159 +4209,103 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
             </section>
           ) : null}
 
-          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'apiDocs' ? (
+          {tab === 'help' ? (
             <section className="card">
-              <div className="card-head"><h3>API Documentation</h3></div>
-              <div className="card" style={{ marginBottom: '.8rem' }}>
-                <h4 style={{ marginTop: 0 }}>Authentication</h4>
-                <div className="muted">All mutating endpoints require authentication. No unauthenticated write API.</div>
-                <pre style={{ marginTop: '.5rem' }}>{`# Session (WebUI)
-GET  /api/v1/csrf
-POST /api/v1/login
-
-# Token (Automation)
-Authorization: Bearer dnx_xxx`}</pre>
+              <div className="card-head"><h3>Help &amp; Support</h3></div>
+              <div className="muted" style={{ marginBottom: '.8rem' }}>
+                Documentation and support have been consolidated into official external channels.
               </div>
-
               <div className="card" style={{ marginBottom: '.8rem' }}>
-                <h4 style={{ marginTop: 0 }}>Token Permission Model</h4>
-                <pre>{`global:read / global:write
-domains:read / domains:write
-hosts:read / hosts:write
-settings:read / settings:write
-users:read / users:write
-tokens:read / tokens:write
-audit:read
-reload:write
-dns:write / cert:write
-
-If no global scope is set:
-domainIds limit access to these domains/hosts.`}</pre>
+                <h4 style={{ marginTop: 0 }}>Official Documentation</h4>
+                <div className="row">
+                  <a className="btn ghost" href="https://github.com/AsaTyr2018/DomNexDomain/wiki" target="_blank" rel="noreferrer">Open Wiki</a>
+                </div>
+                <div className="muted" style={{ marginTop: '.4rem' }}>
+                  The complete API usage guide has been moved to the official Wiki.
+                </div>
               </div>
-
               <div className="card" style={{ marginBottom: '.8rem' }}>
-                <h4 style={{ marginTop: 0 }}>API Base</h4>
-                <pre>{`BASE=http://<domnex>:8443
-TOKEN=dnx_xxx
-
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/me"`}</pre>
+                <h4 style={{ marginTop: 0 }}>Community Support</h4>
+                <div className="row">
+                  <a className="btn ghost" href="https://discord.gg/GnAUmXhfeG" target="_blank" rel="noreferrer">Join Discord</a>
+                </div>
               </div>
-
-              <div className="card" style={{ marginBottom: '.8rem' }}>
-                <h4 style={{ marginTop: 0 }}>Domain Actions</h4>
-                <pre>{`# List domains
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/domains"
-
-# Domain preflight
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"name":"example.com","dnsMode":"cloudflare","provider":"cloudflare","zoneId":""}' \\
-  "$BASE/api/v1/domains/preflight"
-
-# Create/Update domain
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"name":"example.com","dnsMode":"cloudflare","certMode":"letsencrypt","provider":"cloudflare","zoneId":""}' \\
-  "$BASE/api/v1/domains"
-
-# Domain Live Check
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/domains/24/live-check"
-
-# Delete domain
-curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/domains/24"`}</pre>
+              <div className="card">
+                <h4 style={{ marginTop: 0 }}>Source Code & Issues</h4>
+                <div className="row">
+                  <a className="btn ghost" href="https://github.com/AsaTyr2018/DomNexDomain" target="_blank" rel="noreferrer">Open Repository</a>
+                  <a className="btn ghost" href="https://github.com/AsaTyr2018/DomNexDomain/issues" target="_blank" rel="noreferrer">Open Issues</a>
+                </div>
               </div>
+            </section>
+          ) : null}
 
-              <div className="card" style={{ marginBottom: '.8rem' }}>
-                <h4 style={{ marginTop: 0 }}>Subdomain / Host Actions</h4>
-                <pre>{`# List hosts
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/hosts"
-
-# Host preflight
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"domain":"example.com","subdomain":"app","upstream":"https://127.0.0.1:3000","insecureTls":true,"haEnabled":false}' \\
-  "$BASE/api/v1/hosts/preflight"
-
-# Create host
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"domain":"example.com","subdomain":"app","upstream":"https://127.0.0.1:3000","insecureTls":true,"haEnabled":false}' \\
-  "$BASE/api/v1/hosts"
-
-# Create HA host (explicit HA mode)
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{
-    "domain":"example.com",
-    "subdomain":"app-ha",
-    "insecureTls":true,
-    "haEnabled":true,
-    "haMode":"failover",
-    "haBackends":[
-      {"name":"server1","url":"https://10.0.0.11:8443"},
-      {"name":"server2","url":"https://10.0.0.12:8443"}
-    ]
-  }' "$BASE/api/v1/hosts"
-
-# Update host routing settings
-curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"upstream":"https://127.0.0.1:3001","insecureTls":false,"haEnabled":false}' \\
-  "$BASE/api/v1/hosts/5"
-
-# Host diagnostics
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/hosts/diagnostics"
-
-# Host retry
-curl -X POST -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/hosts/5/retry"
-
-# Update host auth page settings
-curl -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"enabled":true,"username":"musicuser","password":"StrongPass123"}' \\
-  "$BASE/api/v1/hosts/5/auth"
-
-# Delete host
-curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/hosts/5"`}</pre>
+          {tab === 'account' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card" style={{ marginBottom: '.6rem' }}>
+                  <div className="card-head"><h3>Profile</h3></div>
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>Username</label>
+                      <input value={identity?.username || ''} disabled />
+                    </div>
+                    <div className="field">
+                      <label>Role</label>
+                      <input value={identity?.role || ''} disabled />
+                    </div>
+                    <div className="field">
+                      <label>Notification Email (future use)</label>
+                      <input value={selfNotifyEmail} onChange={(e) => setSelfNotifyEmail(e.target.value)} placeholder="name@example.com" />
+                    </div>
+                  </div>
+                  <div className="row" style={{ marginBottom: 0 }}>
+                    <button className="btn" onClick={saveMyProfile} disabled={loading}>Save Profile</button>
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Change Password</h3></div>
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>Current Password</label>
+                      <input type="password" value={selfCurrentPassword} onChange={(e) => setSelfCurrentPassword(e.target.value)} placeholder="Current password" />
+                    </div>
+                    <div className="field">
+                      <label>New Password</label>
+                      <input type="password" value={selfNewPassword} onChange={(e) => setSelfNewPassword(e.target.value)} placeholder="New password (min 10)" />
+                    </div>
+                    <div className="field">
+                      <label>Confirm New Password</label>
+                      <input type="password" value={selfConfirmPassword} onChange={(e) => setSelfConfirmPassword(e.target.value)} placeholder="Confirm new password" />
+                    </div>
+                  </div>
+                  <div className="row" style={{ marginBottom: 0 }}>
+                    <button className="btn" onClick={changeOwnPassword} disabled={loading || selfNewPassword.length < 10 || selfNewPassword !== selfConfirmPassword}>Save Password</button>
+                  </div>
+                </section>
               </div>
+              <aside className="entity-side">
+                <section className="card">
+                  <div className="card-head"><h3>Account Notes</h3></div>
+                  <div className="muted">Notification email is stored for upcoming alerting features and does not trigger outbound notifications yet.</div>
+                </section>
+              </aside>
+            </section>
+          ) : null}
 
-              <div className="card" style={{ marginBottom: '.8rem' }}>
-                <h4 style={{ marginTop: 0 }}>System Actions</h4>
-                <pre>{`# Read settings
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/settings"
+          {tab === 'accessControl' ? (
+            <section className="card">
+              <div className="card-head"><h3>Access Control</h3></div>
+              <div className="badge warn">Coming soon</div>
+              <p className="muted">Centralized policy controls for admin/API access hardening, scoped by environment and integration targets.</p>
+            </section>
+          ) : null}
 
-# Update settings
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"acmeEmail":"admin@example.com","acmeStaging":false,"publicIpv4":"203.0.113.10"}' \\
-  "$BASE/api/v1/settings"
-
-# Service reload
-curl -X POST -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/reload"
-
-# Audit logs
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/audit"`}</pre>
-              </div>
-
-              <div className="card" style={{ marginBottom: '.8rem' }}>
-                <h4 style={{ marginTop: 0 }}>User & Token Management</h4>
-                <pre>{`# User list
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/users"
-
-# Create user
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"username":"ops1","password":"SuperSecret123","role":"domain-admin","domainIds":[24]}' \\
-  "$BASE/api/v1/users"
-
-# Token list
-curl -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens"
-
-# Create token (domain scoped)
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{
-    "name":"ci-token",
-    "role":"operator",
-    "domainIds":[24],
-    "permissions":{"domainRead":true,"domainWrite":true,"globalRead":false,"globalWrite":false,"systemRead":false,"systemWrite":false},
-    "scopes":[],
-    "expiresIn":"720h"
-  }' "$BASE/api/v1/tokens"
-
-# Token revoke
-curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
-              </div>
+          {tab === 'integrations' ? (
+            <section className="card">
+              <div className="card-head"><h3>Integrations</h3></div>
+              <div className="badge warn">Coming soon</div>
+              <p className="muted">Integration adapters (e.g. DomRoute, DomHA, DomHost) with trusted app handshake and feature panels.</p>
             </section>
           ) : null}
 
@@ -4670,24 +4668,6 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         </div>
       ) : null}
 
-      {identity && showPasswordDialog ? (
-        <div className="overlay">
-          <div className="login-card">
-            <h3>Change Password</h3>
-            <p className="muted">Update your current account password.</p>
-            <div className="col">
-              <input type="password" value={selfCurrentPassword} onChange={(e) => setSelfCurrentPassword(e.target.value)} placeholder="Current password" />
-              <input type="password" value={selfNewPassword} onChange={(e) => setSelfNewPassword(e.target.value)} placeholder="New password (min 10)" />
-              <input type="password" value={selfConfirmPassword} onChange={(e) => setSelfConfirmPassword(e.target.value)} placeholder="Confirm new password" />
-              <div className="row" style={{ marginBottom: 0 }}>
-                <button className="btn" onClick={changeOwnPassword} disabled={loading || selfNewPassword.length < 10 || selfNewPassword !== selfConfirmPassword}>Save Password</button>
-                <button className="btn danger" onClick={() => { setShowPasswordDialog(false); setSelfCurrentPassword(''); setSelfNewPassword(''); setSelfConfirmPassword(''); }}>Cancel</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
       {identity && deleteHostDialogOpen ? (
         <div className="overlay">
           <div className="login-card">
@@ -5013,8 +4993,27 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         * { box-sizing: border-box; }
         body { margin:0; font-family:'Inter', system-ui, sans-serif; background:var(--bg); color:var(--text); }
         .app-shell { display:grid; grid-template-columns:240px 1fr; min-height:100vh; }
-        .sidebar { background:var(--surface); border-right:1px solid var(--border); padding:1.5rem 0; }
-        .logo { padding:0 .85rem 1.25rem; display:grid; place-items:center; }
+        .sidebar {
+          background:var(--surface);
+          border-right:1px solid var(--border);
+          height:100vh;
+          position:sticky;
+          top:0;
+          display:flex;
+          flex-direction:column;
+          overflow:hidden;
+        }
+        .logo {
+          padding:1.5rem .85rem 1rem;
+          display:grid;
+          place-items:center;
+          position:sticky;
+          top:0;
+          z-index:3;
+          background:var(--surface);
+          border-bottom:1px solid var(--border);
+          flex:0 0 auto;
+        }
         .logo img {
           width:100%;
           max-width:220px;
@@ -5033,7 +5032,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
           -webkit-mask-composite: source-in;
           mask-composite: intersect;
         }
-        .menu { display:grid; gap:.25rem; padding:0 .5rem; }
+        .menu { display:grid; gap:.25rem; padding:.8rem .5rem 1rem; overflow-y:auto; min-height:0; flex:1 1 auto; }
         .menu-group { display:grid; gap:.25rem; margin-bottom:.35rem; }
         .menu-title { color:var(--text-dim); font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; padding:.35rem .9rem .15rem; }
         .menu button { text-align:left; background:transparent; border:1px solid transparent; color:var(--text-dim); padding:.85rem 1rem; border-radius:10px; cursor:pointer; }
@@ -5205,7 +5204,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         }
         .col { display:grid; gap:.6rem; }
         @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} .user-ops-filters{grid-template-columns:1fr 1fr;} .user-ops-filters .row{justify-content:flex-start;} .snapshot-row{grid-template-columns:1fr;} }
-        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} .snapshot-row{grid-template-columns:1fr;} }
+        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);height:auto;position:static;overflow:visible;} .logo{position:static;border-bottom:none;padding:1rem .85rem .35rem;} .menu{overflow:visible;padding:0 .5rem .8rem;} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} .snapshot-row{grid-template-columns:1fr;} }
       `}</style>
     </>
   );
