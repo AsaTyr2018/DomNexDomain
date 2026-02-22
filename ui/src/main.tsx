@@ -495,6 +495,8 @@ function App() {
   const [metricHostFilter, setMetricHostFilter] = useState('all');
   const [metricHours, setMetricHours] = useState(24);
   const [metricClass, setMetricClass] = useState<'all' | 'human' | 'crawler' | 'unknown'>('all');
+  const [metricCountryFocus, setMetricCountryFocus] = useState('all');
+  const [metricMapOpen, setMetricMapOpen] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -1862,6 +1864,87 @@ function App() {
   const metricTopReq = metricCountries.length > 0 ? metricCountries[0].requests || 1 : 1;
   const metricUnknownTotal = metricCountries.find((c) => (c.country || '').toUpperCase() === 'ZZ')?.requests || 0;
   const metricUnknownBreakdown = [...(metricCountryOverview?.unknownBreakdown || [])].sort((a, b) => (b.requests || 0) - (a.requests || 0));
+  const metricFilteredCountries = metricCountryFocus === 'all'
+    ? metricCountries
+    : metricCountries.filter((c) => (c.country || '').toUpperCase() === metricCountryFocus.toUpperCase());
+  const metricTotalRequests = metricCountryOverview?.totalRequests || 0;
+  const metricTotalBlocked = metricCountryOverview?.totalBlocked || 0;
+  const metricTotalBytesOut = metricCountryOverview?.totalBytesOut || 0;
+  const metricError4xx = metricCountries.reduce((s, c) => s + (c.status4xx || 0), 0);
+  const metricError5xx = metricCountries.reduce((s, c) => s + (c.status5xx || 0), 0);
+  const metric2xx = metricCountries.reduce((s, c) => s + (c.status2xx || 0), 0);
+  const metricErrRatePct = metricTotalRequests > 0 ? Math.round(((metricError4xx + metricError5xx) / metricTotalRequests) * 100) : 0;
+  const metric5xxRatePct = metricTotalRequests > 0 ? Math.round((metricError5xx / metricTotalRequests) * 100) : 0;
+  const metricBlockRatePct = metricTotalRequests > 0 ? Math.round((metricTotalBlocked / metricTotalRequests) * 100) : 0;
+  const metricSuccessRatePct = metricTotalRequests > 0 ? Math.round((metric2xx / metricTotalRequests) * 100) : 0;
+  const topCountry = metricCountries[0];
+  const topBlockedCountry = [...metricCountries].sort((a, b) => (b.blocked || 0) - (a.blocked || 0))[0];
+  const topUnknownSharePct = metricTotalRequests > 0 ? Math.round((metricUnknownTotal / metricTotalRequests) * 100) : 0;
+  const trafficSpikeScore = (() => {
+    const total = trafficOverview?.totalRequests || 0;
+    const base = Math.max(1, hosts.length * 120);
+    return Math.round((total / base) * 100);
+  })();
+  const metricProblems = [
+    {
+      id: 'p-5xx',
+      severity: metric5xxRatePct >= 5 ? 'critical' : metric5xxRatePct >= 2 ? 'warn' : 'ok',
+      issue: 'Server errors (5xx)',
+      value: `${metric5xxRatePct}%`,
+      detail: `${metricError5xx} responses`,
+      action: () => setTab('audit'),
+      actionLabel: 'Open Logs',
+    },
+    {
+      id: 'p-err',
+      severity: metricErrRatePct >= 12 ? 'critical' : metricErrRatePct >= 6 ? 'warn' : 'ok',
+      issue: 'Client+server errors',
+      value: `${metricErrRatePct}%`,
+      detail: `${metricError4xx + metricError5xx} responses`,
+      action: () => setTab('audit'),
+      actionLabel: 'Investigate',
+    },
+    {
+      id: 'p-block',
+      severity: metricBlockRatePct >= 25 ? 'critical' : metricBlockRatePct >= 10 ? 'warn' : 'ok',
+      issue: 'Blocked request ratio',
+      value: `${metricBlockRatePct}%`,
+      detail: `${metricTotalBlocked} blocked`,
+      action: () => setTab('threatIntel'),
+      actionLabel: 'Threat Intel',
+    },
+    {
+      id: 'p-ha',
+      severity: haHostsDegraded > 0 ? 'critical' : 'ok',
+      issue: 'HA degraded routes',
+      value: `${haHostsDegraded}`,
+      detail: `${haHostsMonitored} monitored`,
+      action: () => setTab('dashboard'),
+      actionLabel: 'Open Dashboard',
+    },
+    {
+      id: 'p-spike',
+      severity: trafficSpikeScore >= 220 ? 'critical' : trafficSpikeScore >= 140 ? 'warn' : 'ok',
+      issue: 'Traffic spike score',
+      value: `${trafficSpikeScore}%`,
+      detail: 'vs baseline model',
+      action: () => setTab('metricCenter'),
+      actionLabel: 'Review',
+    },
+    {
+      id: 'p-zz',
+      severity: topUnknownSharePct >= 30 ? 'warn' : 'ok',
+      issue: 'Unknown geo share',
+      value: `${topUnknownSharePct}%`,
+      detail: `${metricUnknownTotal} requests`,
+      action: () => setMetricCountryFocus('all'),
+      actionLabel: 'Details',
+    },
+  ];
+  const metricProblemsSorted = [...metricProblems].sort((a, b) => {
+    const score = (s: string) => (s === 'critical' ? 2 : s === 'warn' ? 1 : 0);
+    return score(b.severity) - score(a.severity);
+  });
   const blockedIPCount = blockedIPs.length;
   const degradedHostNames = hosts.filter((h) => h.state === 'error').map((h) => h.fqdn);
   const dashboardStoreItems = DASHBOARD_WIDGET_STORE.filter((w) => {
@@ -3197,10 +3280,10 @@ function App() {
           ) : null}
 
           {tab === 'metricCenter' ? (
-            <section className="entity-page">
+            <section className="entity-page metric-center-page">
               <div className="entity-main">
                 <section className="card">
-                  <div className="card-head"><h3>MetricCenter</h3></div>
+                  <div className="card-head"><h3>MetricCenter v2</h3></div>
                   <div className="row">
                     <select value={metricHostFilter} onChange={(e) => setMetricHostFilter(e.target.value)}>
                       <option value="all">All Subdomains</option>
@@ -3220,47 +3303,110 @@ function App() {
                       <option value="crawler">Crawler</option>
                       <option value="unknown">Unknown UA</option>
                     </select>
+                    <select value={metricCountryFocus} onChange={(e) => setMetricCountryFocus(e.target.value)}>
+                      <option value="all">All Countries</option>
+                      {metricCountries.slice(0, 50).map((c) => (
+                        <option key={`mcc-${c.country}`} value={(c.country || '').toUpperCase()}>{(c.country || 'ZZ').toUpperCase()}</option>
+                      ))}
+                    </select>
+                    <button className="btn" onClick={() => setMetricMapOpen(true)}>Open Geo Map</button>
                     <button className="btn" onClick={loadMetricCenter} disabled={loading}>Refresh</button>
                   </div>
-                  <div className="metric-grid">
-                    <MetricTile label="Requests" value={String(metricCountryOverview?.totalRequests || 0)} hint="Within selected time window" />
-                    <MetricTile label="Blocked" value={String(metricCountryOverview?.totalBlocked || 0)} hint="Geo/Auth/Policy blocked requests" />
-                    <MetricTile label="Traffic Out" value={formatBytes(metricCountryOverview?.totalBytesOut || 0)} hint="Response bytes" />
-                    <MetricTile label="Countries" value={String(metricCountries.length)} hint="Distinct country buckets" />
+                  <div className="ops-alert-strip">
+                    <AlertChip label="Error Rate" value={`${metricErrRatePct}%`} state={metricErrRatePct >= 12 ? 'critical' : metricErrRatePct >= 6 ? 'warn' : 'ok'} />
+                    <AlertChip label="5xx Rate" value={`${metric5xxRatePct}%`} state={metric5xxRatePct >= 5 ? 'critical' : metric5xxRatePct >= 2 ? 'warn' : 'ok'} />
+                    <AlertChip label="Block Rate" value={`${metricBlockRatePct}%`} state={metricBlockRatePct >= 25 ? 'critical' : metricBlockRatePct >= 10 ? 'warn' : 'ok'} />
+                    <AlertChip label="Spike Score" value={`${trafficSpikeScore}%`} state={trafficSpikeScore >= 220 ? 'critical' : trafficSpikeScore >= 140 ? 'warn' : 'ok'} />
+                    <AlertChip label="Top Country" value={(topCountry?.country || 'ZZ').toUpperCase()} state="ok" />
+                    <AlertChip label="HA Degraded" value={String(haHostsDegraded)} state={haHostsDegraded > 0 ? 'critical' : 'ok'} />
                   </div>
                 </section>
-                <section className="card">
-                  <div className="card-head"><h3>Geo Request Map</h3></div>
-                  <GeoScatterMap countries={metricCountries} />
-                </section>
-                <section className="card">
-                  <div className="card-head"><h3>Country Breakdown</h3></div>
-                  {metricCountries.length === 0 ? (
-                    <div className="muted">No traffic data for this filter yet.</div>
-                  ) : (
-                    <div className="event-list">
-                      {metricCountries.map((c) => {
-                        const pct = Math.max(1, Math.round(((c.requests || 0) / metricTopReq) * 100));
-                        return (
-                          <div key={c.country} className="event-item">
-                            <div className="event-top">
-                              <strong>{c.country || 'UNK'}</strong>
-                              <span className="muted">{c.requests} req</span>
-                            </div>
-                            <div style={{ height: 8, borderRadius: 8, background: '#0f1117', border: '1px solid #2a2a35', overflow: 'hidden' }}>
-                              <div style={{ width: `${pct}%`, height: '100%', background: 'linear-gradient(90deg,#0ea5e9,#22c55e)' }} />
-                            </div>
-                            <div className="muted" style={{ marginTop: '.3rem' }}>
-                              2xx: {c.status2xx || 0} · 3xx: {c.status3xx || 0} · 4xx: {c.status4xx || 0} · 5xx: {c.status5xx || 0} · blocked: {c.blocked || 0}
-                            </div>
-                          </div>
-                        );
-                      })}
+
+                <section className="metric-v2-layout">
+                  <section className="card metric-v2-panel">
+                    <div className="card-head"><h3>Geo Intelligence Summary</h3></div>
+                    <div className="muted">Use `Open Geo Map` for full world view and country-click filtering.</div>
+                    <div className="metric-grid" style={{ marginTop: '.6rem' }}>
+                      <MetricTile label="Requests" value={String(metricTotalRequests)} hint="Within selected time window" />
+                      <MetricTile label="Blocked" value={String(metricTotalBlocked)} hint="Geo/Auth/Policy blocked requests" />
+                      <MetricTile label="Traffic Out" value={formatBytes(metricTotalBytesOut)} hint="Response bytes" />
+                      <MetricTile label="Success Rate" value={`${metricSuccessRatePct}%`} hint="2xx across selected scope" />
                     </div>
-                  )}
+                  </section>
+
+                  <section className="card metric-v2-panel">
+                    <div className="card-head"><h3>Country Focus</h3></div>
+                    {metricFilteredCountries.length === 0 ? (
+                      <div className="muted">No traffic data for this filter yet.</div>
+                    ) : (
+                      <div className="event-list metric-scroll">
+                        {metricFilteredCountries.map((c) => {
+                          const pct = Math.max(1, Math.round(((c.requests || 0) / metricTopReq) * 100));
+                          return (
+                            <div key={c.country} className="event-item">
+                              <div className="event-top">
+                                <strong>{(c.country || 'ZZ').toUpperCase()}</strong>
+                                <span className="muted">{c.requests} req</span>
+                              </div>
+                              <div style={{ height: 8, borderRadius: 8, background: '#0f1117', border: '1px solid #2a2a35', overflow: 'hidden' }}>
+                                <div style={{ width: `${pct}%`, height: '100%', background: 'linear-gradient(90deg,#0ea5e9,#22c55e)' }} />
+                              </div>
+                              <div className="muted" style={{ marginTop: '.3rem' }}>
+                                2xx: {c.status2xx || 0} · 3xx: {c.status3xx || 0} · 4xx: {c.status4xx || 0} · 5xx: {c.status5xx || 0} · blocked: {c.blocked || 0}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </section>
+
+                  <section className="card metric-v2-panel">
+                    <div className="card-head"><h3>Problems Now</h3></div>
+                    <div className="log-table-wrap metric-table-wrap">
+                      <table className="log-table metric-problem-table">
+                        <thead>
+                          <tr>
+                            <th>Severity</th>
+                            <th>Issue</th>
+                            <th>Signal</th>
+                            <th>Detail</th>
+                            <th>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {metricProblemsSorted.map((p) => (
+                            <tr key={p.id}>
+                              <td><span className={`badge ${p.severity === 'critical' ? 'err' : p.severity === 'warn' ? 'warn' : 'ok'}`}>{p.severity.toUpperCase()}</span></td>
+                              <td>{p.issue}</td>
+                              <td><strong>{p.value}</strong></td>
+                              <td className="muted">{p.detail}</td>
+                              <td><button className="btn" onClick={p.action}>{p.actionLabel}</button></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="muted" style={{ marginTop: '.45rem' }}>
+                      Top blocked country: {(topBlockedCountry?.country || 'ZZ').toUpperCase()} · {topBlockedCountry?.blocked || 0} blocked
+                    </div>
+                </section>
                 </section>
               </div>
               <aside className="entity-side">
+                <section className="card">
+                  <div className="card-head"><h3>Top Countries</h3></div>
+                  {(metricCountries.slice(0, 8)).map((c) => (
+                    <div key={`top-${c.country}`} className="host">
+                      <div>
+                        <strong>{(c.country || 'ZZ').toUpperCase()}</strong>
+                        <div className="muted">{Math.round(((c.requests || 0) / Math.max(1, metricCountryOverview?.totalRequests || 1)) * 100)}%</div>
+                      </div>
+                      <div className="muted">{c.requests}</div>
+                    </div>
+                  ))}
+                  {metricCountries.length === 0 ? <div className="muted">No country data.</div> : null}
+                </section>
                 <section className="card">
                   <div className="card-head"><h3>Audit Snapshot</h3></div>
                   <div className="metric-grid">
@@ -3269,19 +3415,6 @@ function App() {
                     <MetricTile label="Info" value={String(auditInfoTotal)} hint="Read/list/login events" />
                     <MetricTile label="Unique Actors" value={String(auditActorsTotal)} hint="Across retained audit data" />
                   </div>
-                </section>
-                <section className="card">
-                  <div className="card-head"><h3>Top Countries</h3></div>
-                  {(metricCountries.slice(0, 8)).map((c) => (
-                    <div key={`top-${c.country}`} className="host">
-                      <div>
-                        <strong>{c.country || 'UNK'}</strong>
-                        <div className="muted">{Math.round(((c.requests || 0) / Math.max(1, metricCountryOverview?.totalRequests || 1)) * 100)}%</div>
-                      </div>
-                      <div className="muted">{c.requests}</div>
-                    </div>
-                  ))}
-                  {metricCountries.length === 0 ? <div className="muted">No country data.</div> : null}
                 </section>
                 {metricUnknownTotal > 0 ? (
                   <section className="card">
@@ -5417,6 +5550,24 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         </div>
       ) : null}
 
+      {identity && metricMapOpen ? (
+        <div className="overlay modal-overlay">
+          <div className="login-card modal-card" style={{ maxWidth: '1280px', width: '98vw' }}>
+            <div className="modal-head">
+              <h3>Global Geo Map</h3>
+            </div>
+            <div className="row modal-controls">
+              <div className="muted">Click country bubbles to focus. Current filter: {metricCountryFocus.toUpperCase()}</div>
+              <button className="btn" onClick={() => setMetricCountryFocus('all')}>Reset Country Filter</button>
+              <button className="btn" onClick={() => setMetricMapOpen(false)}>Close</button>
+            </div>
+            <div className="modal-body">
+              <GeoScatterMap countries={metricFilteredCountries} onSelectCountry={(code) => setMetricCountryFocus(code)} />
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <style>{`
         :root { --bg:${activeTheme.bg}; --surface:${activeTheme.surface}; --panel:${activeTheme.panel}; --panel-hover:${activeTheme.panelHover}; --border:${activeTheme.border}; --text:${activeTheme.text}; --text-dim:${activeTheme.textDim}; --accent:${activeTheme.accent}; --accent-hover:${activeTheme.accentHover}; --accent-active:${activeTheme.accentActive}; --accent-soft:${activeTheme.accentSoft}; --green:${activeTheme.success}; --red:${activeTheme.danger}; --input-bg:${activeTheme.inputBg}; --hero-a:${activeTheme.heroA}; --hero-b:${activeTheme.heroB}; --radius:12px; }
         * { box-sizing: border-box; }
@@ -5522,6 +5673,19 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .gauge-title { font-size:.82rem; text-align:center; }
         .gauge-sub { font-size:.74rem; color:var(--text-dim); text-align:center; }
         .metric-grid { display:grid; gap:.8rem; grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .ops-alert-strip { display:grid; gap:.6rem; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
+        .ops-alert-chip { border:1px solid var(--border); border-radius:11px; padding:.55rem .65rem; background:var(--panel); min-width:0; }
+        .ops-alert-chip.ok { border-color:#1d5a45; background:#103227; }
+        .ops-alert-chip.warn { border-color:#6b4d19; background:#3a2a0f; }
+        .ops-alert-chip.err { border-color:#6b2222; background:#3a1717; }
+        .metric-v2-layout { display:grid; gap:1rem; grid-template-columns:minmax(280px,.95fr) minmax(320px,.95fr) minmax(460px,1.3fr); align-items:start; }
+        .metric-v2-panel { min-height:0; }
+        .metric-scroll { max-height:58vh; }
+        .metric-table-wrap { max-height:58vh; }
+        .metric-problem-table { min-width:0; table-layout:fixed; }
+        .metric-problem-table th, .metric-problem-table td { white-space:normal; word-break:break-word; }
+        .metric-center-page { grid-template-columns:minmax(0,1fr); }
+        .metric-center-page .entity-side { grid-template-columns:repeat(2,minmax(0,1fr)); }
         .metric-tile { background:var(--panel); border:1px solid var(--border); border-radius:11px; padding:.75rem; min-width:0; }
         .metric-label { color:var(--text-dim); font-size:.78rem; margin-bottom:.35rem; }
         .metric-value { font-size:1.2rem; font-weight:700; line-height:1.2; margin-bottom:.25rem; overflow-wrap:anywhere; word-break:break-word; }
@@ -5536,6 +5700,8 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
           padding:.65rem;
         }
         .geo-map-svg { width:100%; height:auto; display:block; }
+        .geo-map-vector path { fill:#24164a; stroke:#8b5cf6; stroke-width:.85; opacity:.92; }
+        .geo-map-vector path:hover { fill:#2f1d5f; }
         .geo-map-grid { stroke:#2b3140; stroke-width:1; opacity:.75; }
         .geo-map-bubble { fill:#22c55e; stroke:#a7f3d0; stroke-width:1.5; }
         .geo-map-label { fill:#d1d5db; font-size:11px; font-weight:600; }
@@ -5635,8 +5801,8 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
           mask-composite: intersect;
         }
         .col { display:grid; gap:.6rem; }
-        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} .user-ops-filters{grid-template-columns:1fr 1fr;} .user-ops-filters .row{justify-content:flex-start;} .snapshot-row{grid-template-columns:1fr;} }
-        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);height:auto;position:static;overflow:visible;} .logo{position:static;border-bottom:none;padding:1rem .85rem .35rem;} .menu{overflow:visible;padding:0 .5rem .8rem;} .main{padding:1rem;} .card.wide{grid-column:auto;} .dashboard-grid{grid-template-columns:1fr;} .dashboard-widget{grid-column:span 1 !important; grid-row:auto !important;} .dashboard-editor-layout{grid-template-columns:1fr;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} .snapshot-row{grid-template-columns:1fr;} }
+        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .ops-alert-strip{grid-template-columns:repeat(3,minmax(0,1fr));} .metric-v2-layout{grid-template-columns:1fr;} .metric-center-page .entity-side{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} .user-ops-filters{grid-template-columns:1fr 1fr;} .user-ops-filters .row{justify-content:flex-start;} .snapshot-row{grid-template-columns:1fr;} }
+        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);height:auto;position:static;overflow:visible;} .logo{position:static;border-bottom:none;padding:1rem .85rem .35rem;} .menu{overflow:visible;padding:0 .5rem .8rem;} .main{padding:1rem;} .card.wide{grid-column:auto;} .dashboard-grid{grid-template-columns:1fr;} .dashboard-widget{grid-column:span 1 !important; grid-row:auto !important;} .dashboard-editor-layout{grid-template-columns:1fr;} .kpi-row{grid-template-columns:1fr;} .ops-alert-strip{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} .snapshot-row{grid-template-columns:1fr;} }
       `}</style>
     </>
   );
@@ -5860,40 +6026,145 @@ function Gauge({ title, value, subtitle, strictFull = false }: { title: string; 
   );
 }
 
-const COUNTRY_COORDS: Record<string, { x: number; y: number }> = {
-  US: { x: 206, y: 130 }, CA: { x: 185, y: 86 }, MX: { x: 198, y: 173 },
-  BR: { x: 280, y: 250 }, AR: { x: 268, y: 312 }, CL: { x: 246, y: 292 }, CO: { x: 244, y: 211 },
-  GB: { x: 428, y: 95 }, IE: { x: 416, y: 100 }, FR: { x: 438, y: 117 }, ES: { x: 426, y: 136 }, PT: { x: 415, y: 142 },
-  DE: { x: 451, y: 106 }, NL: { x: 442, y: 103 }, BE: { x: 440, y: 109 }, IT: { x: 463, y: 132 }, CH: { x: 452, y: 119 },
-  AT: { x: 460, y: 116 }, PL: { x: 470, y: 103 }, SE: { x: 466, y: 76 }, NO: { x: 452, y: 67 }, FI: { x: 486, y: 76 },
-  DK: { x: 452, y: 92 }, CZ: { x: 461, y: 110 }, RO: { x: 489, y: 123 }, HU: { x: 472, y: 117 }, GR: { x: 490, y: 147 },
-  TR: { x: 518, y: 136 }, UA: { x: 499, y: 104 }, RU: { x: 575, y: 86 },
-  MA: { x: 413, y: 172 }, DZ: { x: 444, y: 173 }, EG: { x: 502, y: 169 }, NG: { x: 458, y: 223 }, ZA: { x: 492, y: 320 }, KE: { x: 503, y: 251 },
-  SA: { x: 544, y: 186 }, AE: { x: 565, y: 184 }, IL: { x: 516, y: 163 }, IN: { x: 595, y: 197 }, PK: { x: 575, y: 179 },
-  CN: { x: 666, y: 141 }, JP: { x: 744, y: 145 }, KR: { x: 718, y: 137 }, TW: { x: 721, y: 164 }, HK: { x: 705, y: 166 },
-  SG: { x: 647, y: 227 }, ID: { x: 679, y: 249 }, AU: { x: 723, y: 312 }, NZ: { x: 784, y: 338 },
+const METRIC_WORLD_VIEWBOX = { w: 1009.6727, h: 665.963 };
+const METRIC_WORLD_GEO_BOUNDS = {
+  leftLon: -169.110266,
+  topLat: 83.600842,
+  rightLon: 190.486279,
+  bottomLat: -58.508473,
+};
+const COUNTRY_LONLAT: Record<string, { lon: number; lat: number }> = {
+  US: { lon: -98, lat: 39 }, CA: { lon: -106, lat: 56 }, MX: { lon: -102, lat: 23 },
+  BR: { lon: -51, lat: -10 }, AR: { lon: -64, lat: -35 }, CL: { lon: -71, lat: -33 }, CO: { lon: -74, lat: 4 },
+  GB: { lon: -2, lat: 54 }, IE: { lon: -8, lat: 53 }, FR: { lon: 2, lat: 46 }, ES: { lon: -4, lat: 40 }, PT: { lon: -8, lat: 39 },
+  DE: { lon: 10, lat: 51 }, NL: { lon: 5, lat: 52 }, BE: { lon: 4, lat: 50.5 }, IT: { lon: 12, lat: 42 }, CH: { lon: 8, lat: 47 },
+  AT: { lon: 14, lat: 47.5 }, PL: { lon: 19, lat: 52 }, SE: { lon: 16, lat: 62 }, NO: { lon: 10, lat: 62 }, FI: { lon: 26, lat: 64 },
+  DK: { lon: 10, lat: 56 }, CZ: { lon: 15, lat: 49.8 }, RO: { lon: 25, lat: 45.8 }, HU: { lon: 19, lat: 47.2 }, GR: { lon: 22, lat: 39 },
+  TR: { lon: 35, lat: 39 }, UA: { lon: 31, lat: 49 }, RU: { lon: 90, lat: 60 },
+  MA: { lon: -7, lat: 31 }, DZ: { lon: 3, lat: 28 }, EG: { lon: 30, lat: 27 }, NG: { lon: 8, lat: 9 }, ZA: { lon: 24, lat: -29 }, KE: { lon: 37, lat: 0.5 },
+  SA: { lon: 45, lat: 24 }, AE: { lon: 54, lat: 24 }, IL: { lon: 35, lat: 31 }, IN: { lon: 78, lat: 22 }, PK: { lon: 70, lat: 30 },
+  CN: { lon: 104, lat: 35 }, JP: { lon: 138, lat: 36 }, KR: { lon: 127, lat: 36 }, TW: { lon: 121, lat: 23.5 }, HK: { lon: 114, lat: 22.3 },
+  SG: { lon: 103.8, lat: 1.35 }, ID: { lon: 113, lat: -2 }, AU: { lon: 134, lat: -25 }, NZ: { lon: 174, lat: -41 },
+};
+const CONTINENT_LABELS = [
+  { text: 'North America', x: 220, y: 390 },
+  { text: 'Canada', x: 185, y: 245 },
+  { text: 'South America', x: 260, y: 505 },
+  { text: 'Europe', x: 475, y: 185 },
+  { text: 'Africa', x: 525, y: 505 },
+  { text: 'Asia', x: 860, y: 190 },
+  { text: 'Australia', x: 860, y: 585 },
+];
+
+function extractSvgInnerMarkup(svg: string): string {
+  const cleaned = svg.replace(/<\?xml[\s\S]*?\?>/gi, '').replace(/<!DOCTYPE[\s\S]*?>/gi, '');
+  const match = cleaned.match(/<svg[\s\S]*?>([\s\S]*?)<\/svg>/i);
+  return (match?.[1] || cleaned).trim();
+}
+
+function projectToMetricSvg(lon: number, lat: number): { x: number; y: number } {
+  const { leftLon, rightLon, topLat, bottomLat } = METRIC_WORLD_GEO_BOUNDS;
+  const lonSpan = rightLon - leftLon;
+  const nx = lonSpan <= 0 ? 0.5 : (lon - leftLon) / lonSpan;
+  const merc = (deg: number): number => {
+    const clamped = Math.max(-85, Math.min(85, deg));
+    const rad = (clamped * Math.PI) / 180;
+    return Math.log(Math.tan(Math.PI / 4 + rad / 2));
+  };
+  const topM = merc(topLat);
+  const bottomM = merc(bottomLat);
+  const latM = merc(lat);
+  const ny = Math.abs(topM - bottomM) < 1e-9 ? 0.5 : (topM - latM) / (topM - bottomM);
+  return {
+    x: Math.max(0, Math.min(1, nx)) * METRIC_WORLD_VIEWBOX.w,
+    y: Math.max(0, Math.min(1, ny)) * METRIC_WORLD_VIEWBOX.h,
+  };
+}
+
+const COUNTRY_LABEL_NUDGE: Record<string, { dx: number; dy: number }> = {
+  DE: { dx: 16, dy: -2 },
+  NL: { dx: -10, dy: -12 },
+  FR: { dx: -18, dy: 6 },
+  CH: { dx: 8, dy: 10 },
+  BE: { dx: -12, dy: 12 },
+  RU: { dx: 8, dy: -2 },
+  SG: { dx: 8, dy: 6 },
+  ID: { dx: 10, dy: 4 },
+  US: { dx: 10, dy: 2 },
 };
 
-function GeoScatterMap({ countries }: { countries: CountryTraffic[] }) {
+function GeoScatterMap({ countries, onSelectCountry }: { countries: CountryTraffic[]; onSelectCountry?: (code: string) => void }) {
+  const [mapInner, setMapInner] = useState<string>('');
   const normalized = (countries || [])
     .map((c) => ({ ...c, code: String(c.country || '').trim().toUpperCase() }))
-    .filter((c) => c.code && COUNTRY_COORDS[c.code]);
+    .filter((c) => c.code && COUNTRY_LONLAT[c.code]);
+
+  useEffect(() => {
+    let canceled = false;
+    fetch('/metric-worldmap.svg')
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`map fetch failed: ${r.status}`))))
+      .then((txt) => {
+        if (!canceled) setMapInner(extractSvgInnerMarkup(txt));
+      })
+      .catch(() => {
+        if (!canceled) setMapInner('');
+      });
+    return () => {
+      canceled = true;
+    };
+  }, []);
+
   if (normalized.length === 0) {
     return <div className="muted">No mappable country data yet.</div>;
   }
+  if (!mapInner) {
+    return <div className="muted">Loading map geometry...</div>;
+  }
+
   const topReq = Math.max(1, ...normalized.map((c) => c.requests || 0));
   return (
     <div className="geo-map-wrap">
-      <svg className="geo-map-svg" viewBox="0 0 900 380" role="img" aria-label="Request geo map">
-        {[70, 130, 190, 250, 310].map((y) => <line key={`h-${y}`} x1="20" y1={y} x2="880" y2={y} className="geo-map-grid" />)}
-        {[120, 240, 360, 480, 600, 720].map((x) => <line key={`v-${x}`} x1={x} y1="36" x2={x} y2="344" className="geo-map-grid" />)}
+      <svg
+        className="geo-map-svg"
+        viewBox={`0 0 ${METRIC_WORLD_VIEWBOX.w} ${METRIC_WORLD_VIEWBOX.h}`}
+        role="img"
+        aria-label="Request geo map"
+      >
+        <g className="geo-map-vector" dangerouslySetInnerHTML={{ __html: mapInner }} />
+        {[0.2, 0.4, 0.6, 0.8].map((r, i) => (
+          <line
+            key={`h-${i}`}
+            x1={0}
+            y1={METRIC_WORLD_VIEWBOX.h * r}
+            x2={METRIC_WORLD_VIEWBOX.w}
+            y2={METRIC_WORLD_VIEWBOX.h * r}
+            className="geo-map-grid"
+          />
+        ))}
+        {[0.2, 0.4, 0.6, 0.8].map((r, i) => (
+          <line
+            key={`v-${i}`}
+            x1={METRIC_WORLD_VIEWBOX.w * r}
+            y1={0}
+            x2={METRIC_WORLD_VIEWBOX.w * r}
+            y2={METRIC_WORLD_VIEWBOX.h}
+            className="geo-map-grid"
+          />
+        ))}
+        {CONTINENT_LABELS.map((it) => (
+          <text key={it.text} x={it.x} y={it.y} className="geo-map-label muted">
+            {it.text}
+          </text>
+        ))}
         {normalized.map((c) => {
-          const p = COUNTRY_COORDS[c.code];
-          const radius = 4 + Math.round(((c.requests || 0) / topReq) * 14);
+          const ll = COUNTRY_LONLAT[c.code];
+          const p = projectToMetricSvg(ll.lon, ll.lat);
+          const radius = Math.min(13, 3 + Math.round(((c.requests || 0) / topReq) * 8));
+          const n = COUNTRY_LABEL_NUDGE[c.code] || { dx: radius + 4, dy: 3 };
           return (
-            <g key={c.code}>
+            <g key={c.code} style={{ cursor: onSelectCountry ? 'pointer' : 'default' }} onClick={() => onSelectCountry?.(c.code)}>
               <circle cx={p.x} cy={p.y} r={radius} className="geo-map-bubble" style={{ opacity: 0.2 + ((c.requests || 0) / topReq) * 0.8 }} />
-              <text x={p.x + radius + 3} y={p.y + 3} className="geo-map-label">{c.code}</text>
+              <text x={p.x + n.dx} y={p.y + n.dy} className="geo-map-label">{c.code}</text>
             </g>
           );
         })}
@@ -5911,6 +6182,16 @@ function MetricTile({ label, value, hint }: { label: string; value: string; hint
       <div className="metric-label">{label}</div>
       <div className="metric-value">{value}</div>
       <div className="metric-hint">{hint}</div>
+    </div>
+  );
+}
+
+function AlertChip({ label, value, state }: { label: string; value: string; state: 'ok' | 'warn' | 'critical' }) {
+  const cls = state === 'critical' ? 'err' : state === 'warn' ? 'warn' : 'ok';
+  return (
+    <div className={`ops-alert-chip ${cls}`}>
+      <div className="metric-label">{label}</div>
+      <div className="metric-value">{value}</div>
     </div>
   );
 }
