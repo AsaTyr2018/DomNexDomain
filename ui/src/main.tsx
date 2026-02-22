@@ -95,7 +95,22 @@ type ThreatIntelBlocked = { ip: string; reason?: string; history?: string; updat
 type ThreatIntelMatchesPage = { items: ThreatIntelMatch[]; total: number; page: number; pageSize: number };
 type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; page: number; pageSize: number };
 type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
-type MeProfile = { email: string };
+type DashboardWidgetType =
+  | 'ha_alerts'
+  | 'kpi_overview'
+  | 'health_gauges'
+  | 'system_health'
+  | 'performance_snapshot'
+  | 'traffic_snapshot'
+  | 'control_plane_health'
+  | 'recent_events'
+  | 'security_snapshot'
+  | 'quick_actions'
+  | 'degraded_hosts';
+type DashboardWidget = { id: string; type: DashboardWidgetType; w: number; h: number };
+type DashboardUserTab = { id: string; name: string; widgets: DashboardWidget[] };
+type DashboardLayout = { version: number; tabs: DashboardUserTab[] };
+type MeProfile = { email: string; dashboardLayout?: DashboardLayout };
 
 type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'ssh' | 'audit' | 'account' | 'accessControl' | 'integrations' | 'help';
 type SettingsTab = 'general' | 'security' | 'logservers' | 'appearance' | 'advanced';
@@ -156,6 +171,119 @@ const defaultBackupScheduleSettings = (): BackupScheduleSettings => ({
     hasPassword: false,
   },
 });
+
+const mkID = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+const DASHBOARD_WIDGET_STORE: Array<{
+  type: DashboardWidgetType;
+  category: 'Metrics' | 'Traffic' | 'Security' | 'Operations' | 'Quick Actions';
+  title: string;
+  description: string;
+  defaultW: number;
+  defaultH: number;
+}> = [
+  { type: 'kpi_overview', category: 'Metrics', title: 'KPI Overview', description: 'Domains, active hosts, host errors and monitored hosts.', defaultW: 12, defaultH: 1 },
+  { type: 'health_gauges', category: 'Metrics', title: 'Health Gauges', description: 'DNS/HTTP/HTTPS/TLS and certificate window health.', defaultW: 12, defaultH: 2 },
+  { type: 'system_health', category: 'Metrics', title: 'System Health', description: 'CPU, RAM and network load gauges from host telemetry.', defaultW: 12, defaultH: 2 },
+  { type: 'performance_snapshot', category: 'Metrics', title: 'Performance Snapshot', description: 'Protocol status and certificate quality summary.', defaultW: 6, defaultH: 2 },
+  { type: 'traffic_snapshot', category: 'Traffic', title: 'Traffic Snapshot', description: 'Requests, visitors, egress and blocked counters.', defaultW: 6, defaultH: 2 },
+  { type: 'control_plane_health', category: 'Operations', title: 'Control Plane Health', description: 'Cloudflare/ACME/Time-sync state with probe highlights.', defaultW: 6, defaultH: 2 },
+  { type: 'recent_events', category: 'Operations', title: 'Recent Events', description: 'Latest audit stream entries for fast situational awareness.', defaultW: 6, defaultH: 2 },
+  { type: 'security_snapshot', category: 'Security', title: 'Security Snapshot', description: 'Audit severity split and blocked IP counters.', defaultW: 6, defaultH: 1 },
+  { type: 'ha_alerts', category: 'Security', title: 'HA Alerts', description: 'Shows degraded HA routes and currently offline backends.', defaultW: 12, defaultH: 1 },
+  { type: 'degraded_hosts', category: 'Operations', title: 'Degraded Hosts', description: 'List of subdomains currently in error state.', defaultW: 6, defaultH: 2 },
+  { type: 'quick_actions', category: 'Quick Actions', title: 'Quick Actions', description: 'Common operations and direct links to operational views.', defaultW: 6, defaultH: 1 },
+];
+
+const dashboardWidgetByType = Object.fromEntries(DASHBOARD_WIDGET_STORE.map((w) => [w.type, w])) as Record<DashboardWidgetType, (typeof DASHBOARD_WIDGET_STORE)[number]>;
+
+const defaultDashboardLayout = (): DashboardLayout => ({
+  version: 1,
+  tabs: [
+    {
+      id: 'minimal',
+      name: 'Minimal',
+      widgets: [
+        { id: mkID(), type: 'kpi_overview', w: 12, h: 1 },
+        { id: mkID(), type: 'health_gauges', w: 12, h: 2 },
+        { id: mkID(), type: 'quick_actions', w: 12, h: 1 },
+      ],
+    },
+    {
+      id: 'security',
+      name: 'Security',
+      widgets: [
+        { id: mkID(), type: 'ha_alerts', w: 12, h: 1 },
+        { id: mkID(), type: 'security_snapshot', w: 6, h: 1 },
+        { id: mkID(), type: 'control_plane_health', w: 6, h: 2 },
+        { id: mkID(), type: 'recent_events', w: 12, h: 2 },
+      ],
+    },
+    {
+      id: 'network',
+      name: 'Network',
+      widgets: [
+        { id: mkID(), type: 'traffic_snapshot', w: 6, h: 2 },
+        { id: mkID(), type: 'performance_snapshot', w: 6, h: 2 },
+        { id: mkID(), type: 'system_health', w: 12, h: 2 },
+        { id: mkID(), type: 'degraded_hosts', w: 12, h: 2 },
+      ],
+    },
+    {
+      id: 'forensic',
+      name: 'Forensic',
+      widgets: [
+        { id: mkID(), type: 'recent_events', w: 12, h: 2 },
+        { id: mkID(), type: 'security_snapshot', w: 6, h: 1 },
+        { id: mkID(), type: 'degraded_hosts', w: 6, h: 2 },
+        { id: mkID(), type: 'control_plane_health', w: 12, h: 2 },
+      ],
+    },
+  ],
+});
+
+function isLegacyOverviewLayout(layout: DashboardLayout): boolean {
+  if (!layout || !Array.isArray(layout.tabs) || layout.tabs.length !== 1) return false;
+  const t = layout.tabs[0];
+  if (!t || String(t.name || '').toLowerCase() !== 'overview') return false;
+  return true;
+}
+
+function normalizeDashboardLayout(raw: unknown): DashboardLayout {
+  const fallback = defaultDashboardLayout();
+  if (!raw || typeof raw !== 'object') return fallback;
+  const anyRaw = raw as { version?: unknown; tabs?: unknown };
+  const rawTabs = Array.isArray(anyRaw.tabs) ? anyRaw.tabs : [];
+  const tabs: DashboardUserTab[] = rawTabs.map((t, idx) => {
+    const o = t as { id?: unknown; name?: unknown; widgets?: unknown };
+    const rawWidgets = Array.isArray(o.widgets) ? o.widgets : [];
+    const widgets: DashboardWidget[] = rawWidgets
+      .map((w) => {
+        const ow = w as { id?: unknown; type?: unknown; w?: unknown; h?: unknown };
+        const type = String(ow.type || '') as DashboardWidgetType;
+        if (!dashboardWidgetByType[type]) return null;
+        const width = Math.max(3, Math.min(12, Number(ow.w || dashboardWidgetByType[type].defaultW || 6)));
+        const height = Math.max(1, Math.min(3, Number(ow.h || dashboardWidgetByType[type].defaultH || 1)));
+        return {
+          id: String(ow.id || mkID()),
+          type,
+          w: Number.isFinite(width) ? width : dashboardWidgetByType[type].defaultW,
+          h: Number.isFinite(height) ? height : dashboardWidgetByType[type].defaultH,
+        };
+      })
+      .filter(Boolean) as DashboardWidget[];
+    return {
+      id: String(o.id || `tab-${idx + 1}`),
+      name: String(o.name || `Tab ${idx + 1}`).slice(0, 48),
+      widgets,
+    };
+  }).filter((t) => t.widgets.length > 0);
+  if (tabs.length === 0) return fallback;
+  return {
+    version: 1,
+    tabs,
+  };
+}
 const MONOLITH_THEME: ThemeVars = {
   bg: '#0f0f11',
   surface: '#16161a',
@@ -310,6 +438,12 @@ class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, {
 function App() {
   const [tab, setTab] = useState<Tab>('dashboard');
   const [identity, setIdentity] = useState<Identity | null>(null);
+  const [dashboardLayout, setDashboardLayout] = useState<DashboardLayout>(defaultDashboardLayout());
+  const [dashboardTabID, setDashboardTabID] = useState('minimal');
+  const [dashboardEditMode, setDashboardEditMode] = useState(false);
+  const [dashboardDraft, setDashboardDraft] = useState<DashboardLayout>(defaultDashboardLayout());
+  const [dashboardNewTabName, setDashboardNewTabName] = useState('');
+  const [dashboardWidgetQuery, setDashboardWidgetQuery] = useState('');
   const [domains, setDomains] = useState<Domain[]>([]);
   const [hosts, setHosts] = useState<Host[]>([]);
   const [hostDiagnostics, setHostDiagnostics] = useState<Record<string, HostDiagnostic>>({});
@@ -555,8 +689,31 @@ function App() {
       try {
         const profile = await api<MeProfile>('/api/v1/me/profile');
         setSelfNotifyEmail((profile.email || '').trim());
+        let normalizedLayout = normalizeDashboardLayout(profile.dashboardLayout);
+        const needsSystemDefaults = !profile.dashboardLayout || isLegacyOverviewLayout(normalizedLayout);
+        if (needsSystemDefaults) {
+          normalizedLayout = defaultDashboardLayout();
+          try {
+            await api('/api/v1/me/profile', {
+              method: 'POST',
+              headers: { 'X-CSRF-Token': csrf },
+              body: JSON.stringify({ dashboardLayout: normalizedLayout }),
+            });
+          } catch {
+            // Keep runtime defaults even if persistence fails in this request.
+          }
+        }
+        setDashboardLayout(normalizedLayout);
+        setDashboardDraft(normalizedLayout);
+        if (!normalizedLayout.tabs.some((t) => t.id === dashboardTabID)) {
+          setDashboardTabID(normalizedLayout.tabs[0]?.id || 'minimal');
+        }
       } catch {
         setSelfNotifyEmail('');
+        const def = defaultDashboardLayout();
+        setDashboardLayout(def);
+        setDashboardDraft(def);
+        setDashboardTabID(def.tabs[0]?.id || 'minimal');
       }
       setSetupStatus(st && st.initialized ? st : null);
       const [d, h, a] = await Promise.all([
@@ -1222,6 +1379,11 @@ function App() {
       setSelfCurrentPassword('');
       setSelfNewPassword('');
       setSelfConfirmPassword('');
+      const def = defaultDashboardLayout();
+      setDashboardLayout(def);
+      setDashboardDraft(def);
+      setDashboardTabID(def.tabs[0]?.id || 'minimal');
+      setDashboardEditMode(false);
       setBackupRestoreConfirm('');
       setBackupRestoreFile(null);
       setBackupMetaPreview(null);
@@ -1700,6 +1862,152 @@ function App() {
   const metricTopReq = metricCountries.length > 0 ? metricCountries[0].requests || 1 : 1;
   const metricUnknownTotal = metricCountries.find((c) => (c.country || '').toUpperCase() === 'ZZ')?.requests || 0;
   const metricUnknownBreakdown = [...(metricCountryOverview?.unknownBreakdown || [])].sort((a, b) => (b.requests || 0) - (a.requests || 0));
+  const blockedIPCount = blockedIPs.length;
+  const degradedHostNames = hosts.filter((h) => h.state === 'error').map((h) => h.fqdn);
+  const dashboardStoreItems = DASHBOARD_WIDGET_STORE.filter((w) => {
+    if (!dashboardWidgetQuery.trim()) return true;
+    const q = dashboardWidgetQuery.trim().toLowerCase();
+    return `${w.title} ${w.description} ${w.category}`.toLowerCase().includes(q);
+  });
+  const dashboardStoreCategories = ['Metrics', 'Traffic', 'Security', 'Operations', 'Quick Actions'] as const;
+
+  const renderDashboardWidget = (widget: DashboardWidget) => {
+    switch (widget.type) {
+      case 'ha_alerts':
+        return haHostsDegraded > 0 ? (
+          <div className="error" style={{ marginBottom: 0 }}>
+            HA Alert: {haHostsDegraded}/{haHostsMonitored || haHostsDegraded} HA subdomains have offline backends.
+            <div className="muted" style={{ marginTop: '.35rem' }}>
+              {haDegradedDetails.map((it) => (
+                <div key={`ha-alert-${it.fqdn}`}>
+                  {it.fqdn}: {it.online}/{it.total} online{it.offline.length > 0 ? ` · offline: ${it.offline.join(', ')}` : ''}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="muted">No degraded HA routes.</div>
+        );
+      case 'kpi_overview':
+        return (
+          <div className="kpi-row">
+            <Card title="Domains" value={String(domains.length)} status="ok" />
+            <Card title="Active Hosts" value={String(activeHosts)} status="ok" />
+            <Card title="Host Errors" value={String(errorHosts)} status={errorHosts > 0 ? 'err' : 'ok'} />
+            <Card title="Monitored Hosts" value={String(monitoredHosts)} status={monitoredHosts > 0 ? 'ok' : 'err'} />
+          </div>
+        );
+      case 'health_gauges':
+        return (
+          <div className="gauge-grid">
+            <Gauge title="DNS Health" value={dnsHealthPct} subtitle={`${dnsHealthy}/${safeBase} hosts`} strictFull />
+            <Gauge title="HTTP Reachability" value={httpHealthPct} subtitle={`${httpHealthy}/${safeBase} hosts`} strictFull />
+            <Gauge title="HTTPS Reachability" value={httpsHealthPct} subtitle={`${httpsHealthy}/${safeBase} hosts`} strictFull />
+            <Gauge title="TLS Health" value={tlsHealthPct} subtitle={`${tlsHealthy}/${safeBase} hosts`} strictFull />
+            <Gauge title="Cert Window" value={certWindowPct} subtitle={certKnown.length > 0 ? `${certExpiringSoon} expiring <=14d` : 'no cert data'} strictFull />
+          </div>
+        );
+      case 'system_health':
+        return (
+          <div className="gauge-grid">
+            <Gauge title="CPU Load" value={sysCpuPct} subtitle={systemHealth ? `${systemHealth.load1.toFixed(2)} / ${systemHealth.cpuCores.toFixed(0)} load/cores` : 'No sample'} />
+            <Gauge title="RAM Usage" value={sysRamPct} subtitle={systemHealth ? `${formatBytes(systemHealth.ramUsedBytes || 0)} / ${formatBytes(systemHealth.ramTotalBytes || 0)}` : 'No sample'} />
+            <Gauge title="Network Load" value={sysNetPct} subtitle={systemHealth ? `${formatBytes(sysNetPerSec)}/s / ${formatBytes(systemHealth.networkBaselineBps || 0)}/s` : 'No sample'} />
+          </div>
+        );
+      case 'performance_snapshot':
+        return (
+          <div className="metric-grid">
+            <MetricTile label="Avg HTTPS Status" value={avgHTTPSStatus > 0 ? String(avgHTTPSStatus) : '-'} hint="Target: < 400" />
+            <MetricTile label="Avg Cert Days Left" value={avgCertDays > 0 ? `${avgCertDays}d` : '-'} hint="Target: > 30d" />
+            <MetricTile label="TLS Failure Count" value={String(Math.max(0, monitoredHosts - tlsHealthy))} hint="Should trend to 0" />
+            <MetricTile label="DNS Failure Count" value={String(Math.max(0, monitoredHosts - dnsHealthy))} hint="Should trend to 0" />
+          </div>
+        );
+      case 'traffic_snapshot':
+        return (
+          <div className="metric-grid">
+            <MetricTile label="Requests" value={String(trafficReq24h)} hint="Total across all subdomains" />
+            <MetricTile label="Unique Visitors" value={String(trafficVisitors24h)} hint="Distinct client IP hashes" />
+            <MetricTile label="Traffic Out" value={formatBytes(trafficOut24h)} hint="Response bytes" />
+            <MetricTile label="Geo Blocks" value={String(trafficBlocked24h)} hint="Blocked by GeoIP policy" />
+          </div>
+        );
+      case 'control_plane_health':
+        return (
+          <>
+            <div className="metric-grid">
+              <MetricTile label="Cloudflare Token" value={settings?.hasCloudflareToken ? 'set' : 'missing'} hint="Global API token state" />
+              <MetricTile label="ACME Mode" value={settingsAcmeStaging ? 'staging' : 'production'} hint="Certificate endpoint" />
+              <MetricTile label="Time Sync Mode" value={settingsTimeSyncMode} hint="Clock source policy" />
+              <MetricTile label="Time Sync State" value={timeSyncStatus ? (timeSyncStatus.severity || 'unknown').toUpperCase() : '-'} hint={timeSyncStatus?.summary || 'No check yet'} />
+            </div>
+            {timeSyncStatus ? (
+              <div className="event-list" style={{ marginTop: '.55rem' }}>
+                {(timeSyncStatus.probes || []).slice(0, 3).map((p, idx) => (
+                  <div className="event-item" key={`dash-ts-${idx}`}>
+                    <div className="event-top">
+                      <strong>{p.target || p.name}</strong>
+                      <span className={`badge ${p.ok ? 'ok' : 'err'}`}>{p.ok ? 'ok' : 'fail'}</span>
+                    </div>
+                    <div className="muted">offset {String(p.offsetMs || 0)}ms · rtt {String(p.rttMs || 0)}ms</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </>
+        );
+      case 'recent_events':
+        return (
+          <div className="event-list">
+            {audit.length === 0 ? (
+              <div className="muted">No events yet.</div>
+            ) : (
+              audit.slice(0, 10).map((e) => (
+                <div className="event-item" key={e.id}>
+                  <div className="event-top">
+                    <strong>{e.action}</strong>
+                    <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
+                  </div>
+                  <div className="muted">{e.actor} {'->'} {e.target}</div>
+                </div>
+              ))
+            )}
+          </div>
+        );
+      case 'security_snapshot':
+        return (
+          <div className="metric-grid">
+            <MetricTile label="Critical" value={String(auditCriticalTotal)} hint="Deletes, resets, revokes" />
+            <MetricTile label="Warnings" value={String(auditWarningTotal)} hint="Updates, retries, proxy issues" />
+            <MetricTile label="Blocked IPs" value={String(blockedIPCount)} hint="Current block table size" />
+            <MetricTile label="Threat Offenders" value={String(tiTotalOffenders)} hint="Current threat offender list" />
+          </div>
+        );
+      case 'degraded_hosts':
+        return degradedHostNames.length === 0 ? (
+          <div className="muted">No host errors currently reported.</div>
+        ) : (
+          <div className="event-list">
+            {degradedHostNames.slice(0, 20).map((name) => (
+              <div className="event-item" key={`deg-${name}`}>{name}</div>
+            ))}
+          </div>
+        );
+      case 'quick_actions':
+        return (
+          <div className="row" style={{ marginBottom: 0 }}>
+            <button className="btn" onClick={refresh} disabled={loading}>Refresh Data</button>
+            <button className="btn" onClick={() => setTab('audit')}>Open Log Center</button>
+            <button className="btn" onClick={() => setTab('metricCenter')}>Open Metric Center</button>
+            <button className="btn" onClick={runScheduledBackupNow} disabled={loading || isReadOnlyRole}>Backup now</button>
+            <button className="btn" onClick={reloadService} disabled={loading || isReadOnlyRole}>Reload Service</button>
+          </div>
+        );
+      default:
+        return <div className="muted">Unsupported widget.</div>;
+    }
+  };
 
   const domainProviderGuide: Record<DomainProvider, { title: string; steps: string[]; records: string[] }> = {
     cloudflare: {
@@ -2311,6 +2619,104 @@ function App() {
     }
   };
 
+  const currentDashboard = dashboardEditMode ? dashboardDraft : dashboardLayout;
+  const currentDashboardTab = currentDashboard.tabs.find((t) => t.id === dashboardTabID) || currentDashboard.tabs[0] || null;
+
+  const startDashboardEdit = () => {
+    setDashboardDraft(normalizeDashboardLayout(dashboardLayout));
+    setDashboardEditMode(true);
+  };
+
+  const cancelDashboardEdit = () => {
+    setDashboardDraft(normalizeDashboardLayout(dashboardLayout));
+    setDashboardEditMode(false);
+    setDashboardWidgetQuery('');
+  };
+
+  const saveDashboardLayout = async () => {
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      const normalized = normalizeDashboardLayout(dashboardDraft);
+      await api('/api/v1/me/profile', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ dashboardLayout: normalized }),
+      });
+      setDashboardLayout(normalized);
+      setDashboardDraft(normalized);
+      setDashboardEditMode(false);
+      if (!normalized.tabs.some((t) => t.id === dashboardTabID)) {
+        setDashboardTabID(normalized.tabs[0]?.id || 'minimal');
+      }
+      setSettingsMessage('Dashboard layout saved.');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateDashboardDraftTabs = (fn: (tabs: DashboardUserTab[]) => DashboardUserTab[]) => {
+    setDashboardDraft((prev) => ({ ...prev, tabs: fn(prev.tabs) }));
+  };
+
+  const addDashboardTab = () => {
+    const name = dashboardNewTabName.trim() || `Tab ${dashboardDraft.tabs.length + 1}`;
+    const id = `tab-${mkID()}`;
+    updateDashboardDraftTabs((tabs) => [...tabs, { id, name: name.slice(0, 48), widgets: [] }]);
+    setDashboardTabID(id);
+    setDashboardNewTabName('');
+  };
+
+  const renameDashboardTab = (id: string, name: string) => {
+    updateDashboardDraftTabs((tabs) => tabs.map((t) => (t.id === id ? { ...t, name: name.slice(0, 48) } : t)));
+  };
+
+  const deleteDashboardTab = (id: string) => {
+    updateDashboardDraftTabs((tabs) => {
+      if (tabs.length <= 1) return tabs;
+      const next = tabs.filter((t) => t.id !== id);
+      if (!next.some((t) => t.id === dashboardTabID)) setDashboardTabID(next[0]?.id || 'minimal');
+      return next;
+    });
+  };
+
+  const addWidgetToCurrentDashboardTab = (type: DashboardWidgetType) => {
+    if (!currentDashboardTab) return;
+    const meta = dashboardWidgetByType[type];
+    const widget: DashboardWidget = { id: `w-${mkID()}`, type, w: meta.defaultW, h: meta.defaultH };
+    updateDashboardDraftTabs((tabs) => tabs.map((t) => (t.id === currentDashboardTab.id ? { ...t, widgets: [...t.widgets, widget] } : t)));
+  };
+
+  const updateCurrentTabWidgets = (fn: (widgets: DashboardWidget[]) => DashboardWidget[]) => {
+    if (!currentDashboardTab) return;
+    updateDashboardDraftTabs((tabs) => tabs.map((t) => (t.id === currentDashboardTab.id ? { ...t, widgets: fn(t.widgets) } : t)));
+  };
+
+  const removeDashboardWidget = (widgetID: string) => {
+    updateCurrentTabWidgets((widgets) => widgets.filter((w) => w.id !== widgetID));
+  };
+
+  const moveDashboardWidget = (widgetID: string, dir: -1 | 1) => {
+    updateCurrentTabWidgets((widgets) => {
+      const idx = widgets.findIndex((w) => w.id === widgetID);
+      if (idx < 0) return widgets;
+      const nx = idx + dir;
+      if (nx < 0 || nx >= widgets.length) return widgets;
+      const out = [...widgets];
+      const a = out[idx];
+      out[idx] = out[nx];
+      out[nx] = a;
+      return out;
+    });
+  };
+
+  const resizeDashboardWidget = (widgetID: string, w: number, h: number) => {
+    updateCurrentTabWidgets((widgets) => widgets.map((it) => (it.id === widgetID ? { ...it, w: Math.max(3, Math.min(12, w)), h: Math.max(1, Math.min(3, h)) } : it)));
+  };
+
   const blockIP = async (ip: string, reason = 'manual block from audit') => {
     setLoading(true);
     setError('');
@@ -2654,6 +3060,13 @@ function App() {
             </div>
             <div className="top-actions">
               <button className="btn" onClick={refresh} disabled={loading}>Refresh</button>
+              {tab === 'dashboard' ? (
+                !dashboardEditMode ? (
+                  <button className="btn" onClick={startDashboardEdit} disabled={loading}>Edit Dashboard</button>
+                ) : (
+                  <button className="btn" onClick={saveDashboardLayout} disabled={loading}>Save Dashboard</button>
+                )
+              ) : null}
               {identity ? <button className="btn" onClick={logout}>Logout</button> : null}
             </div>
           </header>
@@ -2662,108 +3075,124 @@ function App() {
 
           {tab === 'dashboard' ? (
             <section className="dashboard">
-              {haHostsDegraded > 0 ? (
-                <div className="error">
-                  HA Alert: {haHostsDegraded}/{haHostsMonitored || haHostsDegraded} HA subdomains have offline backends.
-                  <div className="muted" style={{ marginTop: '.35rem' }}>
-                    {haDegradedDetails.map((it) => (
-                      <div key={`ha-alert-${it.fqdn}`}>
-                        {it.fqdn}: {it.online}/{it.total} online{it.offline.length > 0 ? ` · offline: ${it.offline.join(', ')}` : ''}
-                      </div>
-                    ))}
+              <div className="card" style={{ marginBottom: '.75rem' }}>
+                <div className="card-head">
+                  <h3>Dashboard Tabs</h3>
+                  <div className="row" style={{ marginBottom: 0 }}>
+                    {dashboardEditMode ? <button className="btn danger" onClick={cancelDashboardEdit} disabled={loading}>Cancel</button> : null}
                   </div>
                 </div>
-              ) : null}
-              <div className="kpi-row">
-                <Card title="Domains" value={String(domains.length)} status="ok" />
-                <Card title="Active Hosts" value={String(activeHosts)} status="ok" />
-                <Card title="Host Errors" value={String(errorHosts)} status={errorHosts > 0 ? 'err' : 'ok'} />
-                <Card title="Monitored Hosts" value={String(monitoredHosts)} status={monitoredHosts > 0 ? 'ok' : 'err'} />
-              </div>
-              <div className="dashboard-layout">
-                <div className="dashboard-main">
-                  <div className="card">
-                    <div className="card-head"><h3>Health Gauges</h3></div>
-                    <div className="gauge-grid">
-                      <Gauge title="DNS Health" value={dnsHealthPct} subtitle={`${dnsHealthy}/${safeBase} hosts`} strictFull />
-                      <Gauge title="HTTP Reachability" value={httpHealthPct} subtitle={`${httpHealthy}/${safeBase} hosts`} strictFull />
-                      <Gauge title="HTTPS Reachability" value={httpsHealthPct} subtitle={`${httpsHealthy}/${safeBase} hosts`} strictFull />
-                      <Gauge title="TLS Health" value={tlsHealthPct} subtitle={`${tlsHealthy}/${safeBase} hosts`} strictFull />
-                      <Gauge title="Cert Window" value={certWindowPct} subtitle={certKnown.length > 0 ? `${certExpiringSoon} expiring <=14d` : 'no cert data'} strictFull />
-                    </div>
-                  </div>
-                  <div className="card">
-                    <div className="card-head"><h3>System Health</h3></div>
-                    <div className="gauge-grid">
-                      <Gauge title="CPU Load" value={sysCpuPct} subtitle={systemHealth ? `${systemHealth.load1.toFixed(2)} / ${systemHealth.cpuCores.toFixed(0)} load/cores` : 'No sample'} />
-                      <Gauge title="RAM Usage" value={sysRamPct} subtitle={systemHealth ? `${formatBytes(systemHealth.ramUsedBytes || 0)} / ${formatBytes(systemHealth.ramTotalBytes || 0)}` : 'No sample'} />
-                      <Gauge title="Network Load" value={sysNetPct} subtitle={systemHealth ? `${formatBytes(sysNetPerSec)}/s / ${formatBytes(systemHealth.networkBaselineBps || 0)}/s` : 'No sample'} />
-                    </div>
-                  </div>
-                  <div className="snapshot-row">
-                    <div className="card">
-                      <div className="card-head"><h3>Performance Snapshot</h3></div>
-                      <div className="metric-grid">
-                        <MetricTile label="Avg HTTPS Status" value={avgHTTPSStatus > 0 ? String(avgHTTPSStatus) : '-'} hint="Target: < 400" />
-                        <MetricTile label="Avg Cert Days Left" value={avgCertDays > 0 ? `${avgCertDays}d` : '-'} hint="Target: > 30d" />
-                        <MetricTile label="TLS Failure Count" value={String(Math.max(0, monitoredHosts - tlsHealthy))} hint="Should trend to 0" />
-                        <MetricTile label="DNS Failure Count" value={String(Math.max(0, monitoredHosts - dnsHealthy))} hint="Should trend to 0" />
-                      </div>
-                    </div>
-                    <div className="card">
-                      <div className="card-head"><h3>Traffic Snapshot (24h)</h3></div>
-                      <div className="metric-grid">
-                        <MetricTile label="Requests" value={String(trafficReq24h)} hint="Total across all subdomains" />
-                        <MetricTile label="Unique Visitors" value={String(trafficVisitors24h)} hint="Distinct client IP hashes" />
-                        <MetricTile label="Traffic Out" value={formatBytes(trafficOut24h)} hint="Response bytes" />
-                        <MetricTile label="Geo Blocks" value={String(trafficBlocked24h)} hint="Blocked by GeoIP policy" />
-                      </div>
-                    </div>
-                  </div>
+                <div className="wizard-steps" style={{ marginBottom: '.45rem' }}>
+                  {(dashboardEditMode ? dashboardDraft.tabs : dashboardLayout.tabs).map((t) => (
+                    <button key={`dt-${t.id}`} className={dashboardTabID === t.id ? 'wiz active' : 'wiz'} onClick={() => setDashboardTabID(t.id)}>
+                      {t.name}
+                    </button>
+                  ))}
                 </div>
-                <div className="dashboard-side">
-                  <div className="card">
-                    <div className="card-head"><h3>Control Plane Health</h3></div>
-                    <div className="metric-grid">
-                      <MetricTile label="Cloudflare Token" value={settings?.hasCloudflareToken ? 'set' : 'missing'} hint="Global API token state" />
-                      <MetricTile label="ACME Mode" value={settingsAcmeStaging ? 'staging' : 'production'} hint="Certificate endpoint" />
-                      <MetricTile label="Time Sync Mode" value={settingsTimeSyncMode} hint="Clock source policy" />
-                      <MetricTile label="Time Sync State" value={timeSyncStatus ? (timeSyncStatus.severity || 'unknown').toUpperCase() : '-'} hint={timeSyncStatus?.summary || 'No check yet'} />
+                {dashboardEditMode ? (
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>New Tab</label>
+                      <div className="row" style={{ marginBottom: 0 }}>
+                        <input value={dashboardNewTabName} onChange={(e) => setDashboardNewTabName(e.target.value)} placeholder="Operations" />
+                        <button className="btn" onClick={addDashboardTab}>Add Tab</button>
+                      </div>
                     </div>
-                    {timeSyncStatus ? (
-                      <div className="event-list" style={{ marginTop: '.55rem' }}>
-                        {(timeSyncStatus.probes || []).slice(0, 3).map((p, idx) => (
-                          <div className="event-item" key={`dash-ts-${idx}`}>
-                            <div className="event-top">
-                              <strong>{p.target || p.name}</strong>
-                              <span className={`badge ${p.ok ? 'ok' : 'err'}`}>{p.ok ? 'ok' : 'fail'}</span>
-                            </div>
-                            <div className="muted">offset {String(p.offsetMs || 0)}ms · rtt {String(p.rttMs || 0)}ms</div>
-                          </div>
-                        ))}
+                    {currentDashboardTab ? (
+                      <div className="field">
+                        <label>Rename Current Tab</label>
+                        <div className="row" style={{ marginBottom: 0 }}>
+                          <input value={currentDashboardTab.name} onChange={(e) => renameDashboardTab(currentDashboardTab.id, e.target.value)} />
+                          <button className="btn danger" onClick={() => deleteDashboardTab(currentDashboardTab.id)} disabled={dashboardDraft.tabs.length <= 1}>Delete Tab</button>
+                        </div>
                       </div>
                     ) : null}
                   </div>
+                ) : null}
+              </div>
+
+              {dashboardEditMode ? (
+                <div className="dashboard-editor-layout">
                   <div className="card">
-                    <div className="card-head"><h3>Recent Events</h3></div>
-                    <div className="event-list">
-                      {audit.length === 0 ? (
-                        <div className="muted">No events yet.</div>
-                      ) : (
-                        audit.slice(0, 10).map((e) => (
-                          <div className="event-item" key={e.id}>
-                            <div className="event-top">
-                              <strong>{e.action}</strong>
-                              <span className="muted">{new Date(e.createdAt).toLocaleString()}</span>
-                            </div>
-                            <div className="muted">{e.actor} {'->'} {e.target}</div>
+                    <div className="card-head"><h3>Widget Store</h3></div>
+                    <div className="row">
+                      <input value={dashboardWidgetQuery} onChange={(e) => setDashboardWidgetQuery(e.target.value)} placeholder="Search widgets" />
+                    </div>
+                    <div className="event-list" style={{ maxHeight: '68vh' }}>
+                      {dashboardStoreCategories.map((cat) => {
+                        const items = dashboardStoreItems.filter((w) => w.category === cat);
+                        if (items.length === 0) return null;
+                        return (
+                          <div key={`store-${cat}`}>
+                            <div className="menu-title" style={{ paddingLeft: 0 }}>{cat}</div>
+                            {items.map((w) => (
+                              <div className="event-item" key={`store-item-${w.type}`}>
+                                <div className="event-top">
+                                  <strong>{w.title}</strong>
+                                  <button className="btn" onClick={() => addWidgetToCurrentDashboardTab(w.type)} disabled={!currentDashboardTab}>Add</button>
+                                </div>
+                                <div className="muted">{w.description}</div>
+                              </div>
+                            ))}
                           </div>
-                        ))
-                      )}
+                        );
+                      })}
                     </div>
                   </div>
+                  <div className="card">
+                    <div className="card-head"><h3>Grid Preview</h3></div>
+                    {currentDashboardTab ? (
+                      <div className="dashboard-grid">
+                        {currentDashboardTab.widgets.map((w, idx) => {
+                          const meta = dashboardWidgetByType[w.type];
+                          return (
+                            <section key={w.id} className="card dashboard-widget" style={{ gridColumn: `span ${Math.max(3, Math.min(12, w.w))}`, gridRow: `span ${Math.max(1, Math.min(3, w.h))}` }}>
+                              <div className="card-head">
+                                <h3>{meta?.title || w.type}</h3>
+                                <div className="row" style={{ marginBottom: 0 }}>
+                                  <button className="btn" onClick={() => moveDashboardWidget(w.id, -1)} disabled={idx <= 0}>↑</button>
+                                  <button className="btn" onClick={() => moveDashboardWidget(w.id, 1)} disabled={idx >= currentDashboardTab.widgets.length - 1}>↓</button>
+                                  <select value={`${w.w}x${w.h}`} onChange={(e) => {
+                                    const [nw, nh] = (e.target.value || '6x1').split('x');
+                                    resizeDashboardWidget(w.id, Number(nw) || 6, Number(nh) || 1);
+                                  }}>
+                                    <option value="3x1">S (3x1)</option>
+                                    <option value="6x1">M (6x1)</option>
+                                    <option value="6x2">M Tall (6x2)</option>
+                                    <option value="12x1">L (12x1)</option>
+                                    <option value="12x2">XL (12x2)</option>
+                                  </select>
+                                  <button className="btn danger" onClick={() => removeDashboardWidget(w.id)}>Remove</button>
+                                </div>
+                              </div>
+                              {renderDashboardWidget(w)}
+                            </section>
+                          );
+                        })}
+                        {currentDashboardTab.widgets.length === 0 ? <div className="muted">No widgets in this tab yet. Add from Widget Store.</div> : null}
+                      </div>
+                    ) : <div className="muted">No dashboard tab selected.</div>}
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <>
+                  {currentDashboardTab ? (
+                    <div className="dashboard-grid">
+                      {currentDashboardTab.widgets.map((w) => {
+                        const meta = dashboardWidgetByType[w.type];
+                        return (
+                          <section key={w.id} className="card dashboard-widget" style={{ gridColumn: `span ${Math.max(3, Math.min(12, w.w))}`, gridRow: `span ${Math.max(1, Math.min(3, w.h))}` }}>
+                            <div className="card-head"><h3>{meta?.title || w.type}</h3></div>
+                            {renderDashboardWidget(w)}
+                          </section>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="card"><div className="muted">No dashboard tab configured.</div></div>
+                  )}
+                </>
+              )}
             </section>
           ) : null}
 
@@ -5043,6 +5472,9 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .subtitle { margin:.25rem 0 0; color:var(--text-dim); }
         .top-actions { display:flex; gap:.5rem; }
         .dashboard { display:grid; gap:1rem; }
+        .dashboard-grid { display:grid; gap:1rem; grid-template-columns:repeat(12, minmax(0, 1fr)); grid-auto-rows:minmax(72px, auto); align-items:start; }
+        .dashboard-widget { min-height:120px; }
+        .dashboard-editor-layout { display:grid; gap:1rem; grid-template-columns:minmax(320px,.85fr) minmax(0,1.15fr); align-items:start; }
         .kpi-row { display:grid; gap:1rem; grid-template-columns:repeat(4,minmax(0,1fr)); }
         .dashboard-layout { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
         .dashboard-main { display:grid; gap:1rem; }
@@ -5204,7 +5636,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         }
         .col { display:grid; gap:.6rem; }
         @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} .user-ops-filters{grid-template-columns:1fr 1fr;} .user-ops-filters .row{justify-content:flex-start;} .snapshot-row{grid-template-columns:1fr;} }
-        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);height:auto;position:static;overflow:visible;} .logo{position:static;border-bottom:none;padding:1rem .85rem .35rem;} .menu{overflow:visible;padding:0 .5rem .8rem;} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} .snapshot-row{grid-template-columns:1fr;} }
+        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);height:auto;position:static;overflow:visible;} .logo{position:static;border-bottom:none;padding:1rem .85rem .35rem;} .menu{overflow:visible;padding:0 .5rem .8rem;} .main{padding:1rem;} .card.wide{grid-column:auto;} .dashboard-grid{grid-template-columns:1fr;} .dashboard-widget{grid-column:span 1 !important; grid-row:auto !important;} .dashboard-editor-layout{grid-template-columns:1fr;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} .snapshot-row{grid-template-columns:1fr;} }
       `}</style>
     </>
   );

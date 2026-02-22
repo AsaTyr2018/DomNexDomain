@@ -698,39 +698,74 @@ func profileEmailSettingKey(username string) string {
 	return "profile.email." + strings.ToLower(strings.TrimSpace(username))
 }
 
+func profileDashboardLayoutSettingKey(username string) string {
+	return "profile.dashboard_layout." + strings.ToLower(strings.TrimSpace(username))
+}
+
 func (s *Server) handleMeProfileGet(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
 	email := ""
 	if v, err := s.app.Store().GetSetting(r.Context(), profileEmailSettingKey(id.Username)); err == nil {
 		email = strings.TrimSpace(v)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"email": email})
+	out := map[string]any{"email": email}
+	if v, err := s.app.Store().GetSetting(r.Context(), profileDashboardLayoutSettingKey(id.Username)); err == nil {
+		raw := strings.TrimSpace(v)
+		if raw != "" && json.Valid([]byte(raw)) {
+			var obj any
+			if err := json.Unmarshal([]byte(raw), &obj); err == nil {
+				out["dashboardLayout"] = obj
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleMeProfileSet(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
 	var in struct {
-		Email string `json:"email"`
+		Email           *string         `json:"email"`
+		DashboardLayout json.RawMessage `json:"dashboardLayout"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	email := strings.TrimSpace(in.Email)
-	if len(email) > 254 {
-		writeErr(w, http.StatusBadRequest, "email too long")
-		return
+	if in.Email != nil {
+		email := strings.TrimSpace(*in.Email)
+		if len(email) > 254 {
+			writeErr(w, http.StatusBadRequest, "email too long")
+			return
+		}
+		if email != "" && (!strings.Contains(email, "@") || strings.ContainsAny(email, " \t\r\n")) {
+			writeErr(w, http.StatusBadRequest, "invalid email")
+			return
+		}
+		if err := s.app.Store().SetSetting(r.Context(), profileEmailSettingKey(id.Username), email); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "profile.email.update", Target: id.Username, Meta: ""})
 	}
-	if email != "" && (!strings.Contains(email, "@") || strings.ContainsAny(email, " \t\r\n")) {
-		writeErr(w, http.StatusBadRequest, "invalid email")
-		return
+	if len(in.DashboardLayout) > 0 {
+		raw := strings.TrimSpace(string(in.DashboardLayout))
+		if len(raw) > 128*1024 {
+			writeErr(w, http.StatusBadRequest, "dashboard layout too large")
+			return
+		}
+		if raw == "" || raw == "null" {
+			raw = ""
+		} else if !json.Valid([]byte(raw)) {
+			writeErr(w, http.StatusBadRequest, "invalid dashboard layout")
+			return
+		}
+		if err := s.app.Store().SetSetting(r.Context(), profileDashboardLayoutSettingKey(id.Username), raw); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "profile.dashboard_layout.update", Target: id.Username, Meta: ""})
 	}
-	if err := s.app.Store().SetSetting(r.Context(), profileEmailSettingKey(id.Username), email); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "profile.email.update", Target: id.Username, Meta: ""})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "email": email})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleListDomains(w http.ResponseWriter, r *http.Request) {
