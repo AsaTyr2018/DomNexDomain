@@ -32,6 +32,7 @@ import (
 type HostSource interface {
 	ListHosts(ctx context.Context) ([]model.Host, error)
 	ListDomains(ctx context.Context) ([]model.Domain, error)
+	ListSSHBastionRoutes(ctx context.Context) ([]model.SSHBastionRoute, error)
 	PublicIPv4(ctx context.Context) string
 	AddAuditEvent(ctx context.Context, e model.AuditEvent) error
 	GetStyleSettings(ctx context.Context) (string, string, error)
@@ -51,6 +52,7 @@ type Engine struct {
 	publicIP string
 	mu       sync.RWMutex
 	routes   map[string]*routeEntry
+	bastion  map[string]bool
 	managed  map[string]bool
 	auth     map[string]authSession
 	theme    edgeTheme
@@ -89,6 +91,7 @@ func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.
 		tr:       tr,
 		live:     live,
 		routes:   map[string]*routeEntry{},
+		bastion:  map[string]bool{},
 		managed:  map[string]bool{},
 		auth:     map[string]authSession{},
 		theme:    monolithEdgeTheme(),
@@ -232,12 +235,26 @@ func (e *Engine) Refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	sshRoutes, err := e.source.ListSSHBastionRoutes(ctx)
+	if err != nil {
+		return err
+	}
 	publicIP := strings.TrimSpace(e.source.PublicIPv4(ctx))
 	styleProfile, styleCustom, _ := e.source.GetStyleSettings(ctx)
 	tiSnap, _ := e.source.GetThreatIntelSnapshot(ctx)
 	theme := parseEdgeTheme(styleProfile, styleCustom)
 	routes := map[string]*routeEntry{}
+	bastion := map[string]bool{}
 	managed := map[string]bool{}
+	for _, r := range sshRoutes {
+		if !r.Enabled {
+			continue
+		}
+		fqdn := strings.ToLower(strings.TrimSpace(r.FQDN))
+		if fqdn != "" {
+			bastion[fqdn] = true
+		}
+	}
 	for _, d := range domains {
 		if strings.EqualFold(strings.TrimSpace(d.Status), "inactive") {
 			continue
@@ -286,12 +303,13 @@ func (e *Engine) Refresh(ctx context.Context) error {
 	}
 	e.mu.Lock()
 	e.routes = routes
+	e.bastion = bastion
 	e.managed = managed
 	e.publicIP = publicIP
 	e.theme = theme
 	e.tiSnap = tiSnap
 	e.mu.Unlock()
-	e.log.Info("proxy routes refreshed", map[string]any{"count": len(routes), "managedApex": len(managed), "publicIP": publicIP})
+	e.log.Info("proxy routes refreshed", map[string]any{"count": len(routes), "bastionHosts": len(bastion), "managedApex": len(managed), "publicIP": publicIP})
 	return nil
 }
 
@@ -393,6 +411,7 @@ func (e *Engine) Handler() http.Handler {
 		e.mu.RLock()
 		publicIP = e.publicIP
 		route, ok := e.routes[host]
+		isBastionHost := e.bastion[host]
 		managedApex := e.managed[host]
 		tiSnap := e.tiSnap
 		e.mu.RUnlock()
@@ -531,6 +550,21 @@ func (e *Engine) Handler() http.Handler {
 				})
 				return
 			}
+			e.auditProxyEvent(r.Context(), "proxy.error.unknown_host", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
+			e.renderSmartErrorPage(sw, r, smartErrorPage{
+				HTTPStatus:   http.StatusNotFound,
+				Title:        "Nothing here yet",
+				Description:  "This subdomain is not active yet. Check back later, something might appear soon.",
+				Code:         "DNX-ROUTE-404",
+				FailurePoint: "routing: host not configured (yet)",
+				Host:         host,
+				TraceID:      traceID,
+				Theme:        "ok",
+			})
+			return
+		}
+		if isBastionHost {
+			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.error.unknown_host", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
 			e.renderSmartErrorPage(sw, r, smartErrorPage{
 				HTTPStatus:   http.StatusNotFound,

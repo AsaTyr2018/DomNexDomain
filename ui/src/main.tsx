@@ -4186,9 +4186,22 @@ function App() {
                         {group.items.map((h) => (
                           <div className="host" key={h.id}>
                             <div>
-                              <strong>
-                                <a className="host-fqdn-link" href={`https://${h.fqdn}`} target="_blank" rel="noopener noreferrer">{h.fqdn}</a>
-                              </strong> {' -> '} {h.upstreamUrl}
+                              {(() => {
+                                const sshRoute = sshRouteByFQDN[h.fqdn.toLowerCase()];
+                                const isSSHHost = !!sshRoute || (!h.haEnabled && (h.upstreamUrl || '').trim().toLowerCase() === SSH_BASTION_DEFAULT_UPSTREAM);
+                                return (
+                                  <>
+                                    <strong>
+                                      {isSSHHost ? (
+                                        <span className="host-fqdn-link" style={{ cursor: 'default', textDecoration: 'none' }}>{h.fqdn}</span>
+                                      ) : (
+                                        <a className="host-fqdn-link" href={`https://${h.fqdn}`} target="_blank" rel="noopener noreferrer">{h.fqdn}</a>
+                                      )}
+                                    </strong> {' -> '} {h.upstreamUrl}
+                                    {isSSHHost ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>SSH Bastion</span> : null}
+                                  </>
+                                );
+                              })()}
                               {h.haEnabled ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>HA {h.haMode || 'failover'}</span> : null}
                               {h.insecureTls ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>insecure TLS</span> : null}
                               {h.authEnabled ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>auth page enabled</span> : null}
