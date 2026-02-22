@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -406,6 +407,14 @@ func (s *Store) EnsureBootstrapUser(ctx context.Context, username, role, passHas
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, username, role, "", 0, passHash, now, now)
 	return true, err
+}
+
+func (s *Store) CountUsers(ctx context.Context) (int, error) {
+	var c int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM users`).Scan(&c); err != nil {
+		return 0, err
+	}
+	return c, nil
 }
 
 func (s *Store) FindUserByUsername(ctx context.Context, username string) (model.User, error) {
@@ -2915,4 +2924,165 @@ ORDER BY r.id`, out.Key.ID)
 		out.Routes = append(out.Routes, rt)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) VacuumInto(ctx context.Context, outPath string) error {
+	outPath = strings.TrimSpace(outPath)
+	if outPath == "" {
+		return fmt.Errorf("snapshot path required")
+	}
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(FULL)`); err != nil {
+		return err
+	}
+	escaped := strings.ReplaceAll(outPath, `'`, `''`)
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`VACUUM INTO '%s'`, escaped))
+	return err
+}
+
+func (s *Store) RestoreFromSnapshot(ctx context.Context, snapshotPath string) error {
+	snapshotPath = strings.TrimSpace(snapshotPath)
+	if snapshotPath == "" {
+		return fmt.Errorf("snapshot path required")
+	}
+	escaped := strings.ReplaceAll(snapshotPath, `'`, `''`)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if _, err := tx.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`ATTACH DATABASE '%s' AS restoredb`, escaped)); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = tx.ExecContext(context.Background(), `DETACH DATABASE restoredb`)
+	}()
+	mainTables, err := listUserTables(ctx, tx, "main")
+	if err != nil {
+		return err
+	}
+	restoreTables, err := listUserTables(ctx, tx, "restoredb")
+	if err != nil {
+		return err
+	}
+	restoreSet := map[string]bool{}
+	for _, t := range restoreTables {
+		restoreSet[t] = true
+	}
+	for _, t := range mainTables {
+		if !restoreSet[t] {
+			continue
+		}
+		mainCols, err := listTableColumns(ctx, tx, "main", t)
+		if err != nil {
+			return err
+		}
+		restoreCols, err := listTableColumns(ctx, tx, "restoredb", t)
+		if err != nil {
+			return err
+		}
+		if len(mainCols) == 0 || len(restoreCols) == 0 {
+			continue
+		}
+		restoreColSet := map[string]bool{}
+		for _, c := range restoreCols {
+			restoreColSet[c] = true
+		}
+		cols := make([]string, 0, len(mainCols))
+		for _, c := range mainCols {
+			if restoreColSet[c] {
+				cols = append(cols, c)
+			}
+		}
+		if len(cols) == 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s`, quoteIdent(t))); err != nil {
+			return err
+		}
+		colList := quoteIdentList(cols)
+		insertSQL := fmt.Sprintf(
+			`INSERT INTO %s(%s) SELECT %s FROM restoredb.%s`,
+			quoteIdent(t),
+			colList,
+			colList,
+			quoteIdent(t),
+		)
+		if _, err := tx.ExecContext(ctx, insertSQL); err != nil {
+			return err
+		}
+	}
+	if slices.Contains(mainTables, "sessions") {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions`); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DETACH DATABASE restoredb`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `PRAGMA foreign_keys=ON`); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func listUserTables(ctx context.Context, tx *sql.Tx, schema string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+SELECT name
+FROM %s.sqlite_master
+WHERE type='table' AND name NOT LIKE 'sqlite_%%'
+ORDER BY name`, quoteIdent(schema)))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+func listTableColumns(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`PRAGMA %s.table_info(%s)`, quoteIdent(schema), quoteIdent(table)))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(strings.TrimSpace(s), `"`, `""`) + `"`
+}
+
+func quoteIdentList(cols []string) string {
+	parts := make([]string, 0, len(cols))
+	for _, c := range cols {
+		parts = append(parts, quoteIdent(c))
+	}
+	return strings.Join(parts, ",")
 }

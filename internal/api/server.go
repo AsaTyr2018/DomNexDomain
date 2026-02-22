@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net"
@@ -49,10 +50,16 @@ func (s *Server) Router() http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
 	r.Use(s.metricsMiddleware("admin_api"))
+	r.Use(s.setupGateMiddleware)
 
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, map[string]any{"ok": true}) })
 	r.Get("/api/v1/style", s.handlePublicStyle)
 	r.Get("/api/v1/csrf", s.handleCSRF)
+	r.Get("/api/v1/setup/status", s.handleSetupStatus)
+	r.Post("/api/v1/setup/unlock", s.handleSetupUnlock)
+	r.Post("/api/v1/setup/restore/upload", s.handleSetupRestoreUpload)
+	r.Post("/api/v1/setup/restore/analyze", s.handleSetupRestoreAnalyze)
+	r.Post("/api/v1/setup/apply", s.handleSetupApply)
 	r.Post("/api/v1/login", s.handleLogin)
 	r.Post("/api/v1/password-reset/consume", s.handleConsumePasswordReset)
 
@@ -79,6 +86,7 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/settings", s.handleGetSettings)
 		pr.Get("/api/v1/time-sync", s.handleGetTimeSyncStatus)
 		pr.Get("/api/v1/system/health", s.handleGetSystemHealth)
+		pr.Get("/api/v1/backup/settings", s.handleBackupSettingsGet)
 		pr.Get("/api/v1/users", s.handleListUsers)
 		pr.Get("/api/v1/tokens", s.handleListTokens)
 		pr.Get("/api/v1/ssh/routes", s.handleListSSHBastionRoutes)
@@ -120,6 +128,11 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/password-reset/create", s.handleCreatePasswordReset)
 		pr.Post("/api/v1/settings", s.handleSetSettings)
 		pr.Post("/api/v1/reload", s.handleReloadService)
+		pr.Post("/api/v1/backup/settings", s.handleBackupSettingsSet)
+		pr.Post("/api/v1/backup/create", s.handleBackupCreate)
+		pr.Post("/api/v1/backup/analyze", s.handleBackupAnalyze)
+		pr.Post("/api/v1/backup/restore", s.handleBackupRestore)
+		pr.Post("/api/v1/backup/post-restore-check", s.handleBackupPostRestoreCheck)
 		pr.Post("/api/v1/users", s.handleCreateUser)
 		pr.Put("/api/v1/users/{id}", s.handleUpdateUserAccess)
 		pr.Put("/api/v1/users/{id}/domains", s.handleSetUserDomains)
@@ -171,6 +184,282 @@ func (s *Server) Router() http.Handler {
 	})
 
 	return r
+}
+
+func (s *Server) setupGateMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		st, err := s.app.GetSetupStatus(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if st.Initialized {
+			next.ServeHTTP(w, r)
+			return
+		}
+		switch r.URL.Path {
+		case "/api/v1/style", "/api/v1/csrf", "/api/v1/setup/status", "/api/v1/setup/unlock", "/api/v1/setup/restore/upload", "/api/v1/setup/restore/analyze", "/api/v1/setup/apply":
+			next.ServeHTTP(w, r)
+			return
+		default:
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "setup required",
+				"code":  "setup_required",
+			})
+			return
+		}
+	})
+}
+
+func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
+	st, err := s.app.GetSetupStatus(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleSetupUnlock(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		OTS string `json:"ots"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	st, err := s.app.UnlockSetup(r.Context(), in.OTS)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleSetupRestoreAnalyze(w http.ResponseWriter, r *http.Request) {
+	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if strings.HasPrefix(ct, "multipart/form-data") {
+		fileName, raw, passphrase, err := readBackupUpload(r)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		meta, err := s.app.UploadSetupBackup(r.Context(), fileName, raw, passphrase)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, meta)
+		return
+	}
+	var in struct {
+		FileName string `json:"fileName"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeErr(w, http.StatusBadRequest, "send multipart form-data with fields: backup (file), passphrase")
+}
+
+func (s *Server) handleSetupRestoreUpload(w http.ResponseWriter, r *http.Request) {
+	fileName, raw, passphrase, err := readBackupUpload(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	meta, err := s.app.UploadSetupBackup(r.Context(), fileName, raw, passphrase)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, meta)
+}
+
+func (s *Server) handleBackupSettingsGet(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) && id.Role != model.RoleReadOnly {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	cfg, err := s.app.GetBackupScheduleSettings(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
+func (s *Server) handleBackupSettingsSet(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		Enabled       bool                  `json:"enabled"`
+		IntervalHours int                   `json:"intervalHours"`
+		Passphrase    string                `json:"passphrase"`
+		FTP           app.BackupFTPSettings `json:"ftp"`
+		FTPPassword   string                `json:"ftpPassword"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.SetBackupScheduleSettings(r.Context(), app.BackupScheduleSettings{
+		Enabled:       in.Enabled,
+		IntervalHours: in.IntervalHours,
+		FTP:           in.FTP,
+	}, in.Passphrase, in.FTPPassword); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		Passphrase string `json:"passphrase"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	raw, meta, err := s.app.CreateBackupPackage(r.Context(), in.Passphrase)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	fileName := "domnex-backup-" + time.Now().UTC().Format("20060102-150405") + ".dnxbak"
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+fileName+`"`)
+	w.Header().Set("X-Domnex-Backup-Meta", toCompactJSON(meta))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
+
+func (s *Server) handleBackupAnalyze(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	fileName, raw, passphrase, err := readBackupUpload(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	meta, err := s.app.AnalyzeBackupPackage(r.Context(), fileName, raw, passphrase)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, meta)
+}
+
+func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	if strings.TrimSpace(r.FormValue("confirm")) != "RESTORE" {
+		writeErr(w, http.StatusBadRequest, "confirm must equal RESTORE")
+		return
+	}
+	fileName, raw, passphrase, err := readBackupUpload(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	meta, err := s.app.RestoreFromBackupPackage(r.Context(), fileName, raw, passphrase)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	post, postErr := s.app.RunPostRestoreCheck(checkCtx)
+	cancel()
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "backup.restore.apply", Target: meta.FileName, Meta: "done"})
+	if postErr != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "meta": meta, "postCheckError": postErr.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "meta": meta, "postCheck": post})
+}
+
+func (s *Server) handleBackupPostRestoreCheck(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	out, err := s.app.RunPostRestoreCheck(checkCtx)
+	cancel()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func readBackupUpload(r *http.Request) (string, []byte, string, error) {
+	if err := r.ParseMultipartForm(96 << 20); err != nil {
+		return "", nil, "", fmt.Errorf("invalid multipart payload")
+	}
+	passphrase := strings.TrimSpace(r.FormValue("passphrase"))
+	if len(passphrase) < 12 {
+		return "", nil, "", fmt.Errorf("passphrase must be at least 12 characters")
+	}
+	f, fh, err := r.FormFile("backup")
+	if err != nil {
+		return "", nil, "", fmt.Errorf("backup file is required")
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, 96<<20))
+	if err != nil {
+		return "", nil, "", err
+	}
+	if len(raw) == 0 {
+		return "", nil, "", fmt.Errorf("backup file is empty")
+	}
+	name := ""
+	if fh != nil {
+		name = strings.TrimSpace(fh.Filename)
+	}
+	return name, raw, passphrase, nil
+}
+
+func toCompactJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+func (s *Server) handleSetupApply(w http.ResponseWriter, r *http.Request) {
+	var in app.SetupApplyInput
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.ApplyInitialSetup(r.Context(), in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "initialized": true})
 }
 
 func (s *Server) handleDomainPreflight(w http.ResponseWriter, r *http.Request) {

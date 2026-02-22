@@ -39,25 +39,34 @@ import (
 )
 
 type Service struct {
-	cfg      config.Config
-	store    *store.Store
-	keystore *crypto.Keystore
-	dns      dns.Provider
-	log      *logx.Logger
-	publicIP string
-	backoff  map[int64]time.Time
-	logMu    sync.RWMutex
-	logCfg   LogServerSettings
-	logToken string
-	logCh    chan model.AuditEvent
-	hostName string
-	tiMu     sync.RWMutex
-	tiSnap   model.ThreatIntelSnapshot
-	tiWinMu  sync.Mutex
-	tiWin    map[string]tiWindow
-	sysMu    sync.Mutex
-	netLast  uint64
-	netLastT time.Time
+	cfg              config.Config
+	store            *store.Store
+	keystore         *crypto.Keystore
+	dns              dns.Provider
+	log              *logx.Logger
+	publicIP         string
+	backoff          map[int64]time.Time
+	logMu            sync.RWMutex
+	logCfg           LogServerSettings
+	logToken         string
+	logCh            chan model.AuditEvent
+	hostName         string
+	tiMu             sync.RWMutex
+	tiSnap           model.ThreatIntelSnapshot
+	tiWinMu          sync.Mutex
+	tiWin            map[string]tiWindow
+	sysMu            sync.Mutex
+	netLast          uint64
+	netLastT         time.Time
+	setupMu          sync.Mutex
+	setupInitialized bool
+	setupOTSHash     [32]byte
+	setupOTSExpires  time.Time
+	setupUnlockUntil time.Time
+	setupAttempts    int
+	setupCooldown    time.Time
+	setupRestore     *backupSnapshot
+	backupRunMu      sync.Mutex
 }
 
 type tiWindow struct {
@@ -488,6 +497,13 @@ func (s *Service) Bootstrap(ctx context.Context, bootstrapUser, bootstrapPass st
 	if _, err := s.GetThreatIntelSnapshot(ctx); err != nil {
 		s.log.Warn("threat intel snapshot init failed", map[string]any{"err": err.Error()})
 	}
+	if strings.TrimSpace(bootstrapPass) == "" {
+		// Setup assistant mode: no automatic admin/domain bootstrap.
+		if err := s.ensureSetupState(ctx); err != nil {
+			return err
+		}
+		return nil
+	}
 	hash, err := crypto.HashPassword(bootstrapPass, crypto.DefaultArgonConfig())
 	if err != nil {
 		return err
@@ -531,7 +547,7 @@ func (s *Service) Bootstrap(ctx context.Context, bootstrapUser, bootstrapPass st
 	_ = s.store.SetHostState(ctx, h.ID, "dns_pending", "bootstrap")
 	_ = s.store.SetHostState(ctx, h.ID, "cert_pending", "bootstrap")
 	_ = s.store.SetHostState(ctx, h.ID, "active", "bootstrap")
-	return nil
+	return s.ensureSetupState(ctx)
 }
 
 func (s *Service) ListFQDNs(ctx context.Context) ([]string, error) {

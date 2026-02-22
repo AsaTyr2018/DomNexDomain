@@ -17,6 +17,24 @@ type LogServerTCPJSONSettings = { enabled: boolean; address: string; timeoutSec:
 type LogServerSettings = { syslog: LogServerSyslogSettings; http: LogServerHTTPSettings; tcpJson: LogServerTCPJSONSettings };
 type RetentionPolicy = { auditDays: number; trafficDays: number; visitorsDays: number; threatDays: number; blockedDays: number; loginAttemptDays: number; passwordResetDays: number };
 type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean; retention?: RetentionPolicy };
+type SetupStatus = { initialized: boolean; locked: boolean; unlocked: boolean; restoreReady?: boolean; otsExpiresAt?: string; unlockUntil?: string; cooldownUntil?: string };
+type SetupBackupMeta = { fileName: string; format: string; createdAt: string; domnexVersion: string; domains: number; subdomains: number; users: number };
+type BackupMeta = SetupBackupMeta & { dbSha256?: string; keySha256?: string };
+type BackupFTPSettings = { enabled: boolean; host: string; port: number; username: string; remoteDir: string; tlsMode: 'off' | 'explicit' | 'implicit'; hasPassword?: boolean };
+type BackupScheduleSettings = { enabled: boolean; intervalHours: number; hasPassphrase?: boolean; lastRunAt?: string; lastResult?: string; ftp: BackupFTPSettings };
+type PostRestoreCheck = {
+  checkedAt: string;
+  domainsTotal: number;
+  domainsOk: number;
+  hostsTotal: number;
+  hostsDnsOk: number;
+  hostsHttpsOk: number;
+  hostsTlsOk: number;
+  hostsCertValid: number;
+  certWarmupAttempts: number;
+  certWarmupSucceeded: number;
+  issues: string[];
+};
 type TimeSyncProbe = { name: string; target: string; ok: boolean; offsetMs: number; rttMs: number; error?: string; detail?: string };
 type TimeSyncStatus = { mode: 'system_only' | 'external_public' | 'external_lan'; healthy: boolean; severity: 'ok' | 'warn' | 'critical'; summary: string; source?: string; offsetMs?: number; checkedAt: string; probes: TimeSyncProbe[] };
 type SystemHealth = {
@@ -74,7 +92,7 @@ type ThreatIntelMatchesPage = { items: ThreatIntelMatch[]; total: number; page: 
 type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; page: number; pageSize: number };
 type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
 
-type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'users' | 'settings' | 'api' | 'apiDocs' | 'ssh' | 'audit';
+type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'apiDocs' | 'ssh' | 'audit';
 type SettingsTab = 'general' | 'security' | 'logservers' | 'appearance' | 'advanced';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
@@ -113,6 +131,20 @@ const defaultRetentionPolicy = (): RetentionPolicy => ({
   blockedDays: 60,
   loginAttemptDays: 30,
   passwordResetDays: 7,
+});
+const defaultBackupScheduleSettings = (): BackupScheduleSettings => ({
+  enabled: false,
+  intervalHours: 24,
+  hasPassphrase: false,
+  ftp: {
+    enabled: false,
+    host: '',
+    port: 21,
+    username: '',
+    remoteDir: '/',
+    tlsMode: 'explicit',
+    hasPassword: false,
+  },
 });
 const MONOLITH_THEME: ThemeVars = {
   bg: '#0f0f11',
@@ -170,6 +202,25 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
+async function apiMultipart<T>(path: string, form: FormData, csrf?: string): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (csrf) headers['X-CSRF-Token'] = csrf;
+  const res = await fetch(path, {
+    method: 'POST',
+    credentials: 'include',
+    headers,
+    body: form,
+  });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!res.ok) {
+    const err = new Error(data.error || `${res.status} ${res.statusText}`) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
+  }
+  return data as T;
+}
+
 function getCookie(name: string): string {
   const item = document.cookie.split('; ').find((v) => v.startsWith(`${name}=`));
   return item ? decodeURIComponent(item.split('=')[1]) : '';
@@ -177,6 +228,15 @@ function getCookie(name: string): string {
 
 function downloadTextFile(filename: string, content: string): void {
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function downloadBinaryFile(filename: string, blob: Blob): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -296,6 +356,22 @@ function App() {
 
   const [loginUser, setLoginUser] = useState('admin');
   const [loginPass, setLoginPass] = useState('');
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
+  const [setupMode, setSetupMode] = useState<'fresh' | 'restore'>('fresh');
+  const [setupStep, setSetupStep] = useState(1);
+  const [setupOTS, setSetupOTS] = useState('');
+  const [setupAdminUser, setSetupAdminUser] = useState('admin');
+  const [setupAdminPass, setSetupAdminPass] = useState('');
+  const [setupAdminPass2, setSetupAdminPass2] = useState('');
+  const [setupDomainName, setSetupDomainName] = useState('');
+  const [setupDomainDNSMode, setSetupDomainDNSMode] = useState<'manual' | 'cloudflare'>('cloudflare');
+  const [setupDomainCertMode, setSetupDomainCertMode] = useState<'letsencrypt' | 'letsencrypt-catchall'>('letsencrypt-catchall');
+  const [setupDomainZoneID, setSetupDomainZoneID] = useState('');
+  const [setupFirstSub, setSetupFirstSub] = useState('');
+  const [setupFirstUpstream, setSetupFirstUpstream] = useState('http://127.0.0.1:3000');
+  const [setupBackupPassphrase, setSetupBackupPassphrase] = useState('');
+  const [setupBackupFile, setSetupBackupFile] = useState<File | null>(null);
+  const [setupBackupMeta, setSetupBackupMeta] = useState<SetupBackupMeta | null>(null);
   const [domainName, setDomainName] = useState('');
   const [domainProvider, setDomainProvider] = useState<DomainProvider>('cloudflare');
   const [domainZoneID, setDomainZoneID] = useState('');
@@ -365,6 +441,15 @@ function App() {
   const [settingsLogServers, setSettingsLogServers] = useState<LogServerSettings>(defaultLogServers());
   const [settingsLogHTTPBearer, setSettingsLogHTTPBearer] = useState('');
   const [settingsRetention, setSettingsRetention] = useState<RetentionPolicy>(defaultRetentionPolicy());
+  const [backupPassphrase, setBackupPassphrase] = useState('');
+  const [backupRestorePassphrase, setBackupRestorePassphrase] = useState('');
+  const [backupRestoreConfirm, setBackupRestoreConfirm] = useState('');
+  const [backupRestoreFile, setBackupRestoreFile] = useState<File | null>(null);
+  const [backupMetaPreview, setBackupMetaPreview] = useState<BackupMeta | null>(null);
+  const [postRestoreCheck, setPostRestoreCheck] = useState<PostRestoreCheck | null>(null);
+  const [backupSettings, setBackupSettings] = useState<BackupScheduleSettings>(defaultBackupScheduleSettings());
+  const [backupSchedulePassphrase, setBackupSchedulePassphrase] = useState('');
+  const [backupFTPPass, setBackupFTPPass] = useState('');
   const [timeSyncStatus, setTimeSyncStatus] = useState<TimeSyncStatus | null>(null);
   const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
@@ -424,13 +509,36 @@ function App() {
     }
   };
 
+  const loadSetupStatus = async (): Promise<SetupStatus | null> => {
+    try {
+      const st = await api<SetupStatus>('/api/v1/setup/status');
+      setSetupStatus(st);
+      if (st && !st.initialized) {
+        setSetupStep(1);
+        return st;
+      }
+      return st;
+    } catch {
+      return null;
+    }
+  };
+
   const refresh = async () => {
     setLoading(true);
     setError('');
     try {
+      const st = await loadSetupStatus();
+      if (st && !st.initialized) {
+        setIdentity(null);
+        setDomains([]);
+        setHosts([]);
+        setAudit([]);
+        return;
+      }
       await api('/api/v1/csrf');
       const me = await api<{ identity: Identity }>('/api/v1/me');
       setIdentity(me.identity);
+      setSetupStatus(st && st.initialized ? st : null);
       const [d, h, a] = await Promise.all([
         api<{ items: Domain[] }>('/api/v1/domains'),
         api<{ items: Host[] }>('/api/v1/hosts'),
@@ -502,6 +610,12 @@ function App() {
         setSettingsRetention(defaultRetentionPolicy());
       }
       try {
+        const b = await api<BackupScheduleSettings>('/api/v1/backup/settings');
+        setBackupSettings(b || defaultBackupScheduleSettings());
+      } catch {
+        setBackupSettings(defaultBackupScheduleSettings());
+      }
+      try {
         const ts = await api<TimeSyncStatus>('/api/v1/time-sync');
         setTimeSyncStatus(ts);
       } catch {
@@ -537,6 +651,11 @@ function App() {
       }
     } catch (e) {
       const err = e as Error & { status?: number };
+      if (err.status === 503 && /setup required/i.test(err.message)) {
+        setIdentity(null);
+        await loadSetupStatus();
+        return;
+      }
       if (err.status === 401 || /unauthorized/i.test(err.message)) {
         setIdentity(null);
         setDomains([]);
@@ -717,6 +836,253 @@ function App() {
     }
   };
 
+  const setupUnlock = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const st = await api<SetupStatus>('/api/v1/setup/unlock', {
+        method: 'POST',
+        body: JSON.stringify({ ots: setupOTS }),
+      });
+      setSetupStatus(st);
+      setSetupStep(setupMode === 'restore' ? 2 : 3);
+      setSetupOTS('');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const setupUploadBackup = async () => {
+    if (!setupBackupFile) {
+      setError('Select a backup package first.');
+      return;
+    }
+    if (setupBackupPassphrase.trim().length < 12) {
+      setError('Backup passphrase must be at least 12 characters.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      const fd = new FormData();
+      fd.append('backup', setupBackupFile);
+      fd.append('passphrase', setupBackupPassphrase.trim());
+      const meta = await apiMultipart<SetupBackupMeta>('/api/v1/setup/restore/upload', fd);
+      setSetupBackupMeta(meta);
+      setSetupStatus((p) => p ? ({ ...p, restoreReady: true }) : p);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const createEncryptedBackup = async () => {
+    if (backupPassphrase.trim().length < 12) {
+      setError('Backup passphrase must be at least 12 characters.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      const res = await fetch('/api/v1/backup/create', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrf,
+        },
+        body: JSON.stringify({ passphrase: backupPassphrase.trim() }),
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        const data = txt ? JSON.parse(txt) : {};
+        throw new Error(data.error || `${res.status} ${res.statusText}`);
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get('Content-Disposition') || '';
+      const m = /filename=\"?([^\";]+)\"?/.exec(cd);
+      const fileName = m?.[1] || `domnex-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.dnxbak`;
+      downloadBinaryFile(fileName, blob);
+      setSettingsMessage('Encrypted backup package created and downloaded.');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const analyzeBackupFile = async () => {
+    if (!backupRestoreFile) {
+      setError('Select a backup package first.');
+      return;
+    }
+    if (backupRestorePassphrase.trim().length < 12) {
+      setError('Backup passphrase must be at least 12 characters.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      const fd = new FormData();
+      fd.append('backup', backupRestoreFile);
+      fd.append('passphrase', backupRestorePassphrase.trim());
+      const meta = await apiMultipart<BackupMeta>('/api/v1/backup/analyze', fd, csrf);
+      setBackupMetaPreview(meta);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const restoreEncryptedBackup = async () => {
+    if (!backupRestoreFile) {
+      setError('Select a backup package first.');
+      return;
+    }
+    if (backupRestorePassphrase.trim().length < 12) {
+      setError('Backup passphrase must be at least 12 characters.');
+      return;
+    }
+    if (backupRestoreConfirm.trim() !== 'RESTORE') {
+      setError('Type RESTORE exactly to confirm restore apply.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      const fd = new FormData();
+      fd.append('backup', backupRestoreFile);
+      fd.append('passphrase', backupRestorePassphrase.trim());
+      fd.append('confirm', backupRestoreConfirm.trim());
+      const out = await apiMultipart<{ ok: boolean; postCheck?: PostRestoreCheck; postCheckError?: string }>('/api/v1/backup/restore', fd, csrf);
+      if (out.postCheck) {
+        setPostRestoreCheck(out.postCheck);
+      }
+      if (out.postCheckError) {
+        setSettingsMessage(`Backup restore applied. Post-restore check failed: ${out.postCheckError}`);
+      } else {
+        setSettingsMessage('Backup restore applied with post-restore check. For clean runtime transition, use Reload Service now.');
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveBackupSchedule = async () => {
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      await api('/api/v1/backup/settings', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          enabled: !!backupSettings.enabled,
+          intervalHours: Number(backupSettings.intervalHours || 24),
+          passphrase: backupSchedulePassphrase,
+          ftp: {
+            enabled: !!backupSettings.ftp.enabled,
+            host: backupSettings.ftp.host || '',
+            port: Number(backupSettings.ftp.port || 21),
+            username: backupSettings.ftp.username || '',
+            remoteDir: backupSettings.ftp.remoteDir || '/',
+            tlsMode: backupSettings.ftp.tlsMode || 'explicit',
+          },
+          ftpPassword: backupFTPPass,
+        }),
+      });
+      setBackupSchedulePassphrase('');
+      setBackupFTPPass('');
+      const b = await api<BackupScheduleSettings>('/api/v1/backup/settings');
+      setBackupSettings(b || defaultBackupScheduleSettings());
+      setSettingsMessage('Backup schedule saved.');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runPostRestoreCheck = async () => {
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      const out = await api<PostRestoreCheck>('/api/v1/backup/post-restore-check', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: '{}',
+      });
+      setPostRestoreCheck(out);
+      setSettingsMessage('Post-restore check completed.');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const applySetup = async () => {
+    if (!setupAdminUser.trim() || setupAdminPass.length < 10 || setupAdminPass !== setupAdminPass2) {
+      setError('Please provide valid admin credentials (min 10 chars, matching confirmation).');
+      return;
+    }
+    if (setupMode === 'fresh' && !setupDomainName.trim()) {
+      setError('First domain is required for fresh setup.');
+      return;
+    }
+    if (setupMode === 'restore' && !setupBackupMeta) {
+      setError('Analyze a backup package first.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/setup/apply', {
+        method: 'POST',
+        body: JSON.stringify({
+          mode: setupMode,
+          adminUsername: setupAdminUser.trim().toLowerCase(),
+          adminPassword: setupAdminPass,
+          acmeEmail: settingsAcmeEmail,
+          acmeStaging: settingsAcmeStaging,
+          cfToken: '',
+          publicIpv4: settingsPublicIPv4,
+          baseDomain: setupMode === 'fresh' ? setupDomainName.trim().toLowerCase() : settingsBaseDomain,
+          timeSyncMode: settingsTimeSyncMode,
+          timeSyncLanServers: settingsTimeSyncLAN,
+          logServers: settingsLogServers,
+          logHttpBearer: settingsLogHTTPBearer,
+          retention: settingsRetention,
+          domainName: setupMode === 'fresh' ? setupDomainName.trim().toLowerCase() : '',
+          domainDnsMode: setupMode === 'fresh' ? setupDomainDNSMode : '',
+          domainCertMode: setupMode === 'fresh' ? setupDomainCertMode : '',
+          domainProvider: setupMode === 'fresh' ? setupDomainDNSMode : '',
+          domainZoneId: setupMode === 'fresh' ? setupDomainZoneID.trim() : '',
+          firstSubdomain: setupMode === 'fresh' ? setupFirstSub.trim().toLowerCase() : '',
+          firstUpstream: setupMode === 'fresh' ? setupFirstUpstream.trim() : '',
+          firstInsecureTls: false,
+          backupMeta: setupBackupMeta || undefined,
+        }),
+      });
+      setSetupStatus(null);
+      setSetupStep(1);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const logout = async () => {
     setLoading(true);
     setError('');
@@ -743,6 +1109,15 @@ function App() {
       setSettingsTimeSyncMode('system_only');
       setSettingsTimeSyncLAN('');
       setSettingsRetention(defaultRetentionPolicy());
+      setBackupSettings(defaultBackupScheduleSettings());
+      setBackupPassphrase('');
+      setBackupRestorePassphrase('');
+      setBackupRestoreConfirm('');
+      setBackupRestoreFile(null);
+      setBackupMetaPreview(null);
+      setPostRestoreCheck(null);
+      setBackupSchedulePassphrase('');
+      setBackupFTPPass('');
       setTimeSyncStatus(null);
       setSystemHealth(null);
       void loadPublicStyle();
@@ -2099,6 +2474,7 @@ function App() {
               <div className="menu-title">Routing</div>
               <button className={tab === 'domains' ? 'active' : ''} onClick={() => setTab('domains')}>Domains</button>
               <button className={tab === 'hosts' ? 'active' : ''} onClick={() => setTab('hosts')}>Subdomains</button>
+              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'backup' ? 'active' : ''} onClick={() => setTab('backup')}>Backup</button> : null}
               <button className={tab === 'threatIntel' ? 'active' : ''} onClick={() => setTab('threatIntel')}>Threat Intel</button>
               {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'ssh' ? 'active' : ''} onClick={() => setTab('ssh')}>SSH Bastion</button> : null}
             </div>
@@ -3313,6 +3689,136 @@ function App() {
             </section>
           ) : null}
 
+          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'backup' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card" style={{ marginBottom: '.6rem' }}>
+                  <div className="card-head"><h3>Scheduled Backup</h3></div>
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>Enable Scheduler</label>
+                      <label className="check"><input type="checkbox" checked={!!backupSettings.enabled} onChange={(e) => setBackupSettings((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole} /> Create encrypted backups automatically</label>
+                    </div>
+                    <div className="field">
+                      <label>Interval (hours)</label>
+                      <input type="number" min={1} max={168} value={String(backupSettings.intervalHours || 24)} onChange={(e) => setBackupSettings((p) => ({ ...p, intervalHours: Number(e.target.value) || 24 }))} disabled={isReadOnlyRole} />
+                    </div>
+                    <div className="field">
+                      <label>Backup Encryption Passphrase</label>
+                      <input type="password" value={backupSchedulePassphrase} onChange={(e) => setBackupSchedulePassphrase(e.target.value)} placeholder={backupSettings.hasPassphrase ? 'Stored. Enter only to rotate.' : 'Minimum 12 characters'} disabled={isReadOnlyRole} />
+                    </div>
+                  </div>
+                  <div className="muted">Last run: {backupSettings.lastRunAt ? new Date(backupSettings.lastRunAt).toLocaleString() : '-'}</div>
+                  <div className="muted" style={{ marginBottom: '.5rem' }}>Last result: {backupSettings.lastResult || '-'}</div>
+
+                  <div className="card" style={{ marginBottom: '.6rem' }}>
+                    <div className="card-head"><h3>FTP Target</h3></div>
+                    <div className="field-grid">
+                      <div className="field">
+                        <label>Enable FTP Upload</label>
+                        <label className="check"><input type="checkbox" checked={!!backupSettings.ftp.enabled} onChange={(e) => setBackupSettings((p) => ({ ...p, ftp: { ...p.ftp, enabled: e.target.checked } }))} disabled={isReadOnlyRole} /> Upload each scheduled backup to FTP</label>
+                      </div>
+                      <div className="field">
+                        <label>Host</label>
+                        <input value={backupSettings.ftp.host || ''} onChange={(e) => setBackupSettings((p) => ({ ...p, ftp: { ...p.ftp, host: e.target.value } }))} placeholder="ftp.example.net" disabled={isReadOnlyRole} />
+                      </div>
+                      <div className="field">
+                        <label>Port</label>
+                        <input type="number" min={1} max={65535} value={String(backupSettings.ftp.port || 21)} onChange={(e) => setBackupSettings((p) => ({ ...p, ftp: { ...p.ftp, port: Number(e.target.value) || 21 } }))} disabled={isReadOnlyRole} />
+                      </div>
+                      <div className="field">
+                        <label>Username</label>
+                        <input value={backupSettings.ftp.username || ''} onChange={(e) => setBackupSettings((p) => ({ ...p, ftp: { ...p.ftp, username: e.target.value } }))} placeholder="backup-user" disabled={isReadOnlyRole} />
+                      </div>
+                      <div className="field">
+                        <label>Password</label>
+                        <input type="password" value={backupFTPPass} onChange={(e) => setBackupFTPPass(e.target.value)} placeholder={backupSettings.ftp.hasPassword ? 'Stored. Enter only to rotate.' : 'FTP password'} disabled={isReadOnlyRole} />
+                      </div>
+                      <div className="field">
+                        <label>Remote Directory</label>
+                        <input value={backupSettings.ftp.remoteDir || '/'} onChange={(e) => setBackupSettings((p) => ({ ...p, ftp: { ...p.ftp, remoteDir: e.target.value } }))} placeholder="/domnex/backups" disabled={isReadOnlyRole} />
+                      </div>
+                      <div className="field">
+                        <label>TLS Mode</label>
+                        <select value={backupSettings.ftp.tlsMode || 'explicit'} onChange={(e) => setBackupSettings((p) => ({ ...p, ftp: { ...p.ftp, tlsMode: e.target.value as 'off' | 'explicit' | 'implicit' } }))} disabled={isReadOnlyRole}>
+                          <option value="off">FTP (plain)</option>
+                          <option value="explicit">FTP explicit TLS</option>
+                          <option value="implicit">FTP implicit TLS</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="row">
+                    <button className="btn" onClick={saveBackupSchedule} disabled={loading || isReadOnlyRole}>Save Backup Schedule</button>
+                    <button className="btn ghost" onClick={refresh} disabled={loading}>Refresh</button>
+                  </div>
+                </section>
+                <section className="card" style={{ marginBottom: '.6rem' }}>
+                  <div className="card-head"><h3>Create Encrypted Backup</h3></div>
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>Backup Passphrase</label>
+                      <input type="password" value={backupPassphrase} onChange={(e) => setBackupPassphrase(e.target.value)} placeholder="Minimum 12 characters" />
+                      <div className="muted">Package includes users, domains, subdomains, runtime settings and encrypted secrets state.</div>
+                    </div>
+                  </div>
+                  <div className="row" style={{ marginBottom: 0 }}>
+                    <button className="btn" onClick={createEncryptedBackup} disabled={loading || isReadOnlyRole}>Create &amp; Download Backup</button>
+                  </div>
+                </section>
+                <section className="card danger-zone">
+                  <div className="card-head"><h3>Restore Encrypted Backup</h3></div>
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>Backup Package</label>
+                      <input type="file" accept=".dnxbak,.bin,.dat,application/octet-stream" onChange={(e) => setBackupRestoreFile(e.target.files?.[0] || null)} />
+                    </div>
+                    <div className="field">
+                      <label>Backup Passphrase</label>
+                      <input type="password" value={backupRestorePassphrase} onChange={(e) => setBackupRestorePassphrase(e.target.value)} placeholder="Passphrase used for backup encryption" />
+                    </div>
+                    <div className="field">
+                      <label>Confirm Restore</label>
+                      <input value={backupRestoreConfirm} onChange={(e) => setBackupRestoreConfirm(e.target.value)} placeholder="Type RESTORE" />
+                    </div>
+                  </div>
+                  <div className="row">
+                    <button className="btn" onClick={analyzeBackupFile} disabled={loading || !backupRestoreFile}>Analyze Package</button>
+                    <button className="btn danger" onClick={restoreEncryptedBackup} disabled={loading || isReadOnlyRole || !backupRestoreFile}>Apply Restore</button>
+                    <button className="btn" onClick={runPostRestoreCheck} disabled={loading || isReadOnlyRole}>Run Post-Restore Check</button>
+                  </div>
+                  {backupMetaPreview ? (
+                    <pre>{`File: ${backupMetaPreview.fileName}
+Format: ${backupMetaPreview.format}
+Created: ${backupMetaPreview.createdAt}
+DomNex: ${backupMetaPreview.domnexVersion}
+Domains: ${backupMetaPreview.domains}
+Subdomains: ${backupMetaPreview.subdomains}
+Users: ${backupMetaPreview.users}
+DB SHA256: ${backupMetaPreview.dbSha256 || '-'}
+Key SHA256: ${backupMetaPreview.keySha256 || '-'}`}</pre>
+                  ) : null}
+                  {postRestoreCheck ? (
+                    <pre>{`Checked: ${new Date(postRestoreCheck.checkedAt).toLocaleString()}
+Domains: ${postRestoreCheck.domainsOk}/${postRestoreCheck.domainsTotal}
+Hosts DNS OK: ${postRestoreCheck.hostsDnsOk}/${postRestoreCheck.hostsTotal}
+Hosts HTTPS OK: ${postRestoreCheck.hostsHttpsOk}/${postRestoreCheck.hostsTotal}
+Hosts TLS OK: ${postRestoreCheck.hostsTlsOk}/${postRestoreCheck.hostsTotal}
+Hosts Valid Cert: ${postRestoreCheck.hostsCertValid}/${postRestoreCheck.hostsTotal}
+Cert Warmup: ${postRestoreCheck.certWarmupSucceeded}/${postRestoreCheck.certWarmupAttempts}
+Issues: ${postRestoreCheck.issues.length}`}</pre>
+                  ) : null}
+                  {postRestoreCheck && postRestoreCheck.issues.length > 0 ? (
+                    <div className="muted" style={{ marginTop: '.4rem' }}>
+                      {postRestoreCheck.issues.slice(0, 6).join(' | ')}
+                    </div>
+                  ) : null}
+                  <div className="muted">LE cert cache is intentionally excluded from backup packages. Certificates are re-obtained when needed.</div>
+                </section>
+              </div>
+            </section>
+          ) : null}
+
           {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'users' ? (
             <section className="entity-page users-page">
               <div className="entity-main">
@@ -3816,7 +4322,138 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
       </div>
       ) : null}
 
-      {!identity ? (
+      {!identity && setupStatus && !setupStatus.initialized ? (
+        <div className="overlay auth-overlay">
+          <div className="login-card auth-login-card" style={{ width: 'min(760px, 96vw)' }}>
+            <div className="auth-brand">
+              <img src="/logo.png" alt="DomNexDomain" />
+            </div>
+            <h3>Initial Setup Assistant</h3>
+            <p className="muted">This instance is not initialized yet. Complete setup to enable normal admin login.</p>
+            <div className="wizard-steps">
+              <button className={`wiz ${setupStep === 1 ? 'active' : ''}`} onClick={() => setSetupStep(1)}>1. Unlock</button>
+              {setupMode === 'restore' ? <button className={`wiz ${setupStep === 2 ? 'active' : ''}`} onClick={() => setSetupStep(2)}>2. Backup</button> : null}
+              <button className={`wiz ${setupStep === 3 ? 'active' : ''}`} onClick={() => setSetupStep(3)}>{setupMode === 'restore' ? '3. Admin' : '2. Fresh Setup'}</button>
+              <button className={`wiz ${setupStep === 4 ? 'active' : ''}`} onClick={() => setSetupStep(4)}>4. Review</button>
+            </div>
+            {setupStep === 1 ? (
+              <div className="col">
+                <div className="field">
+                  <label>One-Time Setup Code (OTS)</label>
+                  <input value={setupOTS} onChange={(e) => setSetupOTS(e.target.value)} placeholder="Enter OTS from service logs" />
+                  <div className="muted">Expires: {setupStatus.otsExpiresAt ? new Date(setupStatus.otsExpiresAt).toLocaleString() : '-'}</div>
+                </div>
+                <div className="row" style={{ marginBottom: 0 }}>
+                  <button className="btn" onClick={setupUnlock} disabled={loading || !setupOTS.trim()}>Unlock Setup</button>
+                  <button className="btn" onClick={() => setSetupMode('fresh')} disabled={loading}>Fresh Install</button>
+                  <button className="btn" onClick={() => setSetupMode('restore')} disabled={loading}>Restore from Backup</button>
+                </div>
+              </div>
+            ) : null}
+            {setupStep === 2 && setupMode === 'restore' ? (
+              <div className="col">
+                <p className="muted">Upload an encrypted DomNex backup package (`.dnxbak`) and unlock it with its backup passphrase.</p>
+                <div className="row">
+                  <input type="file" accept=".dnxbak,.bin,.dat,application/octet-stream" onChange={(e) => setSetupBackupFile(e.target.files?.[0] || null)} />
+                </div>
+                <div className="row">
+                  <input type="password" value={setupBackupPassphrase} onChange={(e) => setSetupBackupPassphrase(e.target.value)} placeholder="Backup passphrase (min 12 chars)" />
+                </div>
+                <div className="row" style={{ marginBottom: 0 }}>
+                  <button className="btn" onClick={setupUploadBackup} disabled={loading || !setupBackupFile}>Upload &amp; Analyze</button>
+                  <button className="btn" onClick={() => setSetupStep(3)} disabled={!setupBackupMeta}>Continue</button>
+                </div>
+                {setupBackupMeta ? (
+                  <pre>{`File: ${setupBackupMeta.fileName}
+Format: ${setupBackupMeta.format}
+Created: ${setupBackupMeta.createdAt}
+DomNex: ${setupBackupMeta.domnexVersion}
+Domains: ${setupBackupMeta.domains}
+Subdomains: ${setupBackupMeta.subdomains}
+Users: ${setupBackupMeta.users}`}</pre>
+                ) : null}
+              </div>
+            ) : null}
+            {setupStep === 3 ? (
+              <div className="col">
+                <div className="field-grid">
+                  <div className="field">
+                    <label>Admin Username</label>
+                    <input value={setupAdminUser} onChange={(e) => setSetupAdminUser(e.target.value.toLowerCase())} placeholder="admin" />
+                  </div>
+                  <div className="field">
+                    <label>Admin Password</label>
+                    <input type="password" value={setupAdminPass} onChange={(e) => setSetupAdminPass(e.target.value)} placeholder="minimum 10 characters" />
+                  </div>
+                  <div className="field">
+                    <label>Confirm Password</label>
+                    <input type="password" value={setupAdminPass2} onChange={(e) => setSetupAdminPass2(e.target.value)} placeholder="repeat password" />
+                  </div>
+                </div>
+                {setupMode === 'fresh' ? (
+                  <>
+                    <div className="field-grid">
+                      <div className="field">
+                        <label>First Domain</label>
+                        <input value={setupDomainName} onChange={(e) => setSetupDomainName(e.target.value.toLowerCase().trim())} placeholder="example.com" />
+                      </div>
+                      <div className="field">
+                        <label>DNS Mode</label>
+                        <select value={setupDomainDNSMode} onChange={(e) => setSetupDomainDNSMode(e.target.value as 'manual' | 'cloudflare')}>
+                          <option value="cloudflare">Cloudflare</option>
+                          <option value="manual">Manual</option>
+                        </select>
+                      </div>
+                      <div className="field">
+                        <label>Cert Mode</label>
+                        <select value={setupDomainCertMode} onChange={(e) => setSetupDomainCertMode(e.target.value as 'letsencrypt' | 'letsencrypt-catchall')}>
+                          <option value="letsencrypt-catchall">Let's Encrypt + Catchall</option>
+                          <option value="letsencrypt">Let's Encrypt</option>
+                        </select>
+                      </div>
+                      <div className="field">
+                        <label>Cloudflare Zone ID (optional)</label>
+                        <input value={setupDomainZoneID} onChange={(e) => setSetupDomainZoneID(e.target.value)} placeholder="zone id" />
+                      </div>
+                    </div>
+                    <div className="field-grid">
+                      <div className="field">
+                        <label>First Subdomain (optional)</label>
+                        <input value={setupFirstSub} onChange={(e) => setSetupFirstSub(e.target.value.toLowerCase())} placeholder="app" />
+                      </div>
+                      <div className="field">
+                        <label>First Upstream (optional)</label>
+                        <input value={setupFirstUpstream} onChange={(e) => setSetupFirstUpstream(e.target.value)} placeholder="http://127.0.0.1:3000" />
+                      </div>
+                    </div>
+                    <div className="muted">Cloudflare setup intent: records `@`, `*`, `admin` are auto-managed for first domain.</div>
+                  </>
+                ) : (
+                  <div className="muted">Restore mode keeps infrastructure/runtime settings from backup snapshot. This step only bootstraps admin access.</div>
+                )}
+                <div className="row" style={{ marginBottom: 0 }}>
+                  <button className="btn" onClick={() => setSetupStep(4)} disabled={loading}>Review</button>
+                </div>
+              </div>
+            ) : null}
+            {setupStep === 4 ? (
+              <div className="col">
+                <pre>{`Mode: ${setupMode}
+Admin: ${setupAdminUser || '-'}
+Domain: ${setupMode === 'fresh' ? (setupDomainName || '-') : '(from backup)'}
+Subdomain: ${setupMode === 'fresh' ? (setupFirstSub || '(none)') : '(from backup)'}
+Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.format})` : '(none)'}`}</pre>
+                <div className="row" style={{ marginBottom: 0 }}>
+                  <button className="btn" onClick={applySetup} disabled={loading}>Apply Initial Setup</button>
+                  <button className="btn danger" onClick={() => setSetupStep(1)} disabled={loading}>Back to Unlock</button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {!identity && !(setupStatus && !setupStatus.initialized) ? (
         <div className="overlay auth-overlay">
           <div className="login-card auth-login-card">
             <div className="auth-brand">

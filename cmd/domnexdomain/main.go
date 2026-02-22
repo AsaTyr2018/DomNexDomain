@@ -93,6 +93,12 @@ func main() {
 		log.Error("bootstrap failed", map[string]any{"err": err.Error()})
 		os.Exit(1)
 	}
+	if st, err := appSvc.GetSetupStatus(context.Background()); err == nil && !st.Initialized {
+		log.Warn("initial setup required", map[string]any{
+			"locked":       st.Locked,
+			"otsExpiresAt": st.OTSExpiresAt.Format(time.RFC3339),
+		})
+	}
 
 	authSvc, err := auth.New(st, cfg.SessionTTL, cfg.AllowedCIDRs)
 	if err != nil {
@@ -196,6 +202,7 @@ func main() {
 	go appSvc.StartThreatIntelSync(ctx)
 	go appSvc.StartRetentionWorker(ctx)
 	go appSvc.StartPublicIPSync(ctx)
+	go appSvc.StartBackupScheduler(ctx)
 
 	if cfg.SSHBastionOn {
 		sshBastion := bastion.New(cfg.SSHBastionAddr, cfg.SSHBastionKey, appSvc, log)

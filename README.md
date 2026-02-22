@@ -22,6 +22,13 @@ It assumes your edge is reachable from the internet on the intended entry points
 - HA routing and SSH Bastion in the same platform
 - SQLite persistence with encrypted secrets
 
+## First-Boot Experience
+
+- Fresh installs can run in guided setup mode (no static bootstrap login required)
+- Setup is unlocked with a one-time setup code (OTS)
+- Setup supports fresh provisioning and restore-based initialization
+- Control-plane API stays setup-gated until initialization is complete
+
 ## Operating Profiles
 
 Two official operations profiles help teams ramp from simple to hardened setups:
@@ -46,6 +53,9 @@ Details and rollout guidance are documented in the wiki.
 - API tokens with scopes and domain boundaries
 - MetricCenter + LogCenter for operations and investigations
 - Retention policy controls with automatic daily data purge
+- Dedicated Backup menu with encrypted packages (`.dnxbak`) and restore tooling
+- Scheduled encrypted backups with optional FTP upload target
+- Post-restore verification with certificate warmup attempts
 - Style profiles (`Monolith`, `CyberMonolith`, `Custom`) across UI, login, and edge pages
 
 ## Documentation
@@ -55,6 +65,8 @@ Technical setup and operations are maintained in the wiki:
 - **Wiki Home:** https://github.com/AsaTyr2018/DomNexDomain/wiki
 - **Quick Start:** https://github.com/AsaTyr2018/DomNexDomain/wiki/00-Quick-Start
 - **Installation (Bare Metal):** https://github.com/AsaTyr2018/DomNexDomain/wiki/01-Installation-Bare-Metal
+- **Initial Setup Assistant and OTS:** https://github.com/AsaTyr2018/DomNexDomain/wiki/23-Initial-Setup-Assistant-and-OTS
+- **Backup and Restore:** https://github.com/AsaTyr2018/DomNexDomain/wiki/10-Backup-and-Restore
 - **API Usage Guide:** https://github.com/AsaTyr2018/DomNexDomain/wiki/13-API-Usage-Guide
 
 ## Compliance Notice
