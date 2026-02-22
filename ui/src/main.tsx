@@ -18,6 +18,17 @@ type LogServerSettings = { syslog: LogServerSyslogSettings; http: LogServerHTTPS
 type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean };
 type TimeSyncProbe = { name: string; target: string; ok: boolean; offsetMs: number; rttMs: number; error?: string; detail?: string };
 type TimeSyncStatus = { mode: 'system_only' | 'external_public' | 'external_lan'; healthy: boolean; severity: 'ok' | 'warn' | 'critical'; summary: string; source?: string; offsetMs?: number; checkedAt: string; probes: TimeSyncProbe[] };
+type SystemHealth = {
+  cpuPercent: number;
+  ramPercent: number;
+  ramTotalBytes: number;
+  ramUsedBytes: number;
+  networkLoadPct: number;
+  networkBaselineBps: number;
+  networkBytesPerSec: number;
+  load1: number;
+  cpuCores: number;
+};
 type ManagedUser = {
   id: number;
   username: string;
@@ -344,6 +355,7 @@ function App() {
   const [settingsLogServers, setSettingsLogServers] = useState<LogServerSettings>(defaultLogServers());
   const [settingsLogHTTPBearer, setSettingsLogHTTPBearer] = useState('');
   const [timeSyncStatus, setTimeSyncStatus] = useState<TimeSyncStatus | null>(null);
+  const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
   const [publicStyleProfile, setPublicStyleProfile] = useState<StyleProfile>('monolith');
   const [publicStyleCustom, setPublicStyleCustom] = useState('');
@@ -483,6 +495,12 @@ function App() {
         setTimeSyncStatus(null);
       }
       try {
+        const sh = await api<SystemHealth>('/api/v1/system/health');
+        setSystemHealth(sh);
+      } catch {
+        setSystemHealth(null);
+      }
+      try {
         const t = await api<TrafficOverview>('/api/v1/traffic/overview?hours=24');
         setTrafficOverview(t);
       } catch {
@@ -512,6 +530,7 @@ function App() {
         setHosts([]);
         setAudit([]);
         setTrafficOverview(null);
+        setSystemHealth(null);
         setSelectedHostTraffic(null);
         setSshRoutes([]);
         setSshKeys([]);
@@ -539,6 +558,15 @@ function App() {
       setTimeSyncStatus(out);
     } catch {
       setTimeSyncStatus(null);
+    }
+  };
+
+  const loadSystemHealth = async () => {
+    try {
+      const out = await api<SystemHealth>('/api/v1/system/health');
+      setSystemHealth(out);
+    } catch {
+      setSystemHealth(null);
     }
   };
 
@@ -648,6 +676,14 @@ function App() {
   }, [tab, identity?.role]);
 
   useEffect(() => {
+    if (!identity) return;
+    if (tab !== 'dashboard') return;
+    void loadSystemHealth();
+    const t = window.setInterval(() => { void loadSystemHealth(); }, 15000);
+    return () => window.clearInterval(t);
+  }, [tab, identity?.role]);
+
+  useEffect(() => {
     setTiPage(1);
   }, [tiHours, tiDecision, tiQuery, tiView, tiPageSize]);
 
@@ -694,6 +730,7 @@ function App() {
       setSettingsTimeSyncMode('system_only');
       setSettingsTimeSyncLAN('');
       setTimeSyncStatus(null);
+      setSystemHealth(null);
       void loadPublicStyle();
     } catch (e) {
       setError((e as Error).message);
@@ -1148,6 +1185,10 @@ function App() {
   const trafficVisitors24h = trafficOverview?.uniqueVisitors || 0;
   const trafficOut24h = trafficOverview?.totalBytesOut || 0;
   const trafficBlocked24h = trafficOverview?.totalBlocked || 0;
+  const sysCpuPct = Math.max(0, Math.min(100, Math.round(systemHealth?.cpuPercent || 0)));
+  const sysRamPct = Math.max(0, Math.min(100, Math.round(systemHealth?.ramPercent || 0)));
+  const sysNetPct = Math.max(0, Math.min(100, Math.round(systemHealth?.networkLoadPct || 0)));
+  const sysNetPerSec = systemHealth?.networkBytesPerSec || 0;
   const hostTrafficReq = selectedHostTraffic?.requests || 0;
   const hostTraffic2xxRate = hostTrafficReq > 0 ? Math.round(((selectedHostTraffic?.status2xx || 0) / hostTrafficReq) * 100) : 0;
   const hostTrafficErrRate = hostTrafficReq > 0 ? Math.round((((selectedHostTraffic?.status4xx || 0) + (selectedHostTraffic?.status5xx || 0)) / hostTrafficReq) * 100) : 0;
@@ -2098,29 +2139,39 @@ function App() {
                   <div className="card">
                     <div className="card-head"><h3>Health Gauges</h3></div>
                     <div className="gauge-grid">
-                      <Gauge title="DNS Health" value={dnsHealthPct} subtitle={`${dnsHealthy}/${safeBase} hosts`} />
-                      <Gauge title="HTTP Reachability" value={httpHealthPct} subtitle={`${httpHealthy}/${safeBase} hosts`} />
-                      <Gauge title="HTTPS Reachability" value={httpsHealthPct} subtitle={`${httpsHealthy}/${safeBase} hosts`} />
-                      <Gauge title="TLS Health" value={tlsHealthPct} subtitle={`${tlsHealthy}/${safeBase} hosts`} />
-                      <Gauge title="Cert Window" value={certWindowPct} subtitle={certKnown.length > 0 ? `${certExpiringSoon} expiring <=14d` : 'no cert data'} />
+                      <Gauge title="DNS Health" value={dnsHealthPct} subtitle={`${dnsHealthy}/${safeBase} hosts`} strictFull />
+                      <Gauge title="HTTP Reachability" value={httpHealthPct} subtitle={`${httpHealthy}/${safeBase} hosts`} strictFull />
+                      <Gauge title="HTTPS Reachability" value={httpsHealthPct} subtitle={`${httpsHealthy}/${safeBase} hosts`} strictFull />
+                      <Gauge title="TLS Health" value={tlsHealthPct} subtitle={`${tlsHealthy}/${safeBase} hosts`} strictFull />
+                      <Gauge title="Cert Window" value={certWindowPct} subtitle={certKnown.length > 0 ? `${certExpiringSoon} expiring <=14d` : 'no cert data'} strictFull />
                     </div>
                   </div>
                   <div className="card">
-                    <div className="card-head"><h3>Performance Snapshot</h3></div>
-                    <div className="metric-grid">
-                      <MetricTile label="Avg HTTPS Status" value={avgHTTPSStatus > 0 ? String(avgHTTPSStatus) : '-'} hint="Target: < 400" />
-                      <MetricTile label="Avg Cert Days Left" value={avgCertDays > 0 ? `${avgCertDays}d` : '-'} hint="Target: > 30d" />
-                      <MetricTile label="TLS Failure Count" value={String(Math.max(0, monitoredHosts - tlsHealthy))} hint="Should trend to 0" />
-                      <MetricTile label="DNS Failure Count" value={String(Math.max(0, monitoredHosts - dnsHealthy))} hint="Should trend to 0" />
+                    <div className="card-head"><h3>System Health</h3></div>
+                    <div className="gauge-grid">
+                      <Gauge title="CPU Load" value={sysCpuPct} subtitle={systemHealth ? `${systemHealth.load1.toFixed(2)} / ${systemHealth.cpuCores.toFixed(0)} load/cores` : 'No sample'} />
+                      <Gauge title="RAM Usage" value={sysRamPct} subtitle={systemHealth ? `${formatBytes(systemHealth.ramUsedBytes || 0)} / ${formatBytes(systemHealth.ramTotalBytes || 0)}` : 'No sample'} />
+                      <Gauge title="Network Load" value={sysNetPct} subtitle={systemHealth ? `${formatBytes(sysNetPerSec)}/s / ${formatBytes(systemHealth.networkBaselineBps || 0)}/s` : 'No sample'} />
                     </div>
                   </div>
-                  <div className="card">
-                    <div className="card-head"><h3>Traffic Snapshot (24h)</h3></div>
-                    <div className="metric-grid">
-                      <MetricTile label="Requests" value={String(trafficReq24h)} hint="Total across all subdomains" />
-                      <MetricTile label="Unique Visitors" value={String(trafficVisitors24h)} hint="Distinct client IP hashes" />
-                      <MetricTile label="Traffic Out" value={formatBytes(trafficOut24h)} hint="Response bytes" />
-                      <MetricTile label="Geo Blocks" value={String(trafficBlocked24h)} hint="Blocked by GeoIP policy" />
+                  <div className="snapshot-row">
+                    <div className="card">
+                      <div className="card-head"><h3>Performance Snapshot</h3></div>
+                      <div className="metric-grid">
+                        <MetricTile label="Avg HTTPS Status" value={avgHTTPSStatus > 0 ? String(avgHTTPSStatus) : '-'} hint="Target: < 400" />
+                        <MetricTile label="Avg Cert Days Left" value={avgCertDays > 0 ? `${avgCertDays}d` : '-'} hint="Target: > 30d" />
+                        <MetricTile label="TLS Failure Count" value={String(Math.max(0, monitoredHosts - tlsHealthy))} hint="Should trend to 0" />
+                        <MetricTile label="DNS Failure Count" value={String(Math.max(0, monitoredHosts - dnsHealthy))} hint="Should trend to 0" />
+                      </div>
+                    </div>
+                    <div className="card">
+                      <div className="card-head"><h3>Traffic Snapshot (24h)</h3></div>
+                      <div className="metric-grid">
+                        <MetricTile label="Requests" value={String(trafficReq24h)} hint="Total across all subdomains" />
+                        <MetricTile label="Unique Visitors" value={String(trafficVisitors24h)} hint="Distinct client IP hashes" />
+                        <MetricTile label="Traffic Out" value={formatBytes(trafficOut24h)} hint="Response bytes" />
+                        <MetricTile label="Geo Blocks" value={String(trafficBlocked24h)} hint="Blocked by GeoIP policy" />
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -4112,6 +4163,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
         .dashboard-layout { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
         .dashboard-main { display:grid; gap:1rem; }
         .dashboard-side { display:grid; gap:1rem; min-width:0; }
+        .snapshot-row { display:grid; gap:1rem; grid-template-columns:repeat(2,minmax(0,1fr)); }
         .entity-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
         .entity-main { display:grid; gap:1rem; }
         .entity-side { display:grid; gap:1rem; }
@@ -4267,8 +4319,8 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/tokens/2"`}</pre>
           mask-composite: intersect;
         }
         .col { display:grid; gap:.6rem; }
-        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} .user-ops-filters{grid-template-columns:1fr 1fr;} .user-ops-filters .row{justify-content:flex-start;} }
-        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} }
+        @media (max-width:1150px){ .kpi-row{grid-template-columns:repeat(2,minmax(0,1fr));} .dashboard-layout{grid-template-columns:1fr;} .entity-page{grid-template-columns:1fr;} .logs-page{grid-template-columns:1fr;} .cc-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));} .cc-split{grid-template-columns:1fr;} .log-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr));} .user-ops-filters{grid-template-columns:1fr 1fr;} .user-ops-filters .row{justify-content:flex-start;} .snapshot-row{grid-template-columns:1fr;} }
+        @media (max-width:900px){ .app-shell{grid-template-columns:1fr;} .sidebar{border-right:none;border-bottom:1px solid var(--border);} .main{padding:1rem;} .card.wide{grid-column:auto;} .kpi-row{grid-template-columns:1fr;} .metric-grid{grid-template-columns:1fr;} .ti-filter-grid{grid-template-columns:1fr;} .threatintel-page .log-table{min-width:760px;} .user-ops-filters{grid-template-columns:1fr;} .user-table-compact{min-width:760px;} .snapshot-row{grid-template-columns:1fr;} }
       `}</style>
     </>
   );
@@ -4477,10 +4529,10 @@ function mergeCountryCodes(baseRaw: string, add: string[]): string {
   return parseCountryCodes(merged.join(',')).join(', ');
 }
 
-function Gauge({ title, value, subtitle }: { title: string; value: number; subtitle: string }) {
+function Gauge({ title, value, subtitle, strictFull = false }: { title: string; value: number; subtitle: string; strictFull?: boolean }) {
   const clamped = Math.max(0, Math.min(100, value));
   const deg = Math.round((clamped / 100) * 360);
-  const color = clamped >= 85 ? '#10b981' : clamped >= 60 ? '#f59e0b' : '#ef4444';
+  const color = strictFull ? (clamped === 100 ? '#10b981' : '#ef4444') : (clamped <= 70 ? '#10b981' : clamped <= 90 ? '#f59e0b' : '#ef4444');
   return (
     <div className="gauge-card">
       <div className="gauge-ring" style={{ background: `conic-gradient(${color} ${deg}deg, #2a2a31 ${deg}deg)` }}>

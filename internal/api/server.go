@@ -78,6 +78,7 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/threat-intel/allowlist", s.handleThreatIntelAllowlistList)
 		pr.Get("/api/v1/settings", s.handleGetSettings)
 		pr.Get("/api/v1/time-sync", s.handleGetTimeSyncStatus)
+		pr.Get("/api/v1/system/health", s.handleGetSystemHealth)
 		pr.Get("/api/v1/users", s.handleListUsers)
 		pr.Get("/api/v1/tokens", s.handleListTokens)
 		pr.Get("/api/v1/ssh/routes", s.handleListSSHBastionRoutes)
@@ -1351,15 +1352,15 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		ACMEEmail          string `json:"acmeEmail"`
-		ACMEStaging        bool   `json:"acmeStaging"`
-		CFToken            string `json:"cfToken"`
-		PublicIPv4         string `json:"publicIpv4"`
-		BaseDomain         string `json:"baseDomain"`
-		StyleProfile       string `json:"styleProfile"`
-		StyleCustom        string `json:"styleCustom"`
-		TimeSyncMode       string `json:"timeSyncMode"`
-		TimeSyncLANServers string `json:"timeSyncLANServers"`
+		ACMEEmail          string                `json:"acmeEmail"`
+		ACMEStaging        bool                  `json:"acmeStaging"`
+		CFToken            string                `json:"cfToken"`
+		PublicIPv4         string                `json:"publicIpv4"`
+		BaseDomain         string                `json:"baseDomain"`
+		StyleProfile       string                `json:"styleProfile"`
+		StyleCustom        string                `json:"styleCustom"`
+		TimeSyncMode       string                `json:"timeSyncMode"`
+		TimeSyncLANServers string                `json:"timeSyncLANServers"`
 		LogServers         app.LogServerSettings `json:"logServers"`
 		LogHTTPBearer      string                `json:"logHttpBearer"`
 	}
@@ -1385,6 +1386,19 @@ func (s *Server) handleGetTimeSyncStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	out, err := s.app.GetTimeSyncStatus(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleGetSystemHealth(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "system:read") {
+		return
+	}
+	out, err := s.app.GetSystemHealth(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

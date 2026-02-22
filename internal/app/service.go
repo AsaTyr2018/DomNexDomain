@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,6 +55,9 @@ type Service struct {
 	tiSnap   model.ThreatIntelSnapshot
 	tiWinMu  sync.Mutex
 	tiWin    map[string]tiWindow
+	sysMu    sync.Mutex
+	netLast  uint64
+	netLastT time.Time
 }
 
 type tiWindow struct {
@@ -80,17 +84,17 @@ const (
 )
 
 type RuntimeSettings struct {
-	Domain             string   `json:"domain"`
-	BaseDomain         string   `json:"baseDomain"`
-	AdminFQDN          string   `json:"adminFqdn"`
-	ACMEEmail          string   `json:"acmeEmail"`
-	ACMEStaging        bool     `json:"acmeStaging"`
-	HasCFToken         bool     `json:"hasCloudflareToken"`
-	PublicIPv4         string   `json:"publicIpv4"`
-	StyleProfile       string   `json:"styleProfile"`
-	StyleCustom        string   `json:"styleCustom"`
-	TimeSyncMode       string   `json:"timeSyncMode"`
-	TimeSyncLANServers []string `json:"timeSyncLANServers"`
+	Domain             string            `json:"domain"`
+	BaseDomain         string            `json:"baseDomain"`
+	AdminFQDN          string            `json:"adminFqdn"`
+	ACMEEmail          string            `json:"acmeEmail"`
+	ACMEStaging        bool              `json:"acmeStaging"`
+	HasCFToken         bool              `json:"hasCloudflareToken"`
+	PublicIPv4         string            `json:"publicIpv4"`
+	StyleProfile       string            `json:"styleProfile"`
+	StyleCustom        string            `json:"styleCustom"`
+	TimeSyncMode       string            `json:"timeSyncMode"`
+	TimeSyncLANServers []string          `json:"timeSyncLANServers"`
 	LogServers         LogServerSettings `json:"logServers"`
 	HasLogHTTPBearer   bool              `json:"hasLogHTTPBearer"`
 }
@@ -116,6 +120,18 @@ type TimeSyncStatus struct {
 	Probes   []TimeSyncProbe `json:"probes"`
 }
 
+type SystemHealthStatus struct {
+	CPUPercent         float64 `json:"cpuPercent"`
+	RAMPercent         float64 `json:"ramPercent"`
+	RAMTotalBytes      uint64  `json:"ramTotalBytes"`
+	RAMUsedBytes       uint64  `json:"ramUsedBytes"`
+	NetworkLoadPct     float64 `json:"networkLoadPct"`
+	NetworkBaselineBps uint64  `json:"networkBaselineBps"`
+	NetworkBytesPerSec uint64  `json:"networkBytesPerSec"`
+	Load1              float64 `json:"load1"`
+	CPUCores           int     `json:"cpuCores"`
+}
+
 type ManagedUser struct {
 	ID              int64      `json:"id"`
 	Username        string     `json:"username"`
@@ -125,6 +141,63 @@ type ManagedUser struct {
 	IPCheckDisabled bool       `json:"ipCheckDisabled"`
 	CreatedAt       time.Time  `json:"createdAt"`
 	UpdatedAt       time.Time  `json:"updatedAt"`
+}
+
+func (s *Service) GetSystemHealth(ctx context.Context) (SystemHealthStatus, error) {
+	_ = ctx
+	load1, err := readLoad1Linux()
+	if err != nil {
+		return SystemHealthStatus{}, err
+	}
+	memPct, memUsedBytes, memTotalBytes, err := readRAMUsagePercentLinux()
+	if err != nil {
+		return SystemHealthStatus{}, err
+	}
+	now := time.Now().UTC()
+	totalBytes, err := readNetworkBytesLinux()
+	if err != nil {
+		return SystemHealthStatus{}, err
+	}
+	cores := runtime.NumCPU()
+	cpuPct := 0.0
+	if cores > 0 {
+		cpuPct = (load1 / float64(cores)) * 100.0
+	}
+	if cpuPct < 0 {
+		cpuPct = 0
+	}
+	s.sysMu.Lock()
+	netBps := uint64(0)
+	if !s.netLastT.IsZero() && now.After(s.netLastT) {
+		sec := now.Sub(s.netLastT).Seconds()
+		if sec > 0 {
+			delta := totalBytes
+			if totalBytes >= s.netLast {
+				delta = totalBytes - s.netLast
+			}
+			netBps = uint64(float64(delta) / sec)
+		}
+	}
+	s.netLast = totalBytes
+	s.netLastT = now
+	s.sysMu.Unlock()
+	// 100 Mbps baseline for the gauge; values above are clamped to 100%.
+	const gaugeBaselineBps = (100 * 1000 * 1000) / 8
+	netPct := (float64(netBps) / float64(gaugeBaselineBps)) * 100.0
+	if netPct < 0 {
+		netPct = 0
+	}
+	return SystemHealthStatus{
+		CPUPercent:         cpuPct,
+		RAMPercent:         memPct,
+		RAMTotalBytes:      memTotalBytes,
+		RAMUsedBytes:       memUsedBytes,
+		NetworkLoadPct:     netPct,
+		NetworkBaselineBps: gaugeBaselineBps,
+		NetworkBytesPerSec: netBps,
+		Load1:              load1,
+		CPUCores:           cores,
+	}, nil
 }
 
 type HostDiagnostic struct {
@@ -2093,6 +2166,91 @@ func parseIPv4(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
+func readLoad1Linux() (float64, error) {
+	b, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(b)))
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("invalid /proc/loadavg")
+	}
+	v, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+func readRAMUsagePercentLinux() (float64, uint64, uint64, error) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	var totalKB int64
+	var availKB int64
+	for _, ln := range strings.Split(string(b), "\n") {
+		ln = strings.TrimSpace(ln)
+		if strings.HasPrefix(ln, "MemTotal:") {
+			f := strings.Fields(ln)
+			if len(f) >= 2 {
+				totalKB, _ = strconv.ParseInt(f[1], 10, 64)
+			}
+		}
+		if strings.HasPrefix(ln, "MemAvailable:") {
+			f := strings.Fields(ln)
+			if len(f) >= 2 {
+				availKB, _ = strconv.ParseInt(f[1], 10, 64)
+			}
+		}
+	}
+	if totalKB <= 0 {
+		return 0, 0, 0, fmt.Errorf("invalid /proc/meminfo")
+	}
+	usedKB := totalKB - availKB
+	if usedKB < 0 {
+		usedKB = 0
+	}
+	usedBytes := uint64(usedKB) * 1024
+	totalBytes := uint64(totalKB) * 1024
+	return (float64(usedKB) / float64(totalKB)) * 100.0, usedBytes, totalBytes, nil
+}
+
+func readNetworkBytesLinux() (uint64, error) {
+	b, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return 0, err
+	}
+	var sum uint64
+	lines := strings.Split(string(b), "\n")
+	for _, ln := range lines[2:] {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		parts := strings.SplitN(ln, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		iface := strings.TrimSpace(parts[0])
+		if iface == "lo" {
+			continue
+		}
+		f := strings.Fields(parts[1])
+		// rx bytes = field 0, tx bytes = field 8
+		if len(f) < 9 {
+			continue
+		}
+		rx, rxErr := strconv.ParseUint(f[0], 10, 64)
+		tx, txErr := strconv.ParseUint(f[8], 10, 64)
+		if rxErr != nil || txErr != nil {
+			continue
+		}
+		sum += rx + tx
+	}
+	return sum, nil
+}
+
 func parseAndNormalizeCIDRs(raw string) (string, error) {
 	raw = strings.ReplaceAll(raw, "\n", ",")
 	raw = strings.ReplaceAll(raw, ";", ",")
@@ -2994,11 +3152,11 @@ func uniqueThreatSignals(in []string) []string {
 
 func calcThreatBaseXP(signals []string) (int, string) {
 	points := map[string]int{
-		"behavior.unknown_host": 1,
-		"behavior.path_scan":    4,
-		"behavior.ua_scanner":   2,
-		"behavior.invalid_host": 2,
-		"behavior.auth_failed":  3,
+		"behavior.unknown_host":       1,
+		"behavior.path_scan":          4,
+		"behavior.ua_scanner":         2,
+		"behavior.invalid_host":       2,
+		"behavior.auth_failed":        3,
 		"protocol.ssh.auth_denied":    3,
 		"protocol.ssh.forward_denied": 4,
 	}
