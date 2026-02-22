@@ -250,6 +250,17 @@ type ThreatIntelIPState struct {
 	SignalCounts   map[string]int
 }
 
+type BackupArchive struct {
+	ID        int64     `json:"id"`
+	FileName  string    `json:"fileName"`
+	Storage   string    `json:"storage"` // local | ftp
+	Location  string    `json:"location"`
+	SizeBytes int64     `json:"sizeBytes"`
+	SHA256    string    `json:"sha256"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
 type ThreatIntelEventInput struct {
 	IP          string
 	Host        string

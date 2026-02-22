@@ -21,7 +21,11 @@ type SetupStatus = { initialized: boolean; locked: boolean; unlocked: boolean; r
 type SetupBackupMeta = { fileName: string; format: string; createdAt: string; domnexVersion: string; domains: number; subdomains: number; users: number };
 type BackupMeta = SetupBackupMeta & { dbSha256?: string; keySha256?: string };
 type BackupFTPSettings = { enabled: boolean; host: string; port: number; username: string; remoteDir: string; tlsMode: 'off' | 'explicit' | 'implicit'; hasPassword?: boolean };
-type BackupScheduleSettings = { enabled: boolean; intervalHours: number; hasPassphrase?: boolean; lastRunAt?: string; lastResult?: string; ftp: BackupFTPSettings };
+type BackupLocalSettings = { enabled: boolean; dir: string };
+type BackupScheduleSettings = { enabled: boolean; intervalHours: number; retentionCount: number; hasPassphrase?: boolean; lastRunAt?: string; lastResult?: string; local: BackupLocalSettings; ftp: BackupFTPSettings };
+type BackupArchive = { id: number; fileName: string; storage: 'local' | 'ftp'; location: string; sizeBytes: number; sha256: string; status: string; createdAt: string };
+type BackupStats = { totalArchives: number; localArchives: number; ftpArchives: number };
+type BackupTab = 'general' | 'browser' | 'settings' | 'manual';
 type PostRestoreCheck = {
   checkedAt: string;
   domainsTotal: number;
@@ -135,7 +139,12 @@ const defaultRetentionPolicy = (): RetentionPolicy => ({
 const defaultBackupScheduleSettings = (): BackupScheduleSettings => ({
   enabled: false,
   intervalHours: 24,
+  retentionCount: 10,
   hasPassphrase: false,
+  local: {
+    enabled: true,
+    dir: '/var/lib/domnexdomain/backups',
+  },
   ftp: {
     enabled: false,
     host: '',
@@ -450,6 +459,9 @@ function App() {
   const [backupSettings, setBackupSettings] = useState<BackupScheduleSettings>(defaultBackupScheduleSettings());
   const [backupSchedulePassphrase, setBackupSchedulePassphrase] = useState('');
   const [backupFTPPass, setBackupFTPPass] = useState('');
+  const [backupArchives, setBackupArchives] = useState<BackupArchive[]>([]);
+  const [backupStats, setBackupStats] = useState<BackupStats>({ totalArchives: 0, localArchives: 0, ftpArchives: 0 });
+  const [backupTab, setBackupTab] = useState<BackupTab>('general');
   const [timeSyncStatus, setTimeSyncStatus] = useState<TimeSyncStatus | null>(null);
   const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
@@ -614,6 +626,14 @@ function App() {
         setBackupSettings(b || defaultBackupScheduleSettings());
       } catch {
         setBackupSettings(defaultBackupScheduleSettings());
+      }
+      try {
+        const ba = await api<{ items: BackupArchive[]; stats: BackupStats }>('/api/v1/backup/archives?limit=500');
+        setBackupArchives(ba.items || []);
+        setBackupStats(ba.stats || { totalArchives: 0, localArchives: 0, ftpArchives: 0 });
+      } catch {
+        setBackupArchives([]);
+        setBackupStats({ totalArchives: 0, localArchives: 0, ftpArchives: 0 });
       }
       try {
         const ts = await api<TimeSyncStatus>('/api/v1/time-sync');
@@ -987,7 +1007,12 @@ function App() {
         body: JSON.stringify({
           enabled: !!backupSettings.enabled,
           intervalHours: Number(backupSettings.intervalHours || 24),
+          retentionCount: Number(backupSettings.retentionCount || 10),
           passphrase: backupSchedulePassphrase,
+          local: {
+            enabled: !!backupSettings.local.enabled,
+            dir: backupSettings.local.dir || '/var/lib/domnexdomain/backups',
+          },
           ftp: {
             enabled: !!backupSettings.ftp.enabled,
             host: backupSettings.ftp.host || '',
@@ -1003,6 +1028,9 @@ function App() {
       setBackupFTPPass('');
       const b = await api<BackupScheduleSettings>('/api/v1/backup/settings');
       setBackupSettings(b || defaultBackupScheduleSettings());
+      const ba = await api<{ items: BackupArchive[]; stats: BackupStats }>('/api/v1/backup/archives?limit=500');
+      setBackupArchives(ba.items || []);
+      setBackupStats(ba.stats || { totalArchives: 0, localArchives: 0, ftpArchives: 0 });
       setSettingsMessage('Backup schedule saved.');
     } catch (e) {
       setError((e as Error).message);
@@ -1023,6 +1051,76 @@ function App() {
       });
       setPostRestoreCheck(out);
       setSettingsMessage('Post-restore check completed.');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const refreshBackupArchives = async () => {
+    const ba = await api<{ items: BackupArchive[]; stats: BackupStats }>('/api/v1/backup/archives?limit=500');
+    setBackupArchives(ba.items || []);
+    setBackupStats(ba.stats || { totalArchives: 0, localArchives: 0, ftpArchives: 0 });
+  };
+
+  const runScheduledBackupNow = async () => {
+    if (isReadOnlyRole) return;
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      await api('/api/v1/backup/schedule/run', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: '{}',
+      });
+      const [cfg, ba] = await Promise.all([
+        api<BackupScheduleSettings>('/api/v1/backup/settings'),
+        api<{ items: BackupArchive[]; stats: BackupStats }>('/api/v1/backup/archives?limit=500'),
+      ]);
+      setBackupSettings(cfg || defaultBackupScheduleSettings());
+      setBackupArchives(ba.items || []);
+      setBackupStats(ba.stats || { totalArchives: 0, localArchives: 0, ftpArchives: 0 });
+      setSettingsMessage('Scheduled backup created.');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const restoreBackupArchive = async (id: number) => {
+    if (isReadOnlyRole) return;
+    setLoading(true);
+    setError('');
+    setSettingsMessage('');
+    try {
+      const out = await api<{ ok: boolean; postCheck?: PostRestoreCheck }>('/api/v1/backup/archives/' + id + '/restore', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ confirm: 'RESTORE' }),
+      });
+      if (out.postCheck) setPostRestoreCheck(out.postCheck);
+      await refreshBackupArchives();
+      setSettingsMessage('Archive restore applied. Run Reload Service after validation.');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteBackupArchive = async (id: number) => {
+    if (isReadOnlyRole) return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/backup/archives/' + id, {
+        method: 'DELETE',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      await refreshBackupArchives();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -1118,6 +1216,9 @@ function App() {
       setPostRestoreCheck(null);
       setBackupSchedulePassphrase('');
       setBackupFTPPass('');
+      setBackupArchives([]);
+      setBackupStats({ totalArchives: 0, localArchives: 0, ftpArchives: 0 });
+      setBackupTab('general');
       setTimeSyncStatus(null);
       setSystemHealth(null);
       void loadPublicStyle();
@@ -3693,6 +3794,148 @@ function App() {
             <section className="entity-page">
               <div className="entity-main">
                 <section className="card" style={{ marginBottom: '.6rem' }}>
+                  <div className="card-head"><h3>Backup Center</h3></div>
+                  <div className="wizard-steps" style={{ marginBottom: '.3rem' }}>
+                    <button className={backupTab === 'general' ? 'wiz active' : 'wiz'} onClick={() => setBackupTab('general')}>General</button>
+                    <button className={backupTab === 'browser' ? 'wiz active' : 'wiz'} onClick={() => setBackupTab('browser')}>Archive Browser</button>
+                    <button className={backupTab === 'settings' ? 'wiz active' : 'wiz'} onClick={() => setBackupTab('settings')}>Backup Settings</button>
+                    <button className={backupTab === 'manual' ? 'wiz active' : 'wiz'} onClick={() => setBackupTab('manual')}>Manual Backup</button>
+                  </div>
+                </section>
+                {backupTab === 'general' ? (
+                  <>
+                    <section className="card" style={{ marginBottom: '.6rem' }}>
+                      <div className="card-head"><h3>Backup Stats</h3></div>
+                      <div className="metric-grid">
+                        <MetricTile label="Archives Total" value={String(backupStats.totalArchives || 0)} hint="Known backup records" />
+                        <MetricTile label="Local Archives" value={String(backupStats.localArchives || 0)} hint="On-server backups" />
+                        <MetricTile label="FTP Archives" value={String(backupStats.ftpArchives || 0)} hint="Remote FTP backups" />
+                        <MetricTile label="Retention" value={String(backupSettings.retentionCount || 10)} hint="Per target keep count" />
+                      </div>
+                      <div className="muted">Last run: {backupSettings.lastRunAt ? new Date(backupSettings.lastRunAt).toLocaleString() : '-'}</div>
+                      <div className="muted">Last result: {backupSettings.lastResult || '-'}</div>
+                    </section>
+                    <section className="card" style={{ marginBottom: '.6rem' }}>
+                      <div className="card-head"><h3>Scheduled Actions</h3></div>
+                      <div className="row">
+                        <button className="btn" onClick={runScheduledBackupNow} disabled={loading || isReadOnlyRole}>Backup now</button>
+                        <button className="btn ghost" onClick={refreshBackupArchives} disabled={loading}>Refresh Stats</button>
+                      </div>
+                      <div className="muted">Runs one immediate scheduled backup using configured schedule targets and retention.</div>
+                    </section>
+                  </>
+                ) : null}
+                {backupTab === 'browser' ? (
+                  <section className="card">
+                    <div className="card-head"><h3>Archive Browser</h3></div>
+                    <div className="muted" style={{ marginBottom: '.6rem' }}>Click restore to rehydrate from selected archive. Confirmation is required.</div>
+                    <div className="log-table-wrap" style={{ maxHeight: '68vh' }}>
+                      <table className="log-table">
+                        <thead>
+                          <tr>
+                            <th>Created</th>
+                            <th>File</th>
+                            <th>Storage</th>
+                            <th>Location</th>
+                            <th>Size</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {backupArchives.length === 0 ? (
+                            <tr><td colSpan={7} className="muted" style={{ padding: '.9rem' }}>No archived backups yet.</td></tr>
+                          ) : backupArchives.map((a) => (
+                            <tr key={a.id}>
+                              <td>{formatDateTime(a.createdAt)}</td>
+                              <td>{a.fileName}</td>
+                              <td><span className={`badge ${a.storage === 'local' ? 'ok' : 'warn'}`}>{a.storage}</span></td>
+                              <td className="muted">{a.location}</td>
+                              <td>{Math.max(1, Math.round((a.sizeBytes || 0) / 1024))} KB</td>
+                              <td>{a.status || 'ready'}</td>
+                              <td>
+                                <div className="row" style={{ marginBottom: 0 }}>
+                                  <button className="btn" disabled={loading || isReadOnlyRole} onClick={() => {
+                                    const ok = window.confirm(`Restore archive ${a.fileName}? This will overwrite current state.`);
+                                    if (!ok) return;
+                                    void restoreBackupArchive(a.id);
+                                  }}>Restore</button>
+                                  <button className="btn danger" disabled={loading || isReadOnlyRole} onClick={() => {
+                                    const ok = window.confirm(`Delete archive ${a.fileName}?`);
+                                    if (!ok) return;
+                                    void deleteBackupArchive(a.id);
+                                  }}>Delete</button>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </section>
+                ) : null}
+                {backupTab === 'manual' ? (
+                  <>
+                    <section className="card" style={{ marginBottom: '.6rem' }}>
+                      <div className="card-head"><h3>Create Encrypted Backup</h3></div>
+                      <div className="field-grid">
+                        <div className="field">
+                          <label>Backup Passphrase</label>
+                          <input type="password" value={backupPassphrase} onChange={(e) => setBackupPassphrase(e.target.value)} placeholder="Minimum 12 characters" />
+                          <div className="muted">Creates encrypted `.dnxbak` package for download.</div>
+                        </div>
+                      </div>
+                      <div className="row" style={{ marginBottom: 0 }}>
+                        <button className="btn" onClick={createEncryptedBackup} disabled={loading || isReadOnlyRole}>Create &amp; Download Backup</button>
+                      </div>
+                    </section>
+                    <section className="card danger-zone">
+                      <div className="card-head"><h3>Direct Restore Package</h3></div>
+                      <div className="field-grid">
+                        <div className="field">
+                          <label>Backup Package</label>
+                          <input type="file" accept=".dnxbak,.bin,.dat,application/octet-stream" onChange={(e) => setBackupRestoreFile(e.target.files?.[0] || null)} />
+                        </div>
+                        <div className="field">
+                          <label>Backup Passphrase</label>
+                          <input type="password" value={backupRestorePassphrase} onChange={(e) => setBackupRestorePassphrase(e.target.value)} placeholder="Passphrase used for backup encryption" />
+                        </div>
+                        <div className="field">
+                          <label>Confirm Restore</label>
+                          <input value={backupRestoreConfirm} onChange={(e) => setBackupRestoreConfirm(e.target.value)} placeholder="Type RESTORE" />
+                        </div>
+                      </div>
+                      <div className="row">
+                        <button className="btn" onClick={analyzeBackupFile} disabled={loading || !backupRestoreFile}>Analyze Package</button>
+                        <button className="btn danger" onClick={restoreEncryptedBackup} disabled={loading || isReadOnlyRole || !backupRestoreFile}>Apply Restore</button>
+                        <button className="btn" onClick={runPostRestoreCheck} disabled={loading || isReadOnlyRole}>Run Post-Restore Check</button>
+                      </div>
+                      {backupMetaPreview ? (
+                        <pre>{`File: ${backupMetaPreview.fileName}
+Format: ${backupMetaPreview.format}
+Created: ${backupMetaPreview.createdAt}
+DomNex: ${backupMetaPreview.domnexVersion}
+Domains: ${backupMetaPreview.domains}
+Subdomains: ${backupMetaPreview.subdomains}
+Users: ${backupMetaPreview.users}
+DB SHA256: ${backupMetaPreview.dbSha256 || '-'}
+Key SHA256: ${backupMetaPreview.keySha256 || '-'}`}</pre>
+                      ) : null}
+                      {postRestoreCheck ? (
+                        <pre>{`Checked: ${new Date(postRestoreCheck.checkedAt).toLocaleString()}
+Domains: ${postRestoreCheck.domainsOk}/${postRestoreCheck.domainsTotal}
+Hosts DNS OK: ${postRestoreCheck.hostsDnsOk}/${postRestoreCheck.hostsTotal}
+Hosts HTTPS OK: ${postRestoreCheck.hostsHttpsOk}/${postRestoreCheck.hostsTotal}
+Hosts TLS OK: ${postRestoreCheck.hostsTlsOk}/${postRestoreCheck.hostsTotal}
+Hosts Valid Cert: ${postRestoreCheck.hostsCertValid}/${postRestoreCheck.hostsTotal}
+Cert Warmup: ${postRestoreCheck.certWarmupSucceeded}/${postRestoreCheck.certWarmupAttempts}
+Issues: ${postRestoreCheck.issues.length}`}</pre>
+                      ) : null}
+                    </section>
+                  </>
+                ) : null}
+                {backupTab === 'settings' ? (
+                <section className="card" style={{ marginBottom: '.6rem' }}>
                   <div className="card-head"><h3>Scheduled Backup</h3></div>
                   <div className="field-grid">
                     <div className="field">
@@ -3704,12 +3947,30 @@ function App() {
                       <input type="number" min={1} max={168} value={String(backupSettings.intervalHours || 24)} onChange={(e) => setBackupSettings((p) => ({ ...p, intervalHours: Number(e.target.value) || 24 }))} disabled={isReadOnlyRole} />
                     </div>
                     <div className="field">
+                      <label>Retention Count</label>
+                      <input type="number" min={1} max={1000} value={String(backupSettings.retentionCount || 10)} onChange={(e) => setBackupSettings((p) => ({ ...p, retentionCount: Number(e.target.value) || 10 }))} disabled={isReadOnlyRole} />
+                    </div>
+                    <div className="field">
                       <label>Backup Encryption Passphrase</label>
                       <input type="password" value={backupSchedulePassphrase} onChange={(e) => setBackupSchedulePassphrase(e.target.value)} placeholder={backupSettings.hasPassphrase ? 'Stored. Enter only to rotate.' : 'Minimum 12 characters'} disabled={isReadOnlyRole} />
                     </div>
                   </div>
                   <div className="muted">Last run: {backupSettings.lastRunAt ? new Date(backupSettings.lastRunAt).toLocaleString() : '-'}</div>
                   <div className="muted" style={{ marginBottom: '.5rem' }}>Last result: {backupSettings.lastResult || '-'}</div>
+
+                  <div className="card" style={{ marginBottom: '.6rem' }}>
+                    <div className="card-head"><h3>Local Backup Target</h3></div>
+                    <div className="field-grid">
+                      <div className="field">
+                        <label>Enable Local Archive</label>
+                        <label className="check"><input type="checkbox" checked={!!backupSettings.local.enabled} onChange={(e) => setBackupSettings((p) => ({ ...p, local: { ...p.local, enabled: e.target.checked } }))} disabled={isReadOnlyRole} /> Save backups on DomNex host</label>
+                      </div>
+                      <div className="field">
+                        <label>Local Directory</label>
+                        <input value={backupSettings.local.dir || '/var/lib/domnexdomain/backups'} onChange={(e) => setBackupSettings((p) => ({ ...p, local: { ...p.local, dir: e.target.value } }))} placeholder="/var/lib/domnexdomain/backups" disabled={isReadOnlyRole} />
+                      </div>
+                    </div>
+                  </div>
 
                   <div className="card" style={{ marginBottom: '.6rem' }}>
                     <div className="card-head"><h3>FTP Target</h3></div>
@@ -3753,68 +4014,7 @@ function App() {
                     <button className="btn ghost" onClick={refresh} disabled={loading}>Refresh</button>
                   </div>
                 </section>
-                <section className="card" style={{ marginBottom: '.6rem' }}>
-                  <div className="card-head"><h3>Create Encrypted Backup</h3></div>
-                  <div className="field-grid">
-                    <div className="field">
-                      <label>Backup Passphrase</label>
-                      <input type="password" value={backupPassphrase} onChange={(e) => setBackupPassphrase(e.target.value)} placeholder="Minimum 12 characters" />
-                      <div className="muted">Package includes users, domains, subdomains, runtime settings and encrypted secrets state.</div>
-                    </div>
-                  </div>
-                  <div className="row" style={{ marginBottom: 0 }}>
-                    <button className="btn" onClick={createEncryptedBackup} disabled={loading || isReadOnlyRole}>Create &amp; Download Backup</button>
-                  </div>
-                </section>
-                <section className="card danger-zone">
-                  <div className="card-head"><h3>Restore Encrypted Backup</h3></div>
-                  <div className="field-grid">
-                    <div className="field">
-                      <label>Backup Package</label>
-                      <input type="file" accept=".dnxbak,.bin,.dat,application/octet-stream" onChange={(e) => setBackupRestoreFile(e.target.files?.[0] || null)} />
-                    </div>
-                    <div className="field">
-                      <label>Backup Passphrase</label>
-                      <input type="password" value={backupRestorePassphrase} onChange={(e) => setBackupRestorePassphrase(e.target.value)} placeholder="Passphrase used for backup encryption" />
-                    </div>
-                    <div className="field">
-                      <label>Confirm Restore</label>
-                      <input value={backupRestoreConfirm} onChange={(e) => setBackupRestoreConfirm(e.target.value)} placeholder="Type RESTORE" />
-                    </div>
-                  </div>
-                  <div className="row">
-                    <button className="btn" onClick={analyzeBackupFile} disabled={loading || !backupRestoreFile}>Analyze Package</button>
-                    <button className="btn danger" onClick={restoreEncryptedBackup} disabled={loading || isReadOnlyRole || !backupRestoreFile}>Apply Restore</button>
-                    <button className="btn" onClick={runPostRestoreCheck} disabled={loading || isReadOnlyRole}>Run Post-Restore Check</button>
-                  </div>
-                  {backupMetaPreview ? (
-                    <pre>{`File: ${backupMetaPreview.fileName}
-Format: ${backupMetaPreview.format}
-Created: ${backupMetaPreview.createdAt}
-DomNex: ${backupMetaPreview.domnexVersion}
-Domains: ${backupMetaPreview.domains}
-Subdomains: ${backupMetaPreview.subdomains}
-Users: ${backupMetaPreview.users}
-DB SHA256: ${backupMetaPreview.dbSha256 || '-'}
-Key SHA256: ${backupMetaPreview.keySha256 || '-'}`}</pre>
-                  ) : null}
-                  {postRestoreCheck ? (
-                    <pre>{`Checked: ${new Date(postRestoreCheck.checkedAt).toLocaleString()}
-Domains: ${postRestoreCheck.domainsOk}/${postRestoreCheck.domainsTotal}
-Hosts DNS OK: ${postRestoreCheck.hostsDnsOk}/${postRestoreCheck.hostsTotal}
-Hosts HTTPS OK: ${postRestoreCheck.hostsHttpsOk}/${postRestoreCheck.hostsTotal}
-Hosts TLS OK: ${postRestoreCheck.hostsTlsOk}/${postRestoreCheck.hostsTotal}
-Hosts Valid Cert: ${postRestoreCheck.hostsCertValid}/${postRestoreCheck.hostsTotal}
-Cert Warmup: ${postRestoreCheck.certWarmupSucceeded}/${postRestoreCheck.certWarmupAttempts}
-Issues: ${postRestoreCheck.issues.length}`}</pre>
-                  ) : null}
-                  {postRestoreCheck && postRestoreCheck.issues.length > 0 ? (
-                    <div className="muted" style={{ marginTop: '.4rem' }}>
-                      {postRestoreCheck.issues.slice(0, 6).join(' | ')}
-                    </div>
-                  ) : null}
-                  <div className="muted">LE cert cache is intentionally excluded from backup packages. Certificates are re-obtained when needed.</div>
-                </section>
+                ) : null}
               </div>
             </section>
           ) : null}

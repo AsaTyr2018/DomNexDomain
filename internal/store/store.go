@@ -330,6 +330,17 @@ CREATE TABLE IF NOT EXISTS threat_intel_ip_state (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS backup_archives (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_name TEXT NOT NULL,
+  storage TEXT NOT NULL,
+  location TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  sha256 TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'ready',
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_bucket ON host_traffic_minute(bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_minute_host_bucket ON host_traffic_minute(host_id, bucket_start);
 CREATE INDEX IF NOT EXISTS idx_host_traffic_class_minute_bucket ON host_traffic_class_minute(bucket_start);
@@ -340,6 +351,7 @@ CREATE INDEX IF NOT EXISTS idx_threat_intel_entries_ip ON threat_intel_entries(i
 CREATE INDEX IF NOT EXISTS idx_threat_intel_matches_ip ON threat_intel_matches(ip);
 CREATE INDEX IF NOT EXISTS idx_threat_intel_matches_last_seen ON threat_intel_matches(last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_threat_intel_state_level ON threat_intel_ip_state(level);
+CREATE INDEX IF NOT EXISTS idx_backup_archives_storage_created ON backup_archives(storage, created_at);
 `
 	_, err := s.db.ExecContext(ctx, schema)
 	if err != nil {
@@ -2924,6 +2936,94 @@ ORDER BY r.id`, out.Key.ID)
 		out.Routes = append(out.Routes, rt)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) InsertBackupArchive(ctx context.Context, in model.BackupArchive) (model.BackupArchive, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `
+INSERT INTO backup_archives(file_name, storage, location, size_bytes, sha256, status, created_at)
+VALUES(?,?,?,?,?,?,?)`,
+		strings.TrimSpace(in.FileName),
+		strings.TrimSpace(in.Storage),
+		strings.TrimSpace(in.Location),
+		in.SizeBytes,
+		strings.TrimSpace(in.SHA256),
+		strings.TrimSpace(in.Status),
+		now,
+	)
+	if err != nil {
+		return model.BackupArchive{}, err
+	}
+	id, _ := res.LastInsertId()
+	return s.GetBackupArchiveByID(ctx, id)
+}
+
+func (s *Store) GetBackupArchiveByID(ctx context.Context, id int64) (model.BackupArchive, error) {
+	var out model.BackupArchive
+	var created string
+	err := s.db.QueryRowContext(ctx, `
+SELECT id, file_name, storage, location, size_bytes, sha256, status, created_at
+FROM backup_archives WHERE id=?`, id).
+		Scan(&out.ID, &out.FileName, &out.Storage, &out.Location, &out.SizeBytes, &out.SHA256, &out.Status, &created)
+	if err != nil {
+		return out, err
+	}
+	out.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	return out, nil
+}
+
+func (s *Store) ListBackupArchives(ctx context.Context, limit int) ([]model.BackupArchive, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, file_name, storage, location, size_bytes, sha256, status, created_at
+FROM backup_archives
+ORDER BY created_at DESC, id DESC
+LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.BackupArchive{}
+	for rows.Next() {
+		var it model.BackupArchive
+		var created string
+		if err := rows.Scan(&it.ID, &it.FileName, &it.Storage, &it.Location, &it.SizeBytes, &it.SHA256, &it.Status, &created); err != nil {
+			return nil, err
+		}
+		it.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListBackupArchivesByStorageOldestFirst(ctx context.Context, storage string) ([]model.BackupArchive, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, file_name, storage, location, size_bytes, sha256, status, created_at
+FROM backup_archives
+WHERE storage=?
+ORDER BY created_at ASC, id ASC`, strings.TrimSpace(storage))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.BackupArchive{}
+	for rows.Next() {
+		var it model.BackupArchive
+		var created string
+		if err := rows.Scan(&it.ID, &it.FileName, &it.Storage, &it.Location, &it.SizeBytes, &it.SHA256, &it.Status, &created); err != nil {
+			return nil, err
+		}
+		it.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteBackupArchiveByID(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM backup_archives WHERE id=?`, id)
+	return err
 }
 
 func (s *Store) VacuumInto(ctx context.Context, outPath string) error {

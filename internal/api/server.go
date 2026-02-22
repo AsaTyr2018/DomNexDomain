@@ -87,6 +87,7 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/time-sync", s.handleGetTimeSyncStatus)
 		pr.Get("/api/v1/system/health", s.handleGetSystemHealth)
 		pr.Get("/api/v1/backup/settings", s.handleBackupSettingsGet)
+		pr.Get("/api/v1/backup/archives", s.handleBackupArchivesList)
 		pr.Get("/api/v1/users", s.handleListUsers)
 		pr.Get("/api/v1/tokens", s.handleListTokens)
 		pr.Get("/api/v1/ssh/routes", s.handleListSSHBastionRoutes)
@@ -129,10 +130,13 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/settings", s.handleSetSettings)
 		pr.Post("/api/v1/reload", s.handleReloadService)
 		pr.Post("/api/v1/backup/settings", s.handleBackupSettingsSet)
+		pr.Post("/api/v1/backup/schedule/run", s.handleBackupScheduleRunNow)
 		pr.Post("/api/v1/backup/create", s.handleBackupCreate)
 		pr.Post("/api/v1/backup/analyze", s.handleBackupAnalyze)
 		pr.Post("/api/v1/backup/restore", s.handleBackupRestore)
 		pr.Post("/api/v1/backup/post-restore-check", s.handleBackupPostRestoreCheck)
+		pr.Post("/api/v1/backup/archives/{id}/restore", s.handleBackupArchiveRestore)
+		pr.Delete("/api/v1/backup/archives/{id}", s.handleBackupArchiveDelete)
 		pr.Post("/api/v1/users", s.handleCreateUser)
 		pr.Put("/api/v1/users/{id}", s.handleUpdateUserAccess)
 		pr.Put("/api/v1/users/{id}/domains", s.handleSetUserDomains)
@@ -301,21 +305,63 @@ func (s *Server) handleBackupSettingsSet(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var in struct {
-		Enabled       bool                  `json:"enabled"`
-		IntervalHours int                   `json:"intervalHours"`
-		Passphrase    string                `json:"passphrase"`
-		FTP           app.BackupFTPSettings `json:"ftp"`
-		FTPPassword   string                `json:"ftpPassword"`
+		Enabled        bool                    `json:"enabled"`
+		IntervalHours  int                     `json:"intervalHours"`
+		RetentionCount int                     `json:"retentionCount"`
+		Passphrase     string                  `json:"passphrase"`
+		Local          app.BackupLocalSettings `json:"local"`
+		FTP            app.BackupFTPSettings   `json:"ftp"`
+		FTPPassword    string                  `json:"ftpPassword"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if err := s.app.SetBackupScheduleSettings(r.Context(), app.BackupScheduleSettings{
-		Enabled:       in.Enabled,
-		IntervalHours: in.IntervalHours,
-		FTP:           in.FTP,
+		Enabled:        in.Enabled,
+		IntervalHours:  in.IntervalHours,
+		RetentionCount: in.RetentionCount,
+		Local:          in.Local,
+		FTP:            in.FTP,
 	}, in.Passphrase, in.FTPPassword); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleBackupArchivesList(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) && id.Role != model.RoleReadOnly {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	limit := 500
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	items, err := s.app.ListBackupArchives(r.Context(), limit)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	stats, err := s.app.GetBackupGeneralStats(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "stats": stats})
+}
+
+func (s *Server) handleBackupScheduleRunNow(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	if err := s.app.RunScheduledBackupNow(r.Context()); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -412,6 +458,42 @@ func (s *Server) handleBackupPostRestoreCheck(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleBackupArchiveRestore(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	archiveID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	var in struct {
+		Confirm string `json:"confirm"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	meta, post, err := s.app.RestoreBackupArchive(r.Context(), archiveID, in.Confirm)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "meta": meta, "postCheck": post})
+}
+
+func (s *Server) handleBackupArchiveDelete(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	archiveID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err := s.app.DeleteBackupArchive(r.Context(), archiveID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func readBackupUpload(r *http.Request) (string, []byte, string, error) {
