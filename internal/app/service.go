@@ -75,6 +75,8 @@ const (
 	defaultTISoftMinLevel     = 3
 	defaultTIHardLevel        = 6
 	defaultTISoftBlockMinutes = 15
+	defaultTIHardToWatchDays  = 60
+	defaultTIWatchLevel       = 3
 )
 
 type RuntimeSettings struct {
@@ -2664,11 +2666,6 @@ func (s *Service) SetThreatIntelConfig(ctx context.Context, cfg model.ThreatInte
 	if err := s.store.SetThreatIntelConfig(ctx, cfg); err != nil {
 		return err
 	}
-	if cfg.Enabled && cfg.Mode == "auto_mode" {
-		if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, cfg.HardLevel); err != nil {
-			s.log.Warn("threat intel hard-block reconcile failed", map[string]any{"err": err.Error()})
-		}
-	}
 	_, err := s.RefreshThreatIntelSnapshot(ctx)
 	return err
 }
@@ -2790,11 +2787,6 @@ func (s *Service) RefreshThreatIntelSnapshot(ctx context.Context) (model.ThreatI
 	if err != nil {
 		return model.ThreatIntelSnapshot{}, err
 	}
-	if cfg.Enabled && normalizeThreatIntelMode(cfg.Mode) == "auto_mode" {
-		if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, cfg.HardLevel); err != nil {
-			s.log.Warn("threat intel hard-block reconcile failed", map[string]any{"err": err.Error()})
-		}
-	}
 	feedByIP, err := s.store.ListThreatIntelEntriesByIP(ctx)
 	if err != nil {
 		return model.ThreatIntelSnapshot{}, err
@@ -2880,6 +2872,17 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 	}
 
 	decayThreatState(&st, now)
+	externalHit := hasExternalFeedSignal(in.Signals)
+	behaviorHit := hasBehaviorThreatSignal(in.Signals)
+	watchBoost := externalHit && !behaviorHit
+	if watchBoost && st.Level < defaultTIWatchLevel {
+		st.Level = defaultTIWatchLevel
+		minXP := threatLevelThreshold(defaultTIWatchLevel)
+		if st.XP < minXP {
+			st.XP = minXP
+		}
+		st.RiskState = "watch"
+	}
 	baseXP, topSignal := calcThreatBaseXP(in.Signals)
 	xpDelta := applyThreatMultipliers(baseXP, s.bumpThreatWindow(in.IP, topSignal, in.Signals, now), in.Signals)
 	if xpDelta < 0 {
@@ -2906,6 +2909,9 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 		}
 	}
 	st.RiskState = threatRiskState(st.Level, softMinLevel, hardLevel)
+	if watchBoost && !st.PermBlocked && (st.BanUntil.IsZero() || !st.BanUntil.After(now)) {
+		st.RiskState = "watch"
+	}
 	st.LastSeenAt = now
 	if st.PermBlocked {
 		res.Blocked = true
@@ -2919,7 +2925,9 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 	if !res.Blocked {
 		switch in.Mode {
 		case "auto_mode":
-			if st.Level >= hardLevel {
+			if watchBoost {
+				res.Decision = "watch_boost"
+			} else if st.Level >= hardLevel {
 				st.PermBlocked = true
 				st.BanUntil = time.Time{}
 				res.Blocked = true
@@ -3022,6 +3030,24 @@ func calcThreatBaseXP(signals []string) (int, string) {
 		top = "behavior.unknown_host"
 	}
 	return total, top
+}
+
+func hasExternalFeedSignal(signals []string) bool {
+	for _, sig := range uniqueThreatSignals(signals) {
+		if !strings.HasPrefix(sig, "behavior.") && !strings.HasPrefix(sig, "protocol.") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasBehaviorThreatSignal(signals []string) bool {
+	for _, sig := range uniqueThreatSignals(signals) {
+		if strings.HasPrefix(sig, "behavior.") || strings.HasPrefix(sig, "protocol.") {
+			return true
+		}
+	}
+	return false
 }
 
 func applyThreatMultipliers(base int, burstFactor float64, signals []string) int {
@@ -3304,6 +3330,17 @@ func (s *Service) StartThreatIntelSync(ctx context.Context) {
 }
 
 func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
+	cfg, cfgErr := s.store.GetThreatIntelConfig(ctx)
+	softMinLevel := defaultTISoftMinLevel
+	hardLevel := defaultTIHardLevel
+	if cfgErr == nil {
+		if cfg.SoftMinLevel > 0 {
+			softMinLevel = cfg.SoftMinLevel
+		}
+		if cfg.HardLevel > 0 {
+			hardLevel = cfg.HardLevel
+		}
+	}
 	states, err := s.store.ListThreatIntelIPStates(ctx, 20000)
 	if err != nil {
 		return 0, err
@@ -3322,12 +3359,29 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 		if st.IP == "" {
 			continue
 		}
+		idle := now.Sub(st.LastSeenAt)
+		// Lifecycle downgrade: long-lived hard blocks become watch entries, not infinite database growth.
+		if st.PermBlocked && idle >= time.Duration(defaultTIHardToWatchDays)*24*time.Hour {
+			st.PermBlocked = false
+			st.BanUntil = time.Time{}
+			st.RiskState = "watch"
+			st.Level = defaultTIWatchLevel
+			st.XP = threatLevelThreshold(defaultTIWatchLevel)
+			st.LastSeenAt = now
+			idle = 0
+			_ = s.store.RemoveBlockedIP(ctx, st.IP)
+		}
 		decayThreatState(&st, now)
 		if !st.BanUntil.IsZero() && !st.BanUntil.After(now) {
 			st.BanUntil = time.Time{}
 		}
+		if st.RiskState != "watch" {
+			st.RiskState = threatRiskState(st.Level, softMinLevel, hardLevel)
+		} else if st.Level <= 0 && st.XP <= 0 {
+			st.RiskState = "monitoring"
+		}
 		// If an IP has fully cooled down for a sustained period, drop it from active state/history.
-		idle := now.Sub(st.LastSeenAt)
+		idle = now.Sub(st.LastSeenAt)
 		if st.XP <= 0 && st.Level <= 0 && idle >= 72*time.Hour && !st.PermBlocked && st.BanUntil.IsZero() {
 			st.XP = 0
 			st.Level = 0

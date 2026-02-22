@@ -4293,6 +4293,7 @@ function threatDecisionBadge(decision: string): { cls: 'ok' | 'warn' | 'err'; la
   if (d === 'soft_block_active') return { cls: 'warn', label: 'Soft active' };
   if (d === 'hard_block_set') return { cls: 'err', label: 'Hard set' };
   if (d === 'hard_block_permanent') return { cls: 'err', label: 'Hard active' };
+  if (d === 'watch_boost') return { cls: 'warn', label: 'Watch boost' };
   if (d.includes('hard')) return { cls: 'err', label: 'Hard' };
   if (d.includes('soft')) return { cls: 'warn', label: 'Soft' };
   if (d.includes('block')) return { cls: 'err', label: 'Block' };
@@ -4323,6 +4324,7 @@ function humanizeThreatDecisionText(input: string): string {
   s = s.replaceAll('soft_block_active', 'Soft active');
   s = s.replaceAll('hard_block_set', 'Hard set');
   s = s.replaceAll('hard_block_permanent', 'Hard active');
+  s = s.replaceAll('watch_boost', 'Watch boost');
   return s;
 }
 
