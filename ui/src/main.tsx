@@ -1868,6 +1868,31 @@ function App() {
     if (!d) return false;
     return (d.dnsRecords || []).length > 0 && d.tlsOk && d.httpsStatus >= 200 && d.httpsStatus < 500;
   }).length;
+  const hostsGroupedByApex = useMemo(() => {
+    const normalizedDomains = [...domains]
+      .map((d) => String(d.name || '').trim().toLowerCase())
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+    const byApex: Record<string, Host[]> = {};
+    const resolveApex = (fqdnRaw: string): string => {
+      const fqdn = String(fqdnRaw || '').trim().toLowerCase();
+      for (const apex of normalizedDomains) {
+        if (fqdn === apex || fqdn.endsWith(`.${apex}`)) return apex;
+      }
+      const parts = fqdn.split('.').filter(Boolean);
+      if (parts.length >= 2) return `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+      return fqdn || 'unknown';
+    };
+    hosts.forEach((h) => {
+      const apex = resolveApex(h.fqdn);
+      if (!byApex[apex]) byApex[apex] = [];
+      byApex[apex].push(h);
+    });
+    return Object.keys(byApex).sort((a, b) => a.localeCompare(b)).map((apex) => ({
+      apex,
+      items: byApex[apex].sort((a, b) => a.fqdn.localeCompare(b.fqdn)),
+    }));
+  }, [hosts, domains]);
   const filteredUsers = useMemo(() => {
     const q = usersQuery.trim().toLowerCase();
     return users.filter((u) => {
@@ -4152,58 +4177,66 @@ function App() {
                   </section>
                   <section className="card">
                     <div className="card-head"><h3>Configured Subdomains</h3></div>
-                    {hosts.map((h) => (
-                      <div className="host" key={h.id}>
-                        <div>
-                          <strong>
-                            <a href={`https://${h.fqdn}`} target="_blank" rel="noopener noreferrer">{h.fqdn}</a>
-                          </strong> {' -> '} {h.upstreamUrl}
-                          {h.haEnabled ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>HA {h.haMode || 'failover'}</span> : null}
-                          {h.insecureTls ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>insecure TLS</span> : null}
-                          {h.authEnabled ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>auth page enabled</span> : null}
-                          <span className={`badge ${hostStateBadge(h.state).cls}`} style={{ marginLeft: '.45rem' }}>{hostStateBadge(h.state).label}</span>
-                          {requestsByHostID[h.id] ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>24h req {requestsByHostID[h.id]}</span> : null}
-                          {h.haEnabled && hostDiagnostics[h.fqdn]?.haTotal ? (
-                            <span className={`badge ${(hostDiagnostics[h.fqdn].haOnline || 0) === hostDiagnostics[h.fqdn].haTotal ? 'ok' : (hostDiagnostics[h.fqdn].haOnline || 0) > 0 ? 'warn' : 'err'}`} style={{ marginLeft: '.45rem' }}>
-                              Hosts Online {hostDiagnostics[h.fqdn].haOnline || 0}/{hostDiagnostics[h.fqdn].haTotal || 0}
-                            </span>
-                          ) : null}
-                          {h.haEnabled && (hostDiagnostics[h.fqdn]?.haOffline?.length || 0) > 0 ? (
-                            <span className="badge err" style={{ marginLeft: '.45rem' }}>
-                              Offline: {hostDiagnostics[h.fqdn].haOffline?.join(', ')}
-                            </span>
-                          ) : null}
-                          {h.state === 'error' && h.errorReason ? <div className="errtxt">{h.errorReason}</div> : null}
-                          {hostDiagnostics[h.fqdn] ? (
-                            <div className="diag">
-                              <span className={`badge ${hostDiagnostics[h.fqdn].dnsRecords?.length ? 'ok' : 'err'}`}>DNS {hostDiagnostics[h.fqdn].dnsRecords?.length ? 'ok' : 'fail'}</span>
-                              {h.state === 'maintenance' ? (
-                                <>
-                                  <span className="badge warn">HTTP MAINT</span>
-                                  <span className="badge warn">HTTPS MAINT</span>
-                                  <span className="badge warn">TLS MAINT</span>
-                                </>
-                              ) : (
-                                <>
-                                  <span className={`badge ${hostDiagnostics[h.fqdn].httpStatus >= 200 && hostDiagnostics[h.fqdn].httpStatus < 400 ? 'ok' : 'warn'}`}>HTTP {hostDiagnostics[h.fqdn].httpStatus || '-'}</span>
-                                  <span className={`badge ${hostDiagnostics[h.fqdn].httpsStatus >= 200 && hostDiagnostics[h.fqdn].httpsStatus < 500 ? 'ok' : 'warn'}`}>HTTPS {hostDiagnostics[h.fqdn].httpsStatus || '-'}</span>
-                                  <span className={`badge ${hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'err'}`}>TLS {hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'fail'}</span>
-                                </>
-                              )}
+                    {hostsGroupedByApex.map((group) => (
+                      <div key={`apex-${group.apex}`} className="subdomain-group">
+                        <div className="subdomain-group-head">
+                          <strong>{group.apex}</strong>
+                          <span className="muted">{group.items.length} subdomains</span>
+                        </div>
+                        {group.items.map((h) => (
+                          <div className="host" key={h.id}>
+                            <div>
+                              <strong>
+                                <a className="host-fqdn-link" href={`https://${h.fqdn}`} target="_blank" rel="noopener noreferrer">{h.fqdn}</a>
+                              </strong> {' -> '} {h.upstreamUrl}
+                              {h.haEnabled ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>HA {h.haMode || 'failover'}</span> : null}
+                              {h.insecureTls ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>insecure TLS</span> : null}
+                              {h.authEnabled ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>auth page enabled</span> : null}
+                              <span className={`badge ${hostStateBadge(h.state).cls}`} style={{ marginLeft: '.45rem' }}>{hostStateBadge(h.state).label}</span>
+                              {requestsByHostID[h.id] ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>24h req {requestsByHostID[h.id]}</span> : null}
+                              {h.haEnabled && hostDiagnostics[h.fqdn]?.haTotal ? (
+                                <span className={`badge ${(hostDiagnostics[h.fqdn].haOnline || 0) === hostDiagnostics[h.fqdn].haTotal ? 'ok' : (hostDiagnostics[h.fqdn].haOnline || 0) > 0 ? 'warn' : 'err'}`} style={{ marginLeft: '.45rem' }}>
+                                  Hosts Online {hostDiagnostics[h.fqdn].haOnline || 0}/{hostDiagnostics[h.fqdn].haTotal || 0}
+                                </span>
+                              ) : null}
+                              {h.haEnabled && (hostDiagnostics[h.fqdn]?.haOffline?.length || 0) > 0 ? (
+                                <span className="badge err" style={{ marginLeft: '.45rem' }}>
+                                  Offline: {hostDiagnostics[h.fqdn].haOffline?.join(', ')}
+                                </span>
+                              ) : null}
+                              {h.state === 'error' && h.errorReason ? <div className="errtxt">{h.errorReason}</div> : null}
+                              {hostDiagnostics[h.fqdn] ? (
+                                <div className="diag">
+                                  <span className={`badge ${hostDiagnostics[h.fqdn].dnsRecords?.length ? 'ok' : 'err'}`}>DNS {hostDiagnostics[h.fqdn].dnsRecords?.length ? 'ok' : 'fail'}</span>
+                                  {h.state === 'maintenance' ? (
+                                    <>
+                                      <span className="badge warn">HTTP MAINT</span>
+                                      <span className="badge warn">HTTPS MAINT</span>
+                                      <span className="badge warn">TLS MAINT</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <span className={`badge ${hostDiagnostics[h.fqdn].httpStatus >= 200 && hostDiagnostics[h.fqdn].httpStatus < 400 ? 'ok' : 'warn'}`}>HTTP {hostDiagnostics[h.fqdn].httpStatus || '-'}</span>
+                                      <span className={`badge ${hostDiagnostics[h.fqdn].httpsStatus >= 200 && hostDiagnostics[h.fqdn].httpsStatus < 500 ? 'ok' : 'warn'}`}>HTTPS {hostDiagnostics[h.fqdn].httpsStatus || '-'}</span>
+                                      <span className={`badge ${hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'err'}`}>TLS {hostDiagnostics[h.fqdn].tlsOk ? 'ok' : 'fail'}</span>
+                                    </>
+                                  )}
+                                </div>
+                              ) : null}
                             </div>
-                          ) : null}
-                        </div>
-                        <div className="row" style={{ marginBottom: 0 }}>
-                          <button className="btn" onClick={() => openHostDetail(h)}>{isReadOnlyRole ? 'View' : 'Edit'}</button>
-                          <button className="btn" onClick={() => setHostMaintenance(h.id, h.state !== 'maintenance')} disabled={isReadOnlyRole || loading}>
-                            {h.state === 'maintenance' ? 'Maintenance Off' : 'Maintenance On'}
-                          </button>
-                          <button className="btn" onClick={() => setHostDisabled(h.id, h.state !== 'disabled')} disabled={isReadOnlyRole || loading}>
-                            {h.state === 'disabled' ? 'Enable' : 'Disable'}
-                          </button>
-                          {h.state === 'error' ? <button className="btn" onClick={() => retryHost(h.id)} disabled={isReadOnlyRole}>Retry</button> : null}
-                          <button className="btn danger" onClick={() => openDeleteHostDialog(h)} disabled={isReadOnlyRole || loading}>Delete</button>
-                        </div>
+                            <div className="row" style={{ marginBottom: 0 }}>
+                              <button className="btn" onClick={() => openHostDetail(h)}>{isReadOnlyRole ? 'View' : 'Edit'}</button>
+                              <button className="btn" onClick={() => setHostMaintenance(h.id, h.state !== 'maintenance')} disabled={isReadOnlyRole || loading}>
+                                {h.state === 'maintenance' ? 'Maintenance Off' : 'Maintenance On'}
+                              </button>
+                              <button className="btn" onClick={() => setHostDisabled(h.id, h.state !== 'disabled')} disabled={isReadOnlyRole || loading}>
+                                {h.state === 'disabled' ? 'Enable' : 'Disable'}
+                              </button>
+                              {h.state === 'error' ? <button className="btn" onClick={() => retryHost(h.id)} disabled={isReadOnlyRole}>Retry</button> : null}
+                              <button className="btn danger" onClick={() => openDeleteHostDialog(h)} disabled={isReadOnlyRole || loading}>Delete</button>
+                            </div>
+                          </div>
+                        ))}
                       </div>
                     ))}
                   </section>
@@ -5695,7 +5728,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
       <style>{`
         :root { --bg:${activeTheme.bg}; --surface:${activeTheme.surface}; --panel:${activeTheme.panel}; --panel-hover:${activeTheme.panelHover}; --border:${activeTheme.border}; --text:${activeTheme.text}; --text-dim:${activeTheme.textDim}; --accent:${activeTheme.accent}; --accent-hover:${activeTheme.accentHover}; --accent-active:${activeTheme.accentActive}; --accent-soft:${activeTheme.accentSoft}; --green:${activeTheme.success}; --red:${activeTheme.danger}; --input-bg:${activeTheme.inputBg}; --hero-a:${activeTheme.heroA}; --hero-b:${activeTheme.heroB}; --radius:12px; }
         * { box-sizing: border-box; }
-        body { margin:0; font-family:'Inter', system-ui, sans-serif; background:var(--bg); color:var(--text); }
+        body { margin:0; font-family:'Inter', system-ui, sans-serif; font-size:15px; background:var(--bg); color:var(--text); }
         .app-shell { display:grid; grid-template-columns:240px 1fr; min-height:100vh; }
         .sidebar {
           background:var(--surface);
@@ -5739,7 +5772,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .menu { display:grid; gap:.25rem; padding:.8rem .5rem 1rem; overflow-y:auto; min-height:0; flex:1 1 auto; }
         .menu-group { display:grid; gap:.25rem; margin-bottom:.35rem; }
         .menu-title { color:var(--text-dim); font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; padding:.35rem .9rem .15rem; }
-        .menu button { text-align:left; background:transparent; border:1px solid transparent; color:var(--text-dim); padding:.85rem 1rem; border-radius:10px; cursor:pointer; }
+        .menu button { text-align:left; background:transparent; border:1px solid transparent; color:var(--text-dim); padding:.85rem 1rem; border-radius:10px; cursor:pointer; font-size:.9rem; }
         .menu button:hover, .menu button.active { background:var(--accent-soft); color:var(--accent); }
         .main { padding:2.5rem 3rem; }
         .top { display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1.25rem; }
@@ -5876,7 +5909,35 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .pill { display:flex; align-items:center; gap:.35rem; background:#111118; border:1px solid var(--border); border-radius:999px; padding:.3rem .6rem; color:var(--text-dim); }
         ol { margin-top:.2rem; margin-bottom:.8rem; padding-left:1.2rem; }
         pre { margin:0; background:#101015; border:1px solid var(--border); border-radius:10px; padding:.75rem; overflow:auto; }
-        .host { display:flex; justify-content:space-between; align-items:flex-start; gap:.6rem; border-top:1px solid var(--border); padding:.6rem 0; }
+        .host { display:flex; justify-content:space-between; align-items:flex-start; gap:.6rem; border-top:1px solid var(--border); padding:.55rem 0; font-size:.9rem; }
+        .subdomain-group { margin-top:.65rem; border:1px solid var(--border); border-radius:10px; background:var(--panel); padding:.5rem .7rem; }
+        .subdomain-group + .subdomain-group { margin-top:.8rem; }
+        .subdomain-group .host:first-of-type { border-top:1px solid var(--border); }
+        .subdomain-group-head {
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:.5rem;
+          padding:.15rem 0 .35rem;
+          font-size:.88rem;
+          border-bottom:1px solid var(--border);
+          margin-bottom:.1rem;
+        }
+        .host-fqdn-link {
+          color: var(--accent);
+          text-decoration: none;
+          border-bottom: 1px dotted transparent;
+          transition: color .15s ease, border-color .15s ease, opacity .15s ease;
+        }
+        .host-fqdn-link:hover {
+          color: var(--accent-hover);
+          border-bottom-color: var(--accent-hover);
+        }
+        .host-fqdn-link:focus-visible {
+          outline: 2px solid var(--accent);
+          outline-offset: 2px;
+          border-radius: 4px;
+        }
         .diag { display:flex; gap:.35rem; flex-wrap:wrap; margin-top:.35rem; }
         .diag-block { margin-top:.4rem; }
         .badge { font-size:.74rem; padding:.15rem .45rem; border-radius:999px; border:1px solid transparent; display:inline-flex; align-items:center; white-space:nowrap; }
