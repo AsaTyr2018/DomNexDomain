@@ -57,6 +57,11 @@ Technical setup and operations are maintained in the wiki:
 - **Installation (Bare Metal):** https://github.com/AsaTyr2018/DomNexDomain/wiki/01-Installation-Bare-Metal
 - **API Usage Guide:** https://github.com/AsaTyr2018/DomNexDomain/wiki/13-API-Usage-Guide
 
+## Compliance Notice
+
+- IP addresses are treated as operational security data and are subject to retention limits.
+- DomNexDomain does not automatically ensure legal compliance. Operators remain responsible for lawful use.
+
 ## Support
 
 - GitHub Issues: https://github.com/AsaTyr2018/DomNexDomain/issues
