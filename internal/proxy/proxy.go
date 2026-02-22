@@ -1258,14 +1258,6 @@ func (e *Engine) renderSmartErrorPage(w http.ResponseWriter, r *http.Request, p 
 	if host == "" {
 		host = "unknown"
 	}
-	scope := strings.TrimSpace(p.Scope)
-	if scope == "" {
-		clientIP := clientIPFromRequest(r)
-		e.mu.RLock()
-		publicIP := e.publicIP
-		e.mu.RUnlock()
-		scope = requestScope(clientIP, publicIP)
-	}
 	theme := strings.TrimSpace(strings.ToLower(p.Theme))
 	th := e.currentTheme()
 	gradA := th.heroA
@@ -1304,11 +1296,6 @@ p{margin:.2rem 0 .75rem;color:var(--dim)}
 </style></head><body><main class="card"><div class="brand"><img src="` + edgeLogoPath + `" alt="DomNexDomain"></div><div class="top"><div class="tag">DomNexDomain Smart Error</div><div>` + strconv.Itoa(status) + `</div></div>
 <h1>` + html.EscapeString(p.Title) + `</h1><p>` + html.EscapeString(p.Description) + `</p>
 <div class="row"><div class="k">Host</div><div class="v">` + html.EscapeString(host) + `</div></div>
-<div class="row"><div class="k">Path</div><div class="v">` + html.EscapeString(r.URL.Path) + `</div></div>
-<div class="row"><div class="k">Failure Point</div><div class="v">` + html.EscapeString(p.FailurePoint) + `</div></div>
-<div class="row"><div class="k">Request Scope</div><div class="v">` + html.EscapeString(scope) + `</div></div>
-<div class="row"><div class="k">Error Code</div><div class="v">` + html.EscapeString(p.Code) + `</div></div>
-<div class="row"><div class="k">Timestamp (UTC)</div><div class="v">` + time.Now().UTC().Format(time.RFC3339) + `</div></div>
 <div class="row"><div class="k">Trace ID</div><div class="v"><strong>` + html.EscapeString(p.TraceID) + `</strong></div></div>
 </main></body></html>`
 	_, _ = w.Write([]byte(body))
