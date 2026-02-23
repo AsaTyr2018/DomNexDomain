@@ -11,7 +11,9 @@ type NftEnforcer struct {
 	table   string
 	chain   string
 	set4    string
+	set6    string
 	ruleTag string
+	rule6   string
 }
 
 func NewNftEnforcer() *NftEnforcer {
@@ -19,7 +21,9 @@ func NewNftEnforcer() *NftEnforcer {
 		table:   "domnex",
 		chain:   "domnex_input",
 		set4:    "domnex_blocked_v4",
+		set6:    "domnex_blocked_v6",
 		ruleTag: "domnex_ti_drop_v4",
+		rule6:   "domnex_ti_drop_v6",
 	}
 }
 
@@ -28,6 +32,9 @@ func (n *NftEnforcer) Ensure(ctx context.Context) error {
 		return err
 	}
 	if err := n.run(ctx, "add", "set", "inet", n.table, n.set4, "{", "type", "ipv4_addr", ";", "}"); err != nil && !isAlreadyExists(err) {
+		return err
+	}
+	if err := n.run(ctx, "add", "set", "inet", n.table, n.set6, "{", "type", "ipv6_addr", ";", "}"); err != nil && !isAlreadyExists(err) {
 		return err
 	}
 	if err := n.run(ctx, "add", "chain", "inet", n.table, n.chain, "{", "type", "filter", "hook", "input", "priority", "0", ";", "policy", "accept", ";", "}"); err != nil && !isAlreadyExists(err) {
@@ -42,6 +49,11 @@ func (n *NftEnforcer) Ensure(ctx context.Context) error {
 			return err
 		}
 	}
+	if !strings.Contains(out, n.rule6) {
+		if err := n.run(ctx, "add", "rule", "inet", n.table, n.chain, "ip6", "saddr", "@"+n.set6, "tcp", "dport", "{", "80,", "443,", "2222", "}", "drop", "comment", n.rule6); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -49,27 +61,40 @@ func (n *NftEnforcer) Disable(ctx context.Context) error {
 	if err := n.run(ctx, "flush", "set", "inet", n.table, n.set4); err != nil && !isNotFound(err) {
 		return err
 	}
+	if err := n.run(ctx, "flush", "set", "inet", n.table, n.set6); err != nil && !isNotFound(err) {
+		return err
+	}
 	return nil
 }
 
-func (n *NftEnforcer) ReplaceIPv4(ctx context.Context, ips []string) error {
+func (n *NftEnforcer) Replace(ctx context.Context, ipv4, ipv6 []string) error {
 	if err := n.Ensure(ctx); err != nil {
 		return err
 	}
 	if err := n.run(ctx, "flush", "set", "inet", n.table, n.set4); err != nil {
 		return err
 	}
-	if len(ips) == 0 {
-		return nil
+	if err := n.run(ctx, "flush", "set", "inet", n.table, n.set6); err != nil {
+		return err
 	}
 	const chunk = 200
-	for i := 0; i < len(ips); i += chunk {
+	for i := 0; i < len(ipv4); i += chunk {
 		end := i + chunk
-		if end > len(ips) {
-			end = len(ips)
+		if end > len(ipv4) {
+			end = len(ipv4)
 		}
-		part := strings.Join(ips[i:end], ", ")
+		part := strings.Join(ipv4[i:end], ", ")
 		if err := n.run(ctx, "add", "element", "inet", n.table, n.set4, "{", part, "}"); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < len(ipv6); i += chunk {
+		end := i + chunk
+		if end > len(ipv6) {
+			end = len(ipv6)
+		}
+		part := strings.Join(ipv6[i:end], ", ")
+		if err := n.run(ctx, "add", "element", "inet", n.table, n.set6, "{", part, "}"); err != nil {
 			return err
 		}
 	}

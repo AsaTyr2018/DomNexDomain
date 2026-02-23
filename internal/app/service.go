@@ -4055,23 +4055,35 @@ func (s *Service) reconcileOSFirewall(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	set := map[string]bool{}
+	set4 := map[string]bool{}
+	set6 := map[string]bool{}
 	for _, b := range blocked {
 		ip := strings.TrimSpace(b.IP)
-		if !isPublicIPv4(ip) {
+		if ip == "" {
 			continue
 		}
 		if mode == "hard_only" && !strings.Contains(strings.ToLower(strings.TrimSpace(b.Reason)), "hard") {
 			continue
 		}
-		set[ip] = true
+		if isPublicIPv4(ip) {
+			set4[ip] = true
+			continue
+		}
+		if isPublicIPv6(ip) {
+			set6[ip] = true
+		}
 	}
-	ips := make([]string, 0, len(set))
-	for ip := range set {
-		ips = append(ips, ip)
+	ips4 := make([]string, 0, len(set4))
+	for ip := range set4 {
+		ips4 = append(ips4, ip)
 	}
-	sort.Strings(ips)
-	return s.nft.ReplaceIPv4(ctx, ips)
+	ips6 := make([]string, 0, len(set6))
+	for ip := range set6 {
+		ips6 = append(ips6, ip)
+	}
+	sort.Strings(ips4)
+	sort.Strings(ips6)
+	return s.nft.Replace(ctx, ips4, ips6)
 }
 
 func isPublicIPv4(raw string) bool {
@@ -4094,6 +4106,27 @@ func isPublicIPv4(raw string) bool {
 	case v4[0] == 169 && v4[1] == 254:
 		return false
 	case v4[0] >= 224:
+		return false
+	}
+	return true
+}
+
+func isPublicIPv6(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return false
+	}
+	if ip.To4() != nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return false
+	}
+	// ULA fc00::/7 and documentation prefix 2001:db8::/32 should never be enforced.
+	if strings.HasPrefix(strings.ToLower(ip.String()), "fc") || strings.HasPrefix(strings.ToLower(ip.String()), "fd") {
+		return false
+	}
+	if strings.HasPrefix(strings.ToLower(ip.String()), "2001:db8:") {
 		return false
 	}
 	return true
