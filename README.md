@@ -36,7 +36,13 @@ It assumes your edge is reachable from the internet on the intended entry points
 - Optional HA per subdomain (`failover` / `round-robin`)
 - SSH Bastion gateway mode
 - Automated DNS + certificate workflows (Cloudflare-first)
+- In-house MFA/2FA (TOTP) with per-role enforcement and recovery flow
+- Login hardening with staged auth flow and anti-enumeration behavior
 - Smart branded edge error pages with trace ID correlation
+- Threat Intel modes (`Monitor only` / `Auto mode`) with allowlist-first policy
+- Edge hard-drop enforcement for hard-blocked sources
+- GeoIP multi-source ingestion (`.mmdb`, `.csv`, `.gz`, `.zip`) with compiled source-of-truth MMDB
+- GeoIP source stats and upload progress in Web UI
 - Role model: `admin`, `domain-admin`, `read-only`
 - Scoped API tokens (global/domain/system)
 - Data retention controls + daily purge jobs
@@ -65,6 +71,8 @@ sudo ./deploy/systemd/setup-appliance.sh
 - **Installation (Bare Metal):** https://github.com/AsaTyr2018/DomNexDomain/wiki/01-Installation-Bare-Metal
 - **Initial Setup Assistant and OTS:** https://github.com/AsaTyr2018/DomNexDomain/wiki/23-Initial-Setup-Assistant-and-OTS
 - **Backup and Restore:** https://github.com/AsaTyr2018/DomNexDomain/wiki/10-Backup-and-Restore
+- **Users, Roles, and MFA:** https://github.com/AsaTyr2018/DomNexDomain/wiki/06-Users-and-Roles
+- **Threat Intel Operations:** https://github.com/AsaTyr2018/DomNexDomain/wiki/18-Threat-Intel-Operations
 - **API Usage Guide:** https://github.com/AsaTyr2018/DomNexDomain/wiki/13-API-Usage-Guide
 
 ## Operating Profiles
