@@ -3923,6 +3923,16 @@ func (s *Service) ListThreatIntelBlocked(ctx context.Context, hours int, q strin
 	if err != nil {
 		return ThreatIntelBlockedPage{}, err
 	}
+	policy := s.getRetentionPolicy(ctx)
+	retentionDays := policy.BlockedDays
+	if retentionDays <= 0 {
+		retentionDays = 60
+	}
+	for i := range items {
+		if items[i].BlockedUntil.IsZero() && !items[i].BlockedOn.IsZero() {
+			items[i].BlockedUntil = items[i].BlockedOn.Add(time.Duration(retentionDays) * 24 * time.Hour)
+		}
+	}
 	return ThreatIntelBlockedPage{Items: items, Total: total, Page: page, PageSize: pageSize}, nil
 }
 

@@ -6445,6 +6445,7 @@ function formatDateTime(v?: string): string {
   if (!v) return '-';
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) return '-';
+  if (d.getUTCFullYear() < 2000) return '-';
   return d.toLocaleString();
 }
 
