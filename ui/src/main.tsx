@@ -887,6 +887,8 @@ function App() {
         setTiConfig({
           enabled: !!cfg.enabled,
           mode: (cfg.mode || 'monitor_only') as 'monitor_only' | 'auto_mode',
+          osFirewall: !!cfg.osFirewall,
+          osFirewallMode: (cfg.osFirewallMode || 'hard_only') as 'hard_only' | 'all_blocked',
           syncHours: Number(cfg.syncHours || 24),
           eventMinHits: Number(cfg.eventMinHits || 2),
           offenderMinHits: Number(cfg.offenderMinHits || 10),
@@ -962,6 +964,8 @@ function App() {
       setTiConfig({
         enabled: !!cfg.enabled,
         mode: (cfg.mode || 'monitor_only') as 'monitor_only' | 'auto_mode',
+        osFirewall: !!cfg.osFirewall,
+        osFirewallMode: (cfg.osFirewallMode || 'hard_only') as 'hard_only' | 'all_blocked',
         syncHours: Number(cfg.syncHours || 24),
         eventMinHits: Number(cfg.eventMinHits || 2),
         offenderMinHits: Number(cfg.offenderMinHits || 10),
