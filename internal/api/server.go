@@ -69,6 +69,7 @@ func (s *Server) Router() http.Handler {
 		pr.Use(s.requireAuth(model.RoleReadOnly, ""))
 		pr.Get("/api/v1/me", s.handleMe)
 		pr.Get("/api/v1/me/profile", s.handleMeProfileGet)
+		pr.Get("/api/v1/me/mfa/status", s.handleGetOwnMFAStatus)
 		pr.Post("/api/v1/logout", s.handleLogout)
 		pr.Get("/api/v1/domains", s.handleListDomains)
 		pr.Get("/api/v1/domains/{id}/live-check", s.handleDomainLiveCheck)
@@ -104,6 +105,9 @@ func (s *Server) Router() http.Handler {
 		pr.Use(s.requireCSRF)
 		pr.Post("/api/v1/me/password", s.handleChangeOwnPassword)
 		pr.Post("/api/v1/me/profile", s.handleMeProfileSet)
+		pr.Post("/api/v1/me/mfa/enroll/start", s.handleStartOwnMFAEnroll)
+		pr.Post("/api/v1/me/mfa/enroll/confirm", s.handleConfirmOwnMFAEnroll)
+		pr.Post("/api/v1/me/mfa/disable", s.handleDisableOwnMFA)
 	})
 
 	r.Group(func(pr chi.Router) {
@@ -147,6 +151,7 @@ func (s *Server) Router() http.Handler {
 		pr.Put("/api/v1/users/{id}", s.handleUpdateUserAccess)
 		pr.Put("/api/v1/users/{id}/domains", s.handleSetUserDomains)
 		pr.Put("/api/v1/users/{id}/password", s.handleSetUserPassword)
+		pr.Post("/api/v1/users/{id}/mfa/reset", s.handleAdminResetUserMFA)
 		pr.Delete("/api/v1/users/{id}", s.handleDeleteUser)
 		pr.Post("/api/v1/logout-all", s.handleLogoutAll)
 		pr.Post("/api/v1/security/ip-blocks", s.handleAddBlockedIP)
@@ -648,13 +653,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		OTP      string `json:"otp"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	source := clientIP(r)
-	sid, user, err := s.auth.AuthenticatePassword(r.Context(), in.Username, in.Password, source)
+	sid, user, err := s.auth.AuthenticatePassword(r.Context(), in.Username, in.Password, in.OTP, source)
 	if err != nil {
 		s.metrics.Failures.WithLabelValues("auth").Inc()
 		writeErr(w, http.StatusUnauthorized, "login failed")
@@ -696,6 +702,20 @@ func (s *Server) handleLogoutAll(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"identity": identityFrom(r.Context())})
+}
+
+func (s *Server) handleGetOwnMFAStatus(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if id.Type != "session" || id.UserID <= 0 {
+		writeErr(w, http.StatusForbidden, "session auth required")
+		return
+	}
+	out, err := s.app.GetOwnMFAStatus(r.Context(), id.UserID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func profileEmailSettingKey(username string) string {
@@ -1883,17 +1903,18 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 		LogServers         app.LogServerSettings `json:"logServers"`
 		LogHTTPBearer      string                `json:"logHttpBearer"`
 		Retention          app.RetentionPolicy   `json:"retention"`
+		MFAPolicy          app.MFAPolicy         `json:"mfaPolicy"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom, in.TimeSyncMode, in.TimeSyncLANServers, in.LogServers, in.LogHTTPBearer, in.Retention); err != nil {
+	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom, in.TimeSyncMode, in.TimeSyncLANServers, in.LogServers, in.LogHTTPBearer, in.Retention, in.MFAPolicy); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actor := id.Username
-	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "settings.update", Target: "runtime", Meta: "acme/cloudflare/base-domain/time-sync/logservers/retention"})
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "settings.update", Target: "runtime", Meta: "acme/cloudflare/base-domain/time-sync/logservers/retention/mfa-policy"})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"restartNeeded": true,
@@ -2413,6 +2434,37 @@ func (s *Server) handleSetUserPassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (s *Server) handleAdminResetUserMFA(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	userID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if userID <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	if userID == id.UserID {
+		writeErr(w, http.StatusBadRequest, "use your own account mfa actions")
+		return
+	}
+	if err := s.app.ResetManagedUserMFA(r.Context(), userID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "user.mfa.reset",
+		Target: strconv.FormatInt(userID, 10),
+		Meta:   "admin-reset",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
 	if id.Type != "session" || id.UserID <= 0 {
@@ -2434,6 +2486,80 @@ func (s *Server) handleChangeOwnPassword(w http.ResponseWriter, r *http.Request)
 	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
 		Actor:  id.Username,
 		Action: "auth.password.changed",
+		Target: id.Username,
+		Meta:   "self-service",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleStartOwnMFAEnroll(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if id.Type != "session" || id.UserID <= 0 {
+		writeErr(w, http.StatusForbidden, "session auth required")
+		return
+	}
+	out, err := s.app.StartOwnMFAEnrollment(r.Context(), id.UserID, id.Username)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "auth.mfa.enroll.start",
+		Target: id.Username,
+		Meta:   "self-service",
+	})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleConfirmOwnMFAEnroll(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if id.Type != "session" || id.UserID <= 0 {
+		writeErr(w, http.StatusForbidden, "session auth required")
+		return
+	}
+	var in struct {
+		OTP string `json:"otp"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out, err := s.app.ConfirmOwnMFAEnrollment(r.Context(), id.UserID, in.OTP)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "auth.mfa.enroll.confirm",
+		Target: id.Username,
+		Meta:   "enabled=1",
+	})
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleDisableOwnMFA(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if id.Type != "session" || id.UserID <= 0 {
+		writeErr(w, http.StatusForbidden, "session auth required")
+		return
+	}
+	var in struct {
+		CurrentPassword string `json:"currentPassword"`
+		Code            string `json:"code"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.DisableOwnMFA(r.Context(), id.UserID, in.CurrentPassword, in.Code); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "auth.mfa.disable",
 		Target: id.Username,
 		Meta:   "self-service",
 	})

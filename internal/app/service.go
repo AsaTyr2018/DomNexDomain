@@ -33,6 +33,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/crypto"
 	"github.com/domnexdomain/domnexdomain/internal/dns"
 	"github.com/domnexdomain/domnexdomain/internal/logx"
+	"github.com/domnexdomain/domnexdomain/internal/mfa"
 	"github.com/domnexdomain/domnexdomain/internal/model"
 	"github.com/domnexdomain/domnexdomain/internal/store"
 	"golang.org/x/crypto/ssh"
@@ -88,6 +89,9 @@ const (
 	settingRetentionBlockedDays  = "runtime.retention.blocked_days"
 	settingRetentionLoginDays    = "runtime.retention.login_days"
 	settingRetentionResetDays    = "runtime.retention.password_reset_days"
+	settingMFAEnforceAdmin       = "auth.mfa.enforce_admin"
+	settingMFAEnforceDomainAdmin = "auth.mfa.enforce_domain_admin"
+	settingMFAEnforceReadOnly    = "auth.mfa.enforce_read_only"
 )
 
 const (
@@ -114,6 +118,13 @@ type RuntimeSettings struct {
 	LogServers         LogServerSettings `json:"logServers"`
 	HasLogHTTPBearer   bool              `json:"hasLogHTTPBearer"`
 	Retention          RetentionPolicy   `json:"retention"`
+	MFAPolicy          MFAPolicy         `json:"mfaPolicy"`
+}
+
+type MFAPolicy struct {
+	EnforceAdmin       bool `json:"enforceAdmin"`
+	EnforceDomainAdmin bool `json:"enforceDomainAdmin"`
+	EnforceReadOnly    bool `json:"enforceReadOnly"`
 }
 
 type RetentionPolicy struct {
@@ -181,8 +192,31 @@ type ManagedUser struct {
 	DomainIDs       []int64    `json:"domainIds"`
 	AllowedCIDRs    string     `json:"allowedCidrs"`
 	IPCheckDisabled bool       `json:"ipCheckDisabled"`
+	MFAEnabled      bool       `json:"mfaEnabled"`
+	MFAEnrolledAt   time.Time  `json:"mfaEnrolledAt"`
 	CreatedAt       time.Time  `json:"createdAt"`
 	UpdatedAt       time.Time  `json:"updatedAt"`
+}
+
+type MFAStatus struct {
+	Enabled                bool      `json:"enabled"`
+	RequiredByPolicy       bool      `json:"requiredByPolicy"`
+	EnrolledAt             time.Time `json:"enrolledAt"`
+	RecoveryCodesRemaining int       `json:"recoveryCodesRemaining"`
+}
+
+type MFAEnrollStart struct {
+	Secret    string `json:"secret"`
+	OTPAuth   string `json:"otpAuthUri"`
+	Issuer    string `json:"issuer"`
+	Account   string `json:"account"`
+	StartedAt string `json:"startedAt"`
+}
+
+type MFAEnrollConfirm struct {
+	Enabled       bool      `json:"enabled"`
+	EnrolledAt    time.Time `json:"enrolledAt"`
+	RecoveryCodes []string  `json:"recoveryCodes"`
 }
 
 func (s *Service) GetSystemHealth(ctx context.Context) (SystemHealthStatus, error) {
@@ -696,10 +730,11 @@ func (s *Service) GetRuntimeSettings(ctx context.Context) (RuntimeSettings, erro
 		out.HasLogHTTPBearer = hasToken
 	}
 	out.Retention = s.getRetentionPolicy(ctx)
+	out.MFAPolicy = s.getMFAPolicy(ctx)
 	return out, nil
 }
 
-func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom, timeSyncMode, timeSyncLANServers string, logServers LogServerSettings, logHTTPBearer string, retention RetentionPolicy) error {
+func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom, timeSyncMode, timeSyncLANServers string, logServers LogServerSettings, logHTTPBearer string, retention RetentionPolicy, mfaPolicy MFAPolicy) error {
 	acmeEmail = strings.TrimSpace(acmeEmail)
 	if acmeEmail != "" {
 		if err := s.store.SetSetting(ctx, "acme.email", acmeEmail); err != nil {
@@ -810,7 +845,39 @@ func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acme
 	if err := s.store.SetSetting(ctx, settingRetentionResetDays, strconv.Itoa(retention.PasswordResetDays)); err != nil {
 		return err
 	}
+	mfaPolicy = normalizeMFAPolicy(mfaPolicy)
+	if err := s.store.SetSetting(ctx, settingMFAEnforceAdmin, strconv.FormatBool(mfaPolicy.EnforceAdmin)); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingMFAEnforceDomainAdmin, strconv.FormatBool(mfaPolicy.EnforceDomainAdmin)); err != nil {
+		return err
+	}
+	if err := s.store.SetSetting(ctx, settingMFAEnforceReadOnly, strconv.FormatBool(mfaPolicy.EnforceReadOnly)); err != nil {
+		return err
+	}
 	return nil
+}
+
+func normalizeMFAPolicy(in MFAPolicy) MFAPolicy {
+	return MFAPolicy{
+		EnforceAdmin:       in.EnforceAdmin,
+		EnforceDomainAdmin: in.EnforceDomainAdmin,
+		EnforceReadOnly:    in.EnforceReadOnly,
+	}
+}
+
+func (s *Service) getMFAPolicy(ctx context.Context) MFAPolicy {
+	out := MFAPolicy{}
+	if v, err := s.store.GetSetting(ctx, settingMFAEnforceAdmin); err == nil {
+		out.EnforceAdmin = strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	if v, err := s.store.GetSetting(ctx, settingMFAEnforceDomainAdmin); err == nil {
+		out.EnforceDomainAdmin = strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	if v, err := s.store.GetSetting(ctx, settingMFAEnforceReadOnly); err == nil {
+		out.EnforceReadOnly = strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	return out
 }
 
 func defaultRetentionPolicy() RetentionPolicy {
@@ -2981,6 +3048,9 @@ func (s *Service) CreateManagedUser(ctx context.Context, username, password stri
 	if _, err := parseAndNormalizeCIDRs(allowedCIDRs); err != nil {
 		return ManagedUser{}, err
 	}
+	if ipCheckDisabled {
+		return ManagedUser{}, fmt.Errorf("disable IP check requires MFA enabled for this user")
+	}
 	hash, err := crypto.HashPassword(password, crypto.DefaultArgonConfig())
 	if err != nil {
 		return ManagedUser{}, err
@@ -3006,6 +3076,8 @@ func (s *Service) CreateManagedUser(ctx context.Context, username, password stri
 		DomainIDs:       ids,
 		AllowedCIDRs:    u.AllowedCIDRs,
 		IPCheckDisabled: u.IPCheckOff,
+		MFAEnabled:      u.MFAEnabled,
+		MFAEnrolledAt:   u.MFAEnrolled,
 		CreatedAt:       u.CreatedAt,
 		UpdatedAt:       u.UpdatedAt,
 	}, nil
@@ -3026,6 +3098,8 @@ func (s *Service) ListManagedUsers(ctx context.Context) ([]ManagedUser, error) {
 			DomainIDs:       ids,
 			AllowedCIDRs:    u.AllowedCIDRs,
 			IPCheckDisabled: u.IPCheckOff,
+			MFAEnabled:      u.MFAEnabled,
+			MFAEnrolledAt:   u.MFAEnrolled,
 			CreatedAt:       u.CreatedAt,
 			UpdatedAt:       u.UpdatedAt,
 		})
@@ -3055,8 +3129,12 @@ func (s *Service) SetManagedUserAccess(ctx context.Context, userID int64, role m
 	if err != nil {
 		return err
 	}
-	if _, err := s.store.GetUserByID(ctx, userID); err != nil {
+	u, err := s.store.GetUserByID(ctx, userID)
+	if err != nil {
 		return err
+	}
+	if ipCheckDisabled && !u.MFAEnabled {
+		return fmt.Errorf("disable IP check requires MFA enabled for this user")
 	}
 	if role == model.RoleDomainAdmin && len(domainIDs) == 0 {
 		return fmt.Errorf("domain-admin requires at least one domain assignment")
@@ -3104,6 +3182,144 @@ func (s *Service) ChangeOwnPassword(ctx context.Context, userID int64, currentPa
 		return err
 	}
 	return s.store.SetUserPasswordHashByID(ctx, userID, newHash)
+}
+
+func (s *Service) isMFAPolicyRequiredForRole(ctx context.Context, role model.Role) bool {
+	p := s.getMFAPolicy(ctx)
+	switch role {
+	case model.RoleAdmin:
+		return p.EnforceAdmin
+	case model.RoleDomainAdmin:
+		return p.EnforceDomainAdmin
+	case model.RoleReadOnly:
+		return p.EnforceReadOnly
+	default:
+		return false
+	}
+}
+
+func (s *Service) GetOwnMFAStatus(ctx context.Context, userID int64) (MFAStatus, error) {
+	u, err := s.store.GetUserByID(ctx, userID)
+	if err != nil {
+		return MFAStatus{}, err
+	}
+	count := 0
+	if u.MFAEnabled {
+		if c, cErr := s.store.CountUserMFARecoveryCodesRemaining(ctx, userID); cErr == nil {
+			count = c
+		}
+	}
+	return MFAStatus{
+		Enabled:                u.MFAEnabled,
+		RequiredByPolicy:       s.isMFAPolicyRequiredForRole(ctx, u.Role),
+		EnrolledAt:             u.MFAEnrolled,
+		RecoveryCodesRemaining: count,
+	}, nil
+}
+
+func (s *Service) StartOwnMFAEnrollment(ctx context.Context, userID int64, username string) (MFAEnrollStart, error) {
+	u, err := s.store.GetUserByID(ctx, userID)
+	if err != nil {
+		return MFAEnrollStart{}, err
+	}
+	secret, err := mfa.GenerateSecret()
+	if err != nil {
+		return MFAEnrollStart{}, err
+	}
+	enc, err := s.keystore.Encrypt(secret)
+	if err != nil {
+		return MFAEnrollStart{}, err
+	}
+	if err := s.store.SetUserMFAState(ctx, userID, false, enc, time.Time{}); err != nil {
+		return MFAEnrollStart{}, err
+	}
+	issuer := "DomNexDomain"
+	account := strings.TrimSpace(username)
+	if account == "" {
+		account = strings.TrimSpace(u.Username)
+	}
+	return MFAEnrollStart{
+		Secret:    secret,
+		OTPAuth:   mfa.BuildOTPAuthURL(issuer, account, secret),
+		Issuer:    issuer,
+		Account:   account,
+		StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}, nil
+}
+
+func (s *Service) ConfirmOwnMFAEnrollment(ctx context.Context, userID int64, otp string) (MFAEnrollConfirm, error) {
+	u, err := s.store.GetUserByID(ctx, userID)
+	if err != nil {
+		return MFAEnrollConfirm{}, err
+	}
+	if strings.TrimSpace(u.MFASecretEnc) == "" {
+		return MFAEnrollConfirm{}, fmt.Errorf("mfa enrollment not started")
+	}
+	secret, err := s.keystore.Decrypt(u.MFASecretEnc)
+	if err != nil {
+		return MFAEnrollConfirm{}, fmt.Errorf("mfa secret unavailable")
+	}
+	if !mfa.ValidateTOTP(secret, otp, time.Now().UTC()) {
+		return MFAEnrollConfirm{}, fmt.Errorf("invalid otp code")
+	}
+	now := time.Now().UTC()
+	if err := s.store.SetUserMFAState(ctx, userID, true, u.MFASecretEnc, now); err != nil {
+		return MFAEnrollConfirm{}, err
+	}
+	recoveryCodes, err := mfa.GenerateRecoveryCodes(10)
+	if err != nil {
+		return MFAEnrollConfirm{}, err
+	}
+	hashes := make([]string, 0, len(recoveryCodes))
+	for _, code := range recoveryCodes {
+		hashes = append(hashes, mfa.HashRecoveryCode(code))
+	}
+	if err := s.store.ReplaceUserMFARecoveryCodes(ctx, userID, hashes); err != nil {
+		return MFAEnrollConfirm{}, err
+	}
+	return MFAEnrollConfirm{
+		Enabled:       true,
+		EnrolledAt:    now,
+		RecoveryCodes: recoveryCodes,
+	}, nil
+}
+
+func (s *Service) DisableOwnMFA(ctx context.Context, userID int64, currentPassword, otpOrRecovery string) error {
+	u, err := s.store.GetUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !u.MFAEnabled {
+		return nil
+	}
+	if !crypto.VerifyPassword(currentPassword, u.PasswordHash) {
+		return fmt.Errorf("invalid current password")
+	}
+	otpOrRecovery = strings.TrimSpace(otpOrRecovery)
+	if otpOrRecovery == "" {
+		return fmt.Errorf("mfa code required")
+	}
+	allowed := false
+	if secretEnc := strings.TrimSpace(u.MFASecretEnc); secretEnc != "" {
+		if secret, dErr := s.keystore.Decrypt(secretEnc); dErr == nil {
+			allowed = mfa.ValidateTOTP(secret, otpOrRecovery, time.Now().UTC())
+		}
+	}
+	if !allowed && mfa.IsRecoveryCodeFormat(otpOrRecovery) {
+		ok, _ := s.store.ConsumeUserMFARecoveryCode(ctx, userID, mfa.HashRecoveryCode(otpOrRecovery))
+		allowed = ok
+	}
+	if !allowed {
+		return fmt.Errorf("invalid mfa code")
+	}
+	return s.store.ResetUserMFA(ctx, userID)
+}
+
+func (s *Service) ResetManagedUserMFA(ctx context.Context, userID int64) error {
+	if _, err := s.store.GetUserByID(ctx, userID); err != nil {
+		return err
+	}
+	return s.store.ResetUserMFA(ctx, userID)
 }
 
 func normalizeThreatIntelMode(mode string) string {
@@ -3375,11 +3591,19 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 	if watchBoost && !st.PermBlocked && (st.BanUntil.IsZero() || !st.BanUntil.After(now)) {
 		st.RiskState = "watch"
 	}
+	// Deterministic hard-block enforcement:
+	// once hard level is reached in auto mode, immediately convert to permanent block.
+	if in.Mode == "auto_mode" && st.Level >= hardLevel {
+		st.PermBlocked = true
+		st.BanUntil = time.Time{}
+		st.RiskState = "hardblock"
+	}
 	st.LastSeenAt = now
 	if st.PermBlocked {
 		res.Blocked = true
 		res.HardBlock = true
 		res.Decision = "hard_block_permanent"
+		_ = s.store.UpsertBlockedIP(ctx, in.IP, "threat_intel_auto:"+topSignal)
 	} else if !st.BanUntil.IsZero() && st.BanUntil.After(now) {
 		res.Blocked = true
 		res.Decision = "soft_block_active"
@@ -3390,13 +3614,6 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 		case "auto_mode":
 			if watchBoost {
 				res.Decision = "watch_boost"
-			} else if st.Level >= hardLevel {
-				st.PermBlocked = true
-				st.BanUntil = time.Time{}
-				res.Blocked = true
-				res.HardBlock = true
-				res.Decision = "hard_block_set"
-				_ = s.store.UpsertBlockedIP(ctx, in.IP, "threat_intel_auto:"+topSignal)
 			} else if st.Level >= softMinLevel {
 				st.TempBlockCount++
 				d := time.Duration(softBlockMinutes) * time.Minute
@@ -3886,6 +4103,10 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 		if cfg.HardLevel > 0 {
 			hardLevel = cfg.HardLevel
 		}
+	}
+	// Global safety net: enforce hard-level states into blocked IPs regularly.
+	if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, hardLevel); err != nil {
+		s.log.Warn("threat intel hardblock promotion failed", map[string]any{"err": err.Error()})
 	}
 	states, err := s.store.ListThreatIntelIPStates(ctx, 20000)
 	if err != nil {

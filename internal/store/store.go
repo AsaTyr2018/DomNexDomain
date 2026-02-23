@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS users (
   role TEXT NOT NULL,
   allowed_cidrs TEXT NOT NULL DEFAULT '',
   ip_check_disabled INTEGER NOT NULL DEFAULT 0,
+  mfa_enabled INTEGER NOT NULL DEFAULT 0,
+  mfa_secret_enc TEXT NOT NULL DEFAULT '',
+  mfa_enrolled_at TEXT NOT NULL DEFAULT '',
   password_hash TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -191,6 +194,15 @@ CREATE TABLE IF NOT EXISTS user_domain_scopes (
   PRIMARY KEY(user_id, domain_id),
   FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY(domain_id) REFERENCES domains(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS user_mfa_recovery_codes (
+  user_id INTEGER NOT NULL,
+  code_hash TEXT NOT NULL,
+  used_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(user_id, code_hash),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS host_traffic_minute (
@@ -405,6 +417,15 @@ CREATE INDEX IF NOT EXISTS idx_backup_archives_storage_created ON backup_archive
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN ip_check_disabled INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN mfa_secret_enc TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN mfa_enrolled_at TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
 	return nil
 }
 
@@ -431,14 +452,16 @@ func (s *Store) CountUsers(ctx context.Context) (int, error) {
 
 func (s *Store) FindUserByUsername(ctx context.Context, username string) (model.User, error) {
 	var u model.User
-	var created, updated string
-	var ipCheckDisabled int
-	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at FROM users WHERE username=?`, username).
-		Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &u.PasswordHash, &created, &updated)
+	var created, updated, mfaEnrolledAt string
+	var ipCheckDisabled, mfaEnabled int
+	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users WHERE username=?`, username).
+		Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated)
 	if err != nil {
 		return u, err
 	}
 	u.IPCheckOff = ipCheckDisabled != 0
+	u.MFAEnabled = mfaEnabled != 0
+	u.MFAEnrolled = parseTimeOrZero(mfaEnrolledAt)
 	u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	u.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return u, nil
@@ -446,14 +469,16 @@ func (s *Store) FindUserByUsername(ctx context.Context, username string) (model.
 
 func (s *Store) GetUserByID(ctx context.Context, id int64) (model.User, error) {
 	var u model.User
-	var created, updated string
-	var ipCheckDisabled int
-	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at FROM users WHERE id=?`, id).
-		Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &u.PasswordHash, &created, &updated)
+	var created, updated, mfaEnrolledAt string
+	var ipCheckDisabled, mfaEnabled int
+	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users WHERE id=?`, id).
+		Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated)
 	if err != nil {
 		return u, err
 	}
 	u.IPCheckOff = ipCheckDisabled != 0
+	u.MFAEnabled = mfaEnabled != 0
+	u.MFAEnrolled = parseTimeOrZero(mfaEnrolledAt)
 	u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 	u.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return u, nil
@@ -1674,7 +1699,85 @@ func (s *Store) SetUserPasswordHashByID(ctx context.Context, userID int64, passH
 	return err
 }
 
+func (s *Store) SetUserMFAState(ctx context.Context, userID int64, enabled bool, secretEnc string, enrolledAt time.Time) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	enrolledRaw := ""
+	if !enrolledAt.IsZero() {
+		enrolledRaw = enrolledAt.UTC().Format(time.RFC3339Nano)
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE users
+SET mfa_enabled=?, mfa_secret_enc=?, mfa_enrolled_at=?, updated_at=?
+WHERE id=?`, boolToInt(enabled), strings.TrimSpace(secretEnc), enrolledRaw, now, userID)
+	return err
+}
+
+func (s *Store) ResetUserMFA(ctx context.Context, userID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `
+UPDATE users
+SET mfa_enabled=0, mfa_secret_enc='', mfa_enrolled_at='', ip_check_disabled=0, updated_at=?
+WHERE id=?`, now, userID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_mfa_recovery_codes WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ReplaceUserMFARecoveryCodes(ctx context.Context, userID int64, codeHashes []string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_mfa_recovery_codes WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, h := range codeHashes {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO user_mfa_recovery_codes(user_id, code_hash, used_at, created_at) VALUES(?,?,?,?)`, userID, h, "", now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ConsumeUserMFARecoveryCode(ctx context.Context, userID int64, codeHash string) (bool, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `
+UPDATE user_mfa_recovery_codes
+SET used_at=?
+WHERE user_id=? AND code_hash=? AND (used_at='' OR used_at IS NULL)`, now, userID, strings.TrimSpace(codeHash))
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) CountUserMFARecoveryCodesRemaining(ctx context.Context, userID int64) (int, error) {
+	var c int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM user_mfa_recovery_codes WHERE user_id=? AND (used_at='' OR used_at IS NULL)`, userID).Scan(&c); err != nil {
+		return 0, err
+	}
+	return c, nil
+}
+
 func (s *Store) CreateUser(ctx context.Context, username string, role model.Role, allowedCIDRs string, ipCheckDisabled bool, passHash string) (model.User, error) {
+	if ipCheckDisabled {
+		return model.User{}, fmt.Errorf("ip check can be disabled only after MFA is enabled for this user")
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, username, string(role), strings.TrimSpace(allowedCIDRs), boolToInt(ipCheckDisabled), passHash, now, now)
 	if err != nil {
@@ -1685,7 +1788,7 @@ func (s *Store) CreateUser(ctx context.Context, username string, role model.Role
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at FROM users ORDER BY username`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
@@ -1693,12 +1796,14 @@ func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
 	out := []model.User{}
 	for rows.Next() {
 		var u model.User
-		var created, updated string
-		var ipCheckDisabled int
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &u.PasswordHash, &created, &updated); err != nil {
+		var created, updated, mfaEnrolledAt string
+		var ipCheckDisabled, mfaEnabled int
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated); err != nil {
 			return nil, err
 		}
 		u.IPCheckOff = ipCheckDisabled != 0
+		u.MFAEnabled = mfaEnabled != 0
+		u.MFAEnrolled = parseTimeOrZero(mfaEnrolledAt)
 		u.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		u.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 		out = append(out, u)
@@ -1769,6 +1874,15 @@ func (s *Store) SetUserAccessPolicy(ctx context.Context, userID int64, role mode
 		return err
 	}
 	defer tx.Rollback()
+	if ipCheckDisabled {
+		var mfaEnabled int
+		if err := tx.QueryRowContext(ctx, `SELECT mfa_enabled FROM users WHERE id=?`, userID).Scan(&mfaEnabled); err != nil {
+			return err
+		}
+		if mfaEnabled == 0 {
+			return fmt.Errorf("ip check can be disabled only for MFA-enabled users")
+		}
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := tx.ExecContext(ctx, `UPDATE users SET role=?, allowed_cidrs=?, ip_check_disabled=?, updated_at=? WHERE id=?`, string(role), strings.TrimSpace(allowedCIDRs), boolToInt(ipCheckDisabled), now, userID)
 	if err != nil {
@@ -2535,7 +2649,23 @@ SELECT m.ip,
        SUM(m.hits) AS total_hits,
        COUNT(DISTINCT m.feed) AS distinct_feeds,
        COUNT(DISTINCT m.host) AS distinct_hosts,
-       GROUP_CONCAT(DISTINCT m.decision),
+       COALESCE((
+         SELECT GROUP_CONCAT(x, ' | ') FROM (
+           SELECT (CASE WHEN COALESCE(mf.feed, '') = '' THEN '(none)' ELSE mf.feed END || ' (' || SUM(mf.hits) || ')') AS x
+           FROM threat_intel_matches mf
+           WHERE mf.ip = m.ip AND mf.last_seen_at >= ?
+           GROUP BY mf.feed
+           ORDER BY SUM(mf.hits) DESC
+           LIMIT 3
+         )
+       ), '') AS feed_summary,
+       COALESCE((
+         SELECT m2.decision
+         FROM threat_intel_matches m2
+         WHERE m2.ip = m.ip
+         ORDER BY m2.last_seen_at DESC
+         LIMIT 1
+       ), 'monitor_observe') AS latest_decision,
        MAX(m.last_seen_at),
        CASE WHEN b.ip IS NULL THEN 0 ELSE 1 END AS blocked,
        CASE WHEN a.ip IS NULL THEN 0 ELSE 1 END AS allowlisted,
@@ -2560,7 +2690,7 @@ WHERE m.last_seen_at >= ? AND b.ip IS NULL
 GROUP BY m.ip, b.ip, a.ip
 HAVING SUM(m.hits) >= ?
 ORDER BY total_hits DESC, MAX(m.last_seen_at) DESC
-LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), now, offenderMinHits, limit, offset)
+LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), since.UTC().Format(time.RFC3339Nano), now, offenderMinHits, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2568,11 +2698,12 @@ LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), now, offenderMinHits, l
 	out := []model.ThreatIntelOffender{}
 	for rows.Next() {
 		var o model.ThreatIntelOffender
-		var decisions, last string
+		var feedSummary, decisions, last string
 		var blocked, allowlisted int
-		if err := rows.Scan(&o.IP, &o.TotalHits, &o.DistinctFeeds, &o.DistinctHosts, &decisions, &last, &blocked, &allowlisted, &o.XP, &o.Level, &o.Tier, &o.RiskState); err != nil {
+		if err := rows.Scan(&o.IP, &o.TotalHits, &o.DistinctFeeds, &o.DistinctHosts, &feedSummary, &decisions, &last, &blocked, &allowlisted, &o.XP, &o.Level, &o.Tier, &o.RiskState); err != nil {
 			return nil, 0, err
 		}
+		o.FeedSummary = strings.TrimSpace(feedSummary)
 		o.Decisions = decisions
 		o.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
 		o.Blocked = blocked != 0
@@ -2620,6 +2751,8 @@ SELECT b.ip,
            LIMIT 3
          )
        ), '') AS history_snippet,
+       b.created_at,
+       COALESCE(MAX(s.ban_until), '') AS blocked_until,
        b.updated_at,
        COALESCE(SUM(m.hits), 0) AS total_hits,
        COUNT(DISTINCT m.feed) AS distinct_feeds,
@@ -2641,7 +2774,7 @@ FROM blocked_ips b
 LEFT JOIN threat_intel_matches m ON m.ip = b.ip AND m.last_seen_at >= ?
 LEFT JOIN threat_intel_ip_state s ON s.ip = b.ip
 WHERE `+strings.Join(where, " AND ")+`
-GROUP BY b.ip, b.reason, b.updated_at
+GROUP BY b.ip, b.reason, b.created_at, b.updated_at
 ORDER BY b.updated_at DESC, total_hits DESC
 LIMIT ? OFFSET ?`, queryArgs...)
 	if err != nil {
@@ -2651,14 +2784,14 @@ LIMIT ? OFFSET ?`, queryArgs...)
 	out := []model.ThreatIntelBlocked{}
 	for rows.Next() {
 		var b model.ThreatIntelBlocked
-		var updated, last string
-		if err := rows.Scan(&b.IP, &b.Reason, &b.History, &updated, &b.TotalHits, &b.DistinctFeeds, &b.DistinctHosts, &last, &b.XP, &b.Level, &b.Tier, &b.RiskState); err != nil {
+		var blockedOn, blockedUntil, updated, last string
+		if err := rows.Scan(&b.IP, &b.Reason, &b.History, &blockedOn, &blockedUntil, &updated, &b.TotalHits, &b.DistinctFeeds, &b.DistinctHosts, &last, &b.XP, &b.Level, &b.Tier, &b.RiskState); err != nil {
 			return nil, 0, err
 		}
-		b.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
-		if strings.TrimSpace(last) != "" {
-			b.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
-		}
+		b.BlockedOn = parseTimeOrZero(blockedOn)
+		b.BlockedUntil = parseTimeOrZero(blockedUntil)
+		b.UpdatedAt = parseTimeOrZero(updated)
+		b.LastSeenAt = parseTimeOrZero(last)
 		out = append(out, b)
 	}
 	if err := rows.Err(); err != nil {
@@ -2739,11 +2872,7 @@ func parseNullableTime(v sql.NullString) time.Time {
 	if !v.Valid || strings.TrimSpace(v.String) == "" {
 		return time.Time{}
 	}
-	t, err := time.Parse(time.RFC3339Nano, v.String)
-	if err != nil {
-		return time.Time{}
-	}
-	return t
+	return parseTimeOrZero(v.String)
 }
 
 func parseTimeOrZero(v string) time.Time {
@@ -2751,11 +2880,17 @@ func parseTimeOrZero(v string) time.Time {
 	if v == "" {
 		return time.Time{}
 	}
-	t, err := time.Parse(time.RFC3339Nano, v)
-	if err != nil {
-		return time.Time{}
+	layouts := []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05",
 	}
-	return t
+	for _, layout := range layouts {
+		t, err := time.Parse(layout, v)
+		if err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 func (s *Store) UpsertSSHBastionRoute(ctx context.Context, in model.SSHBastionRoute) (model.SSHBastionRoute, error) {

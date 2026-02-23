@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/domnexdomain/domnexdomain/internal/crypto"
+	"github.com/domnexdomain/domnexdomain/internal/mfa"
 	"github.com/domnexdomain/domnexdomain/internal/model"
 	"github.com/domnexdomain/domnexdomain/internal/store"
 )
@@ -32,12 +34,15 @@ type Store interface {
 	ClearLoginFailures(ctx context.Context, username string) error
 	GetUserDomainIDs(ctx context.Context, userID int64) ([]int64, error)
 	IsIPBlocked(ctx context.Context, ip string) (bool, error)
+	ConsumeUserMFARecoveryCode(ctx context.Context, userID int64, codeHash string) (bool, error)
+	GetSetting(ctx context.Context, key string) (string, error)
 }
 
 type Service struct {
 	store      Store
 	sessionTTL time.Duration
 	allowed    []*net.IPNet
+	keystore   *crypto.Keystore
 }
 
 type Identity struct {
@@ -49,7 +54,7 @@ type Identity struct {
 	Type      string          `json:"type"`
 }
 
-func New(store Store, sessionTTL time.Duration, allowedCIDRs []string) (*Service, error) {
+func New(store Store, ks *crypto.Keystore, sessionTTL time.Duration, allowedCIDRs []string) (*Service, error) {
 	allowed := make([]*net.IPNet, 0, len(allowedCIDRs))
 	for _, c := range allowedCIDRs {
 		_, network, err := net.ParseCIDR(c)
@@ -58,10 +63,10 @@ func New(store Store, sessionTTL time.Duration, allowedCIDRs []string) (*Service
 		}
 		allowed = append(allowed, network)
 	}
-	return &Service{store: store, sessionTTL: sessionTTL, allowed: allowed}, nil
+	return &Service{store: store, keystore: ks, sessionTTL: sessionTTL, allowed: allowed}, nil
 }
 
-func (s *Service) AuthenticatePassword(ctx context.Context, username, password, source string) (string, model.User, error) {
+func (s *Service) AuthenticatePassword(ctx context.Context, username, password, otpOrRecovery, source string) (string, model.User, error) {
 	failErr := errors.New("login failed")
 	if strings.TrimSpace(source) == "" {
 		source = "n/a"
@@ -98,6 +103,19 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "ip_policy_denied;" + detail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
 		return "", model.User{}, failErr
 	}
+	if required, mfaDetail := s.userRequiresMFA(ctx, u); required {
+		if !u.MFAEnabled {
+			fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
+			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "mfa_required_not_enrolled;" + mfaDetail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
+			return "", model.User{}, failErr
+		}
+		ok, detail := s.validateMFA(ctx, u, otpOrRecovery)
+		if !ok {
+			fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
+			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "mfa_failed;" + detail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
+			return "", model.User{}, failErr
+		}
+	}
 	_ = s.store.ClearLoginFailures(ctx, username)
 	sid, err := randomHex(32)
 	if err != nil {
@@ -107,8 +125,55 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 	if err := s.store.CreateSession(ctx, sid, u.ID, expires); err != nil {
 		return "", model.User{}, err
 	}
-	_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: u.Username, Action: "auth.login.success", Target: "session", Meta: "password;source=" + source})
+	_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: u.Username, Action: "auth.login.success", Target: "session", Meta: "password+mfa;source=" + source})
 	return sid, u, nil
+}
+
+func (s *Service) userRequiresMFA(ctx context.Context, u model.User) (bool, string) {
+	if u.MFAEnabled {
+		return true, "user_enrolled"
+	}
+	key := ""
+	switch u.Role {
+	case model.RoleAdmin:
+		key = "auth.mfa.enforce_admin"
+	case model.RoleDomainAdmin:
+		key = "auth.mfa.enforce_domain_admin"
+	case model.RoleReadOnly:
+		key = "auth.mfa.enforce_read_only"
+	default:
+		return false, "role_not_enforced"
+	}
+	v, err := s.store.GetSetting(ctx, key)
+	if err != nil {
+		return false, "policy_unset"
+	}
+	if strings.EqualFold(strings.TrimSpace(v), "true") {
+		return true, "policy_enforced"
+	}
+	return false, "policy_not_enforced"
+}
+
+func (s *Service) validateMFA(ctx context.Context, u model.User, otpOrRecovery string) (bool, string) {
+	raw := strings.TrimSpace(otpOrRecovery)
+	if raw == "" {
+		return false, "missing_code"
+	}
+	if s.keystore != nil && strings.TrimSpace(u.MFASecretEnc) != "" {
+		secret, err := s.keystore.Decrypt(strings.TrimSpace(u.MFASecretEnc))
+		if err == nil && mfa.ValidateTOTP(secret, raw, time.Now().UTC()) {
+			return true, "totp_ok"
+		}
+	}
+	if mfa.IsRecoveryCodeFormat(raw) {
+		norm := mfa.NormalizeRecoveryCode(raw)
+		sum := sha256.Sum256([]byte(norm))
+		ok, err := s.store.ConsumeUserMFARecoveryCode(ctx, u.ID, hex.EncodeToString(sum[:]))
+		if err == nil && ok {
+			return true, "recovery_ok"
+		}
+	}
+	return false, "invalid_code"
 }
 
 func (s *Service) ResolveIdentity(r *http.Request) (Identity, error) {
@@ -144,7 +209,11 @@ func (s *Service) ResolveIdentity(r *http.Request) (Identity, error) {
 
 func (s *Service) isSourceAllowedForUser(u model.User, source string) (bool, string) {
 	if u.IPCheckOff {
-		return true, "ip_check_disabled=1"
+		if u.MFAEnabled {
+			return true, "ip_check_disabled=1;mfa_enabled=1"
+		}
+		// Security guard: IP-check bypass is only valid for MFA-enabled users.
+		// If MFA is not enabled, continue with normal CIDR policy evaluation.
 	}
 	ip := net.ParseIP(strings.TrimSpace(source))
 	if ip == nil {

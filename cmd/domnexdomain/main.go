@@ -22,6 +22,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/dns"
 	"github.com/domnexdomain/domnexdomain/internal/logx"
 	"github.com/domnexdomain/domnexdomain/internal/metrics"
+	"github.com/domnexdomain/domnexdomain/internal/model"
 	"github.com/domnexdomain/domnexdomain/internal/proxy"
 	"github.com/domnexdomain/domnexdomain/internal/store"
 	"github.com/domnexdomain/domnexdomain/internal/traffic"
@@ -47,6 +48,31 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
+
+	if len(os.Args) >= 3 && strings.EqualFold(strings.TrimSpace(os.Args[1]), "mfa-reset") {
+		username := strings.TrimSpace(os.Args[2])
+		if username == "" {
+			fmt.Fprintln(os.Stderr, "usage: domnexdomain mfa-reset <username>")
+			os.Exit(2)
+		}
+		u, err := st.FindUserByUsername(context.Background(), username)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mfa-reset failed: %v\n", err)
+			os.Exit(1)
+		}
+		if err := st.ResetUserMFA(context.Background(), u.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "mfa-reset failed: %v\n", err)
+			os.Exit(1)
+		}
+		_ = st.AddAuditEvent(context.Background(), model.AuditEvent{
+			Actor:  "local-cli",
+			Action: "user.mfa.reset.breakglass",
+			Target: username,
+			Meta:   "local-cli",
+		})
+		fmt.Printf("MFA reset for user %q completed.\n", username)
+		return
+	}
 
 	ks, err := crypto.LoadOrCreateKey(cfg.SecretKeyPath)
 	if err != nil {
@@ -100,7 +126,7 @@ func main() {
 		})
 	}
 
-	authSvc, err := auth.New(st, cfg.SessionTTL, cfg.AllowedCIDRs)
+	authSvc, err := auth.New(st, ks, cfg.SessionTTL, cfg.AllowedCIDRs)
 	if err != nil {
 		log.Error("auth init failed", map[string]any{"err": err.Error()})
 		os.Exit(1)

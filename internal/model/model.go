@@ -17,6 +17,9 @@ type User struct {
 	Role         Role      `json:"role"`
 	AllowedCIDRs string    `json:"allowedCidrs"`
 	IPCheckOff   bool      `json:"ipCheckOff"`
+	MFAEnabled   bool      `json:"mfaEnabled"`
+	MFASecretEnc string    `json:"-"`
+	MFAEnrolled  time.Time `json:"mfaEnrolledAt"`
 	PasswordHash string    `json:"-"`
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`
@@ -212,6 +215,7 @@ type ThreatIntelOffender struct {
 	TotalHits     int64     `json:"totalHits"`
 	DistinctFeeds int64     `json:"distinctFeeds"`
 	DistinctHosts int64     `json:"distinctHosts"`
+	FeedSummary   string    `json:"feedSummary"`
 	Decisions     string    `json:"decisions"`
 	LastSeenAt    time.Time `json:"lastSeenAt"`
 	Blocked       bool      `json:"blocked"`
@@ -226,6 +230,8 @@ type ThreatIntelBlocked struct {
 	IP            string    `json:"ip"`
 	Reason        string    `json:"reason"`
 	History       string    `json:"history"`
+	BlockedOn     time.Time `json:"blockedOn"`
+	BlockedUntil  time.Time `json:"blockedUntil"`
 	UpdatedAt     time.Time `json:"updatedAt"`
 	TotalHits     int64     `json:"totalHits"`
 	DistinctFeeds int64     `json:"distinctFeeds"`

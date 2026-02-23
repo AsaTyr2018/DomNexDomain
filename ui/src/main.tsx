@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import QRCode from 'qrcode';
 
 type Identity = { username: string; role: string; type: string };
 type Domain = { id: number; name: string; dnsMode?: string; certMode?: string; provider?: string; zoneId?: string; status?: string };
@@ -16,7 +17,8 @@ type LogServerHTTPSettings = { enabled: boolean; url: string; timeoutSec: number
 type LogServerTCPJSONSettings = { enabled: boolean; address: string; timeoutSec: number; minLevel: 'info' | 'warn' | 'error' };
 type LogServerSettings = { syslog: LogServerSyslogSettings; http: LogServerHTTPSettings; tcpJson: LogServerTCPJSONSettings };
 type RetentionPolicy = { auditDays: number; trafficDays: number; visitorsDays: number; threatDays: number; blockedDays: number; loginAttemptDays: number; passwordResetDays: number };
-type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean; retention?: RetentionPolicy };
+type MFAPolicy = { enforceAdmin: boolean; enforceDomainAdmin: boolean; enforceReadOnly: boolean };
+type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean; retention?: RetentionPolicy; mfaPolicy?: MFAPolicy };
 type SetupStatus = { initialized: boolean; locked: boolean; unlocked: boolean; restoreReady?: boolean; otsExpiresAt?: string; unlockUntil?: string; cooldownUntil?: string };
 type SetupBackupMeta = { fileName: string; format: string; createdAt: string; domnexVersion: string; domains: number; subdomains: number; users: number };
 type BackupMeta = SetupBackupMeta & { dbSha256?: string; keySha256?: string };
@@ -59,6 +61,8 @@ type ManagedUser = {
   domainIds: number[];
   allowedCidrs?: string;
   ipCheckDisabled?: boolean;
+  mfaEnabled?: boolean;
+  mfaEnrolledAt?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -117,8 +121,8 @@ type ThreatIntelConfig = {
 type ThreatIntelFeed = { id: number; name: string; url: string; enabled: boolean; isDefault?: boolean; entryCount?: number; lastSyncAt?: string; lastError?: string; lastHash?: string; createdAt?: string; updatedAt?: string };
 type ThreatIntelMatch = { id: number; ip: string; feed: string; host: string; path: string; targetCount?: number; country: string; mode: string; decision: string; hits: number; firstSeenAt: string; lastSeenAt: string; lastTraceId?: string; sourceScope?: string; xp?: number; level?: number; tier?: string; riskState?: string };
 type ThreatIntelTarget = { host: string; path: string; feed: string; decision: string; hits: number; lastSeenAt: string };
-type ThreatIntelOffender = { ip: string; totalHits: number; distinctFeeds: number; distinctHosts: number; decisions: string; lastSeenAt: string; blocked: boolean; allowlisted: boolean; xp?: number; level?: number; tier?: string; riskState?: string };
-type ThreatIntelBlocked = { ip: string; reason?: string; history?: string; updatedAt: string; totalHits: number; distinctFeeds: number; distinctHosts: number; lastSeenAt?: string; xp?: number; level?: number; tier?: string; riskState?: string };
+type ThreatIntelOffender = { ip: string; totalHits: number; distinctFeeds: number; distinctHosts: number; feedSummary?: string; decisions: string; lastSeenAt: string; blocked: boolean; allowlisted: boolean; xp?: number; level?: number; tier?: string; riskState?: string };
+type ThreatIntelBlocked = { ip: string; reason?: string; history?: string; blockedOn?: string; blockedUntil?: string; updatedAt: string; totalHits: number; distinctFeeds: number; distinctHosts: number; lastSeenAt?: string; xp?: number; level?: number; tier?: string; riskState?: string };
 type ThreatIntelMatchesPage = { items: ThreatIntelMatch[]; total: number; page: number; pageSize: number };
 type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; page: number; pageSize: number };
 type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
@@ -138,9 +142,12 @@ type DashboardWidget = { id: string; type: DashboardWidgetType; w: number; h: nu
 type DashboardUserTab = { id: string; name: string; widgets: DashboardWidget[] };
 type DashboardLayout = { version: number; tabs: DashboardUserTab[] };
 type MeProfile = { email: string; dashboardLayout?: DashboardLayout };
+type MFAStatus = { enabled: boolean; requiredByPolicy: boolean; enrolledAt?: string; recoveryCodesRemaining: number };
+type MFAEnrollStart = { secret: string; otpAuthUri: string; issuer: string; account: string; startedAt: string };
+type MFAEnrollConfirm = { enabled: boolean; enrolledAt?: string; recoveryCodes: string[] };
 
 type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'ssh' | 'audit' | 'account' | 'accessControl' | 'integrations' | 'help';
-type SettingsTab = 'general' | 'security' | 'logservers' | 'appearance' | 'advanced';
+type SettingsTab = 'general' | 'security' | 'mfa' | 'logservers' | 'appearance' | 'advanced';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
 type PublicStyle = { styleProfile?: string; styleCustom?: string };
@@ -534,6 +541,7 @@ function App() {
 
   const [loginUser, setLoginUser] = useState('admin');
   const [loginPass, setLoginPass] = useState('');
+  const [loginOTP, setLoginOTP] = useState('');
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
   const [setupMode, setSetupMode] = useState<'fresh' | 'restore'>('fresh');
   const [setupStep, setSetupStep] = useState(1);
@@ -619,6 +627,7 @@ function App() {
   const [settingsLogServers, setSettingsLogServers] = useState<LogServerSettings>(defaultLogServers());
   const [settingsLogHTTPBearer, setSettingsLogHTTPBearer] = useState('');
   const [settingsRetention, setSettingsRetention] = useState<RetentionPolicy>(defaultRetentionPolicy());
+  const [settingsMFAPolicy, setSettingsMFAPolicy] = useState<MFAPolicy>({ enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
   const [backupPassphrase, setBackupPassphrase] = useState('');
   const [backupRestorePassphrase, setBackupRestorePassphrase] = useState('');
   const [backupRestoreConfirm, setBackupRestoreConfirm] = useState('');
@@ -672,6 +681,13 @@ function App() {
   const [selfCurrentPassword, setSelfCurrentPassword] = useState('');
   const [selfNewPassword, setSelfNewPassword] = useState('');
   const [selfConfirmPassword, setSelfConfirmPassword] = useState('');
+  const [selfMFAStatus, setSelfMFAStatus] = useState<MFAStatus | null>(null);
+  const [selfMFAStart, setSelfMFAStart] = useState<MFAEnrollStart | null>(null);
+  const [selfMFAQRDataURL, setSelfMFAQRDataURL] = useState('');
+  const [selfMFAConfirmCode, setSelfMFAConfirmCode] = useState('');
+  const [selfMFARecoveryCodes, setSelfMFARecoveryCodes] = useState<string[]>([]);
+  const [selfMFADisablePassword, setSelfMFADisablePassword] = useState('');
+  const [selfMFADisableCode, setSelfMFADisableCode] = useState('');
   const [deleteHostDialogOpen, setDeleteHostDialogOpen] = useState(false);
   const [deleteHostID, setDeleteHostID] = useState<number | null>(null);
   const [deleteHostLabel, setDeleteHostLabel] = useState('');
@@ -720,6 +736,12 @@ function App() {
       await api('/api/v1/csrf');
       const me = await api<{ identity: Identity }>('/api/v1/me');
       setIdentity(me.identity);
+      try {
+        const ms = await api<MFAStatus>('/api/v1/me/mfa/status');
+        setSelfMFAStatus(ms);
+      } catch {
+        setSelfMFAStatus(null);
+      }
       try {
         const profile = await api<MeProfile>('/api/v1/me/profile');
         setSelfNotifyEmail((profile.email || '').trim());
@@ -809,6 +831,7 @@ function App() {
         setSettingsTimeSyncLAN((s.timeSyncLANServers || []).join(', '));
         setSettingsLogServers(s.logServers || defaultLogServers());
         setSettingsRetention(s.retention || defaultRetentionPolicy());
+        setSettingsMFAPolicy(s.mfaPolicy || { enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
       } catch {
         setSettings(null);
         setSettingsPublicIPv4('');
@@ -819,6 +842,7 @@ function App() {
         setSettingsTimeSyncLAN('');
         setSettingsLogServers(defaultLogServers());
         setSettingsRetention(defaultRetentionPolicy());
+        setSettingsMFAPolicy({ enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
       }
       try {
         const b = await api<BackupScheduleSettings>('/api/v1/backup/settings');
@@ -1038,15 +1062,35 @@ function App() {
     setTiPage(1);
   }, [tiHours, tiDecision, tiQuery, tiView, tiPageSize]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const uri = selfMFAStart?.otpAuthUri?.trim() || '';
+    if (!uri) {
+      setSelfMFAQRDataURL('');
+      return;
+    }
+    void QRCode.toDataURL(uri, { margin: 1, width: 220 })
+      .then((url) => {
+        if (!cancelled) setSelfMFAQRDataURL(url);
+      })
+      .catch(() => {
+        if (!cancelled) setSelfMFAQRDataURL('');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selfMFAStart?.otpAuthUri]);
+
   const login = async () => {
     setLoading(true);
     setError('');
     try {
       await api('/api/v1/login', {
         method: 'POST',
-        body: JSON.stringify({ username: loginUser, password: loginPass }),
+        body: JSON.stringify({ username: loginUser, password: loginPass, otp: loginOTP }),
       });
       setLoginPass('');
+      setLoginOTP('');
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -2371,6 +2415,7 @@ function App() {
           logServers: settingsLogServers,
           logHttpBearer: settingsLogHTTPBearer,
           retention: settingsRetention,
+          mfaPolicy: settingsMFAPolicy,
         }),
       });
       setSettingsCFToken('');
@@ -2706,6 +2751,10 @@ function App() {
 
   const createUser = async () => {
     if (isReadOnlyRole) return;
+    if (newUserIPCheckDisabled) {
+      setError('Disable IP check is allowed only after MFA is enabled for this user.');
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -2753,6 +2802,10 @@ function App() {
   const saveUserEdit = async () => {
     if (isReadOnlyRole) return;
     if (!editUserID) return;
+    if (editUserIPCheckDisabled && !editingUser?.mfaEnabled) {
+      setError('Disable IP check requires MFA enabled for this user.');
+      return;
+    }
     if (editUserRole === 'domain-admin' && editUserDomainIDs.length === 0) {
       setError('Domain-admin requires at least one domain assignment.');
       return;
@@ -2806,6 +2859,90 @@ function App() {
       setSelfCurrentPassword('');
       setSelfNewPassword('');
       setSelfConfirmPassword('');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const startOwnMFAEnroll = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<MFAEnrollStart>('/api/v1/me/mfa/enroll/start', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      setSelfMFAQRDataURL('');
+      setSelfMFAStart(out);
+      setSelfMFAConfirmCode('');
+      setSelfMFARecoveryCodes([]);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const confirmOwnMFAEnroll = async () => {
+    if (!selfMFAConfirmCode.trim()) return;
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<MFAEnrollConfirm>('/api/v1/me/mfa/enroll/confirm', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ otp: selfMFAConfirmCode.trim() }),
+      });
+      setSelfMFARecoveryCodes(out.recoveryCodes || []);
+      setSelfMFAStart(null);
+      setSelfMFAQRDataURL('');
+      setSelfMFAConfirmCode('');
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const disableOwnMFA = async () => {
+    if (!selfMFADisablePassword || !selfMFADisableCode) return;
+    setLoading(true);
+    setError('');
+    try {
+      await api('/api/v1/me/mfa/disable', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({ currentPassword: selfMFADisablePassword, code: selfMFADisableCode }),
+      });
+      setSelfMFADisablePassword('');
+      setSelfMFADisableCode('');
+      setSelfMFAStart(null);
+      setSelfMFAQRDataURL('');
+      setSelfMFARecoveryCodes([]);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const adminResetUserMFA = async (id: number) => {
+    if (isReadOnlyRole) return;
+    const ok = window.confirm('Reset MFA for this user? This will also force IP check back on.');
+    if (!ok) return;
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/users/${id}/mfa/reset`, {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      await refresh();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -2977,7 +3114,7 @@ function App() {
     setEditUserDomainIDs([...(u.domainIds || [])]);
     setEditUserPassword('');
     setEditUserAllowedCIDRs((u.allowedCidrs || '').trim());
-    setEditUserIPCheckDisabled(!!u.ipCheckDisabled);
+    setEditUserIPCheckDisabled(!!u.ipCheckDisabled && !!u.mfaEnabled);
   };
 
   const closeEditUserDialog = () => {
@@ -3647,7 +3784,7 @@ function App() {
                             <th>Targets</th>
                             <th>Country</th>
                             <th>Trace</th>
-                            <th>Actions</th>
+                            <th>Action</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -3669,10 +3806,7 @@ function App() {
                               <td>{m.country || 'ZZ'}</td>
                               <td><code>{m.lastTraceId || '-'}</code></td>
                               <td>
-                                <div className="row" style={{ marginBottom: 0 }}>
-                                  <button className="btn danger" onClick={() => threatIntelBlockIP(m.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Block</button>
-                                  <button className="btn" onClick={() => threatIntelAllowIP(m.ip, 'allow from threat events')} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Allow</button>
-                                </div>
+                                <button className="btn danger" onClick={() => threatIntelBlockIP(m.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Block</button>
                               </td>
                             </tr>
                           ))}
@@ -3686,6 +3820,7 @@ function App() {
                             <th>Hits</th>
                             <th>Feeds</th>
                             <th>Hosts</th>
+                            <th className="ti-feed-col">Feed Breakdown</th>
                             <th>Decision</th>
                             <th className="ti-tier-col">Tier</th>
                             <th>Last Seen</th>
@@ -3694,27 +3829,25 @@ function App() {
                         </thead>
                         <tbody>
                           {tiOffenders.length === 0 ? (
-                            <tr><td colSpan={8} className="muted">No burst offenders ({'>='}{tiConfig.offenderMinHits || 10} hits) in current filter.</td></tr>
+                            <tr><td colSpan={9} className="muted">No burst offenders ({'>='}{tiConfig.offenderMinHits || 10} hits) in current filter.</td></tr>
                           ) : tiOffenders.map((o) => (
                             <tr key={`ti-off-${o.ip}`}>
                               <td><code>{o.ip}</code></td>
                               <td>{o.totalHits}</td>
                               <td>{o.distinctFeeds}</td>
                               <td>{o.distinctHosts}</td>
+                              <td className="ti-feed-col">{o.feedSummary || '-'}</td>
                               <td>
-                                <div className="row" style={{ marginBottom: 0 }}>
-                                  {threatDecisionList(o.decisions).map((d) => {
-                                    const b = threatDecisionBadge(d);
-                                    return <span key={`${o.ip}-${d}`} className={`badge ${b.cls}`}>{b.label}</span>;
-                                  })}
-                                </div>
+                                {(() => {
+                                  const b = threatOffenderDecisionBadge(o.decisions);
+                                  return <span className={`badge ${b.cls}`}>{b.label}</span>;
+                                })()}
                               </td>
                               <td className="ti-tier-col"><span className={`badge ${o.riskState === 'hardblock' ? 'err' : o.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(o.tier || 'tier0').toUpperCase()} · L{o.level || 0} · XP {o.xp || 0}</span></td>
                               <td>{new Date(o.lastSeenAt).toLocaleString()}</td>
                               <td>
                                 <div className="row" style={{ marginBottom: 0 }}>
                                   <button className="btn danger" onClick={() => threatIntelBlockIP(o.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Block</button>
-                                  <button className="btn" onClick={() => threatIntelAllowIP(o.ip, 'allow from offender list')} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Allow</button>
                                   {o.allowlisted ? <span className="badge ok">allowlisted</span> : null}
                                 </div>
                               </td>
@@ -4283,6 +4416,7 @@ function App() {
                   <div className="wizard-steps" style={{ marginBottom: '.75rem' }}>
                     <button className={settingsTab === 'general' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('general')}>General</button>
                     <button className={settingsTab === 'security' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('security')}>Security &amp; Time</button>
+                    <button className={settingsTab === 'mfa' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('mfa')}>MFA</button>
                     <button className={settingsTab === 'logservers' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('logservers')}>Logservers</button>
                     <button className={settingsTab === 'appearance' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('appearance')}>Appearance</button>
                     <button className={settingsTab === 'advanced' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('advanced')}>Advanced</button>
@@ -4388,6 +4522,52 @@ function App() {
                           <button className="btn" onClick={saveThreatIntelConfig} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Save Threat Intel Policy</button>
                         </div>
                         {tiConfigSavedAt ? <div className="muted" style={{ marginTop: '.5rem' }}>Policy saved: {new Date(tiConfigSavedAt).toLocaleString()}</div> : null}
+                      </div>
+                    </>
+                  ) : null}
+                  {settingsTab === 'mfa' ? (
+                    <>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>MFA Policy</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Global Admin</label>
+                            <label className="check">
+                              <input
+                                type="checkbox"
+                                checked={!!settingsMFAPolicy.enforceAdmin}
+                                onChange={(e) => setSettingsMFAPolicy((p) => ({ ...p, enforceAdmin: e.target.checked }))}
+                                disabled={isReadOnlyRole || identity?.role !== 'admin'}
+                              />
+                              Require MFA at login
+                            </label>
+                          </div>
+                          <div className="field">
+                            <label>Domain Admin</label>
+                            <label className="check">
+                              <input
+                                type="checkbox"
+                                checked={!!settingsMFAPolicy.enforceDomainAdmin}
+                                onChange={(e) => setSettingsMFAPolicy((p) => ({ ...p, enforceDomainAdmin: e.target.checked }))}
+                                disabled={isReadOnlyRole || identity?.role !== 'admin'}
+                              />
+                              Require MFA at login
+                            </label>
+                          </div>
+                          <div className="field">
+                            <label>Read Only</label>
+                            <label className="check">
+                              <input
+                                type="checkbox"
+                                checked={!!settingsMFAPolicy.enforceReadOnly}
+                                onChange={(e) => setSettingsMFAPolicy((p) => ({ ...p, enforceReadOnly: e.target.checked }))}
+                                disabled={isReadOnlyRole || identity?.role !== 'admin'}
+                              />
+                              Require MFA at login
+                            </label>
+                          </div>
+                        </div>
+                        <div className="muted">When enforced, users in that role must enroll MFA before successful login.</div>
                       </div>
                     </>
                   ) : null}
@@ -4849,16 +5029,20 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                                   : 'global'}
                               </td>
                               <td>
-                                {u.ipCheckDisabled ? (
-                                  <span className="badge warn">IP check disabled</span>
-                                ) : (
-                                  <span className="muted">{(u.allowedCidrs || '').trim() || 'default CIDR policy'}</span>
-                                )}
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '.25rem' }}>
+                                  {u.ipCheckDisabled ? (
+                                    <span className="badge warn">IP check disabled</span>
+                                  ) : (
+                                    <span className="muted">{(u.allowedCidrs || '').trim() || 'default CIDR policy'}</span>
+                                  )}
+                                  <span className={`badge ${u.mfaEnabled ? 'ok' : 'warn'}`}>{u.mfaEnabled ? 'MFA enabled' : 'MFA disabled'}</span>
+                                </div>
                               </td>
                               <td>{formatDateTime(u.updatedAt)}</td>
                               <td>
                                 <div className="row" style={{ marginBottom: 0 }}>
                                   <button className="btn ghost" onClick={() => openEditUserDialog(u)} disabled={loading || isCurrentUser || isReadOnlyRole}>Edit</button>
+                                  <button className="btn ghost" onClick={() => adminResetUserMFA(u.id)} disabled={loading || isCurrentUser || isReadOnlyRole || !u.mfaEnabled}>Reset MFA</button>
                                   <button className="btn danger" onClick={() => deleteUser(u.id)} disabled={loading || isCurrentUser || isReadOnlyRole}>Delete</button>
                                 </div>
                               </td>
@@ -4994,6 +5178,77 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                   <div className="row" style={{ marginBottom: 0 }}>
                     <button className="btn" onClick={changeOwnPassword} disabled={loading || selfNewPassword.length < 10 || selfNewPassword !== selfConfirmPassword}>Save Password</button>
                   </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Personal MFA Settings</h3></div>
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>Status</label>
+                      <div>
+                        <span className={`badge ${selfMFAStatus?.enabled ? 'ok' : 'warn'}`}>{selfMFAStatus?.enabled ? 'Enabled' : 'Disabled'}</span>
+                        {selfMFAStatus?.requiredByPolicy ? <span className="badge err" style={{ marginLeft: '.4rem' }}>Required by policy</span> : null}
+                      </div>
+                      <div className="muted">Recovery codes left: {String(selfMFAStatus?.recoveryCodesRemaining ?? 0)}</div>
+                    </div>
+                    <div className="field">
+                      <label>Enroll</label>
+                      <button className="btn" onClick={startOwnMFAEnroll} disabled={loading}>Start Enrollment</button>
+                    </div>
+                  </div>
+                  {selfMFAStart ? (
+                    <div className="card" style={{ marginBottom: '.6rem' }}>
+                      <div className="muted">Use the secret/URI in your authenticator app, then confirm with a 6-digit code.</div>
+                      {selfMFAQRDataURL ? (
+                        <div style={{ margin: '.6rem 0', display: 'flex', justifyContent: 'center' }}>
+                          <img src={selfMFAQRDataURL} alt="MFA QR code" style={{ width: 220, height: 220, borderRadius: '12px', border: '1px solid var(--border)' }} />
+                        </div>
+                      ) : null}
+                      <div className="field-grid">
+                        <div className="field">
+                          <label>Secret</label>
+                          <input value={selfMFAStart.secret} readOnly />
+                        </div>
+                        <div className="field">
+                          <label>OTPAuth URI</label>
+                          <input value={selfMFAStart.otpAuthUri} readOnly />
+                        </div>
+                        <div className="field">
+                          <label>Verification Code</label>
+                          <input value={selfMFAConfirmCode} onChange={(e) => setSelfMFAConfirmCode(e.target.value)} placeholder="123456" />
+                        </div>
+                      </div>
+                      <div className="row" style={{ marginBottom: 0 }}>
+                        <button className="btn" onClick={confirmOwnMFAEnroll} disabled={loading || !selfMFAConfirmCode.trim()}>Confirm MFA</button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {selfMFARecoveryCodes.length > 0 ? (
+                    <div className="card" style={{ marginBottom: '.6rem' }}>
+                      <div className="card-head"><h3>Recovery Codes (shown once)</h3></div>
+                      <pre>{selfMFARecoveryCodes.join('\n')}</pre>
+                      <div className="row" style={{ marginBottom: 0 }}>
+                        <button className="btn" onClick={() => downloadTextFile(`domnex-mfa-recovery-${identity?.username || 'user'}.txt`, `${selfMFARecoveryCodes.join('\n')}\n`)} disabled={loading}>Download Recovery Codes</button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {selfMFAStatus?.enabled ? (
+                    <div className="card danger-zone">
+                      <div className="card-head"><h3>Disable MFA</h3></div>
+                      <div className="field-grid">
+                        <div className="field">
+                          <label>Current Password</label>
+                          <input type="password" value={selfMFADisablePassword} onChange={(e) => setSelfMFADisablePassword(e.target.value)} placeholder="Current password" />
+                        </div>
+                        <div className="field">
+                          <label>MFA or Recovery Code</label>
+                          <input value={selfMFADisableCode} onChange={(e) => setSelfMFADisableCode(e.target.value)} placeholder="123456 or recovery code" />
+                        </div>
+                      </div>
+                      <div className="row" style={{ marginBottom: 0 }}>
+                        <button className="btn danger" onClick={disableOwnMFA} disabled={loading || !selfMFADisablePassword || !selfMFADisableCode}>Disable MFA</button>
+                      </div>
+                    </div>
+                  ) : null}
                 </section>
               </div>
               <aside className="entity-side">
@@ -5374,6 +5629,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
             <div className="col">
               <input value={loginUser} onChange={(e) => setLoginUser(e.target.value)} placeholder="Username" />
               <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Password" />
+              <input value={loginOTP} onChange={(e) => setLoginOTP(e.target.value)} placeholder="MFA code (if enabled)" />
               <button className="btn" onClick={login} disabled={loading}>Login</button>
             </div>
           </div>
@@ -5425,9 +5681,10 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
               <div className="field">
                 <label>IP Policy</label>
                 <label className="check">
-                  <input type="checkbox" checked={newUserIPCheckDisabled} onChange={(e) => setNewUserIPCheckDisabled(e.target.checked)} />
-                  Disable IP check
+                  <input type="checkbox" checked={newUserIPCheckDisabled} onChange={(e) => setNewUserIPCheckDisabled(e.target.checked)} disabled />
+                  Disable IP check (requires MFA after user enrollment)
                 </label>
+                <div className="muted">Create user first, then enable MFA, then you can disable IP checks.</div>
               </div>
             </div>
             {newUserRole === 'domain-admin' ? (
@@ -5476,9 +5733,15 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
               <div className="field">
                 <label>IP Policy</label>
                 <label className="check">
-                  <input type="checkbox" checked={editUserIPCheckDisabled} onChange={(e) => setEditUserIPCheckDisabled(e.target.checked)} />
-                  Disable IP check
+                  <input
+                    type="checkbox"
+                    checked={editUserIPCheckDisabled}
+                    onChange={(e) => setEditUserIPCheckDisabled(e.target.checked)}
+                    disabled={!editingUser?.mfaEnabled}
+                  />
+                  Disable IP check (MFA required)
                 </label>
+                {!editingUser?.mfaEnabled ? <div className="muted">Enable MFA for this user first.</div> : null}
               </div>
             </div>
             {editUserRole === 'domain-admin' ? (
@@ -5600,12 +5863,12 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
 
       {identity && tiBlockedOpen ? (
         <div className="overlay modal-overlay">
-          <div className="login-card modal-card" style={{ maxWidth: '1150px', width: '96vw' }}>
+          <div className="login-card modal-card" style={{ maxWidth: '1080px', width: '96vw' }}>
             <div className="modal-head">
               <h3>Threat Intel Blocked Entries</h3>
             </div>
             <div className="row modal-controls">
-              <div className="muted">Consolidated blocked list with XP/Level/Tier state. Total blocked: {tiTotalBlocked}</div>
+              <div className="muted">Compact blocked list with timing + tier state. Total blocked: {tiTotalBlocked}</div>
               <button className="btn" onClick={openThreatIntelBlocked} disabled={loading}>Refresh</button>
               <button className="btn" onClick={() => setTiBlockedOpen(false)}>Close</button>
             </div>
@@ -5616,32 +5879,31 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
                     <tr>
                       <th>IP</th>
                       <th>Reason</th>
-                      <th>History</th>
                       <th>Hits</th>
-                      <th>Feeds</th>
-                      <th>Hosts</th>
+                      <th>Feed/Host</th>
                       <th className="ti-tier-col">Tier</th>
                       <th>Last Seen</th>
-                      <th>Blocked At</th>
+                      <th>Blocked On</th>
+                      <th>Blocked Until</th>
                       <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {tiBlocked.length === 0 ? (
-                      <tr><td colSpan={10} className="muted">No blocked entries in current filter.</td></tr>
+                      <tr><td colSpan={9} className="muted">No blocked entries in current filter.</td></tr>
                     ) : tiBlocked.map((b) => (
                       <tr key={`ti-blocked-${b.ip}`}>
                         <td><code>{b.ip}</code></td>
                         <td>{b.reason || '-'}</td>
-                        <td className="muted">{humanizeThreatDecisionText(b.history || '') || '-'}</td>
                         <td>{b.totalHits || 0}</td>
-                        <td>{b.distinctFeeds || 0}</td>
-                        <td>{b.distinctHosts || 0}</td>
+                        <td>{b.distinctFeeds || 0} / {b.distinctHosts || 0}</td>
                         <td className="ti-tier-col"><span className={`badge ${b.riskState === 'hardblock' ? 'err' : b.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(b.tier || 'tier0').toUpperCase()} · L{b.level || 0} · XP {b.xp || 0}</span></td>
-                        <td>{b.lastSeenAt ? new Date(b.lastSeenAt).toLocaleString() : '-'}</td>
-                        <td>{b.updatedAt ? new Date(b.updatedAt).toLocaleString() : '-'}</td>
+                        <td>{formatDateTime(b.lastSeenAt)}</td>
+                        <td>{formatDateTime(b.blockedOn || b.updatedAt)}</td>
+                        <td>{(b.blockedUntil && formatDateTime(b.blockedUntil) !== '-') ? formatDateTime(b.blockedUntil) : ((b.riskState || '').toLowerCase() === 'hardblock' ? 'Permanent' : '-')}</td>
                         <td>
                           <div className="row" style={{ marginBottom: 0 }}>
+                            <button className="btn" onClick={() => openThreatIntelTargets(b.ip)} disabled={loading}>Details</button>
                             <button className="btn danger" onClick={() => unblockIP(b.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Unblock</button>
                             <button className="btn" onClick={() => threatIntelAllowIP(b.ip, 'allow from blocked list')} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Allow</button>
                           </div>
@@ -6061,6 +6323,14 @@ function threatDecisionList(decisions: string): string[] {
     out.push(d);
   }
   return out.length > 0 ? out : ['monitor_observe'];
+}
+
+function threatOffenderDecisionBadge(decision: string): { cls: 'ok' | 'warn' | 'err'; label: string } {
+  const d = (decision || '').trim().toLowerCase();
+  if (d === 'soft_block_set' || d === 'soft_block_active') return { cls: 'warn', label: 'Soft block' };
+  if (d === 'hard_block_set' || d === 'hard_block_permanent') return { cls: 'err', label: 'Hard block' };
+  if (d === 'monitor_observe' || d === 'watch_boost') return { cls: 'ok', label: 'Monitoring' };
+  return threatDecisionBadge(d);
 }
 
 function humanizeThreatDecisionText(input: string): string {
