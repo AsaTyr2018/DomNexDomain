@@ -40,11 +40,12 @@ type Store interface {
 }
 
 type Service struct {
-	store      Store
-	sessionTTL time.Duration
-	allowed    []*net.IPNet
-	trusted    []*net.IPNet
-	keystore   *crypto.Keystore
+	store             Store
+	sessionTTL        time.Duration
+	allowed           []*net.IPNet
+	trusted           []*net.IPNet
+	keystore          *crypto.Keystore
+	dummyPasswordHash string
 }
 
 type Identity struct {
@@ -65,7 +66,18 @@ func New(store Store, ks *crypto.Keystore, sessionTTL time.Duration, allowedCIDR
 	if err != nil {
 		return nil, err
 	}
-	return &Service{store: store, keystore: ks, sessionTTL: sessionTTL, allowed: allowed, trusted: trusted}, nil
+	dummyPasswordHash, err := crypto.HashPassword("domnex-auth-burner", crypto.DefaultArgonConfig())
+	if err != nil {
+		return nil, err
+	}
+	return &Service{
+		store:             store,
+		keystore:          ks,
+		sessionTTL:        sessionTTL,
+		allowed:           allowed,
+		trusted:           trusted,
+		dummyPasswordHash: dummyPasswordHash,
+	}, nil
 }
 
 func (s *Service) AuthenticatePassword(ctx context.Context, username, password, otpOrRecovery, source string) (string, model.User, error) {
@@ -74,6 +86,7 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 		source = "n/a"
 	}
 	if blocked, err := s.store.IsIPBlocked(ctx, source); err == nil && blocked {
+		s.burnPasswordCheck(password)
 		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.blocked_ip", Target: "user", Meta: "source=" + source})
 		return "", model.User{}, failErr
 	}
@@ -82,6 +95,7 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 		return "", model.User{}, err
 	}
 	if failed > 0 && lockUntil.After(time.Now().UTC()) {
+		s.burnPasswordCheck(password)
 		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.locked", Target: "user", Meta: "lock_until=" + lockUntil.Format(time.RFC3339) + ";source=" + source})
 		return "", model.User{}, failErr
 	}
@@ -89,6 +103,7 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 	u, err := s.store.FindUserByUsername(ctx, username)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			s.burnPasswordCheck(password)
 			fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
 			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "unknown_user;failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
 			return "", model.User{}, failErr
@@ -129,6 +144,13 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 	}
 	_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: u.Username, Action: "auth.login.success", Target: "session", Meta: "password+mfa;source=" + source})
 	return sid, u, nil
+}
+
+func (s *Service) burnPasswordCheck(password string) {
+	if strings.TrimSpace(s.dummyPasswordHash) == "" {
+		return
+	}
+	_ = crypto.VerifyPassword(password, s.dummyPasswordHash)
 }
 
 func (s *Service) userRequiresMFA(ctx context.Context, u model.User) (bool, string) {

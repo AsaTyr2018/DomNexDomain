@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -42,11 +43,13 @@ type Server struct {
 	metrics *metrics.Collector
 	live    *traffic.LiveHub
 	trusted []*net.IPNet
+	loginMu sync.Mutex
+	login   map[string]loginFlow
 }
 
 func New(appSvc *app.Service, authSvc *auth.Service, log *logx.Logger, m *metrics.Collector, live *traffic.LiveHub, trustedProxyCIDRs []string) *Server {
 	trusted, _ := netutil.ParseCIDRs(trustedProxyCIDRs)
-	return &Server{app: appSvc, auth: authSvc, log: log, metrics: m, live: live, trusted: trusted}
+	return &Server{app: appSvc, auth: authSvc, log: log, metrics: m, live: live, trusted: trusted, login: map[string]loginFlow{}}
 }
 
 func (s *Server) Router() http.Handler {
@@ -64,7 +67,9 @@ func (s *Server) Router() http.Handler {
 	r.Post("/api/v1/setup/restore/upload", s.handleSetupRestoreUpload)
 	r.Post("/api/v1/setup/restore/analyze", s.handleSetupRestoreAnalyze)
 	r.Post("/api/v1/setup/apply", s.handleSetupApply)
-	r.Post("/api/v1/login", s.handleLogin)
+	r.Post("/api/v1/login/start", s.handleLoginStart)
+	r.Post("/api/v1/login/password", s.handleLoginPassword)
+	r.Post("/api/v1/login/finish", s.handleLoginFinish)
 	r.Post("/api/v1/password-reset/consume", s.handleConsumePasswordReset)
 
 	r.Group(func(pr chi.Router) {
@@ -651,24 +656,97 @@ func (s *Server) handlePublicStyle(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
-		Password string `json:"password"`
-		OTP      string `json:"otp"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	token, err := randomHex(24)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "login failed")
+		return
+	}
+	now := time.Now().UTC()
 	source := s.auth.SourceIP(r)
-	sid, user, err := s.auth.AuthenticatePassword(r.Context(), in.Username, in.Password, in.OTP, source)
+	s.loginMu.Lock()
+	s.pruneLoginFlowsLocked(now)
+	s.login[token] = loginFlow{
+		Username: strings.TrimSpace(in.Username),
+		SourceIP: source,
+		Stage:    loginStagePassword,
+		Expires:  now.Add(loginFlowTTL),
+	}
+	s.loginMu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     loginFlowCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int(loginFlowTTL.Seconds()),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"next": "password"})
+}
+
+func (s *Server) handleLoginPassword(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	token, flow, ok := s.requireLoginFlow(r, loginStagePassword)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "login failed")
+		return
+	}
+	now := time.Now().UTC()
+	flow.Password = in.Password
+	flow.Stage = loginStageOTP
+	flow.Expires = now.Add(loginFlowTTL)
+	s.loginMu.Lock()
+	s.pruneLoginFlowsLocked(now)
+	s.login[token] = flow
+	s.loginMu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     loginFlowCookie,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int(loginFlowTTL.Seconds()),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"next": "otp"})
+}
+
+func (s *Server) handleLoginFinish(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		OTP string `json:"otp"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	token, flow, ok := s.requireLoginFlow(r, loginStageOTP)
+	if !ok {
+		writeErr(w, http.StatusUnauthorized, "login failed")
+		return
+	}
+	s.clearLoginFlow(token, w, r)
+	sid, user, err := s.auth.AuthenticatePassword(r.Context(), flow.Username, flow.Password, strings.TrimSpace(in.OTP), flow.SourceIP)
 	if err != nil {
 		s.metrics.Failures.WithLabelValues("auth").Inc()
 		writeErr(w, http.StatusUnauthorized, "login failed")
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "domnex_session", Value: sid, Path: "/", HttpOnly: true, Secure: isSecureRequest(r), SameSite: http.SameSiteStrictMode, MaxAge: int((12 * time.Hour).Seconds())})
+	flow.Password = ""
 	writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -704,6 +782,67 @@ func (s *Server) handleLogoutAll(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"identity": identityFrom(r.Context())})
+}
+
+const (
+	loginFlowCookie    = "domnex_login_flow"
+	loginStagePassword = "password"
+	loginStageOTP      = "otp"
+)
+
+const loginFlowTTL = 3 * time.Minute
+
+type loginFlow struct {
+	Username string
+	Password string
+	SourceIP string
+	Stage    string
+	Expires  time.Time
+}
+
+func (s *Server) requireLoginFlow(r *http.Request, stage string) (string, loginFlow, bool) {
+	c, err := r.Cookie(loginFlowCookie)
+	if err != nil || strings.TrimSpace(c.Value) == "" {
+		return "", loginFlow{}, false
+	}
+	token := strings.TrimSpace(c.Value)
+	source := s.auth.SourceIP(r)
+	now := time.Now().UTC()
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	s.pruneLoginFlowsLocked(now)
+	flow, ok := s.login[token]
+	if !ok {
+		return "", loginFlow{}, false
+	}
+	if flow.Stage != stage || flow.SourceIP != source {
+		delete(s.login, token)
+		return "", loginFlow{}, false
+	}
+	return token, flow, true
+}
+
+func (s *Server) clearLoginFlow(token string, w http.ResponseWriter, r *http.Request) {
+	s.loginMu.Lock()
+	delete(s.login, token)
+	s.loginMu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     loginFlowCookie,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+	})
+}
+
+func (s *Server) pruneLoginFlowsLocked(now time.Time) {
+	for token, flow := range s.login {
+		if !flow.Expires.After(now) {
+			delete(s.login, token)
+		}
+	}
 }
 
 func (s *Server) handleGetOwnMFAStatus(w http.ResponseWriter, r *http.Request) {

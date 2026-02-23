@@ -21,6 +21,7 @@ type MFAPolicy = { enforceAdmin: boolean; enforceDomainAdmin: boolean; enforceRe
 type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean; retention?: RetentionPolicy; mfaPolicy?: MFAPolicy };
 type SetupStatus = { initialized: boolean; locked: boolean; unlocked: boolean; restoreReady?: boolean; otsExpiresAt?: string; unlockUntil?: string; cooldownUntil?: string };
 type SetupBackupMeta = { fileName: string; format: string; createdAt: string; domnexVersion: string; domains: number; subdomains: number; users: number };
+type LoginStep = 'username' | 'password' | 'otp';
 type BackupMeta = SetupBackupMeta & { dbSha256?: string; keySha256?: string };
 type BackupFTPSettings = { enabled: boolean; host: string; port: number; username: string; remoteDir: string; tlsMode: 'off' | 'explicit' | 'implicit'; hasPassword?: boolean };
 type BackupLocalSettings = { enabled: boolean; dir: string };
@@ -542,6 +543,7 @@ function App() {
   const [loginUser, setLoginUser] = useState('admin');
   const [loginPass, setLoginPass] = useState('');
   const [loginOTP, setLoginOTP] = useState('');
+  const [loginStep, setLoginStep] = useState<LoginStep>('username');
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
   const [setupMode, setSetupMode] = useState<'fresh' | 'restore'>('fresh');
   const [setupStep, setSetupStep] = useState(1);
@@ -1085,15 +1087,36 @@ function App() {
     setLoading(true);
     setError('');
     try {
-      await api('/api/v1/login', {
-        method: 'POST',
-        body: JSON.stringify({ username: loginUser, password: loginPass, otp: loginOTP }),
-      });
+      if (loginStep === 'username') {
+        await api('/api/v1/login/start', {
+          method: 'POST',
+          body: JSON.stringify({ username: loginUser }),
+        });
+        setLoginPass('');
+        setLoginOTP('');
+        setLoginStep('password');
+      } else if (loginStep === 'password') {
+        await api('/api/v1/login/password', {
+          method: 'POST',
+          body: JSON.stringify({ password: loginPass }),
+        });
+        setLoginPass('');
+        setLoginStep('otp');
+      } else {
+        await api('/api/v1/login/finish', {
+          method: 'POST',
+          body: JSON.stringify({ otp: loginOTP }),
+        });
+        setLoginPass('');
+        setLoginOTP('');
+        setLoginStep('username');
+        await refresh();
+      }
+    } catch (e) {
       setLoginPass('');
       setLoginOTP('');
-      await refresh();
-    } catch (e) {
-      setError((e as Error).message);
+      setLoginStep('username');
+      setError('Invalid login.');
     } finally {
       setLoading(false);
     }
@@ -5627,10 +5650,18 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
             <h3>Control Plane Login</h3>
             <p className="muted">Sign in with your admin account to continue.</p>
             <div className="col">
-              <input value={loginUser} onChange={(e) => setLoginUser(e.target.value)} placeholder="Username" />
-              <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Password" />
-              <input value={loginOTP} onChange={(e) => setLoginOTP(e.target.value)} placeholder="MFA code (if enabled)" />
-              <button className="btn" onClick={login} disabled={loading}>Login</button>
+              {loginStep === 'username' ? (
+                <input value={loginUser} onChange={(e) => setLoginUser(e.target.value)} placeholder="Username" />
+              ) : null}
+              {loginStep === 'password' ? (
+                <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Password" />
+              ) : null}
+              {loginStep === 'otp' ? (
+                <input value={loginOTP} onChange={(e) => setLoginOTP(e.target.value)} placeholder="MFA code (leave empty if not enabled)" />
+              ) : null}
+              <button className="btn" onClick={login} disabled={loading}>
+                {loginStep === 'username' ? 'Continue' : loginStep === 'password' ? 'Continue' : 'Login'}
+              </button>
             </div>
           </div>
         </div>
