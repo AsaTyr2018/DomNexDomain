@@ -1967,7 +1967,7 @@ func (s *Server) handleAddBlockedIP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid ip")
 		return
 	}
-	if err := s.app.Store().UpsertBlockedIP(r.Context(), ip.String(), strings.TrimSpace(in.Reason)); err != nil {
+	if err := s.app.UpsertBlockedIP(r.Context(), ip.String(), strings.TrimSpace(in.Reason)); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -1997,7 +1997,7 @@ func (s *Server) handleRemoveBlockedIP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid ip")
 		return
 	}
-	if err := s.app.Store().RemoveBlockedIP(r.Context(), ip.String()); err != nil {
+	if err := s.app.RemoveBlockedIP(r.Context(), ip.String()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2367,7 +2367,7 @@ func (s *Server) handleThreatIntelActionAllow(w http.ResponseWriter, r *http.Req
 		writeErr(w, http.StatusBadRequest, "ip required")
 		return
 	}
-	_ = s.app.Store().RemoveBlockedIP(r.Context(), ip)
+	_ = s.app.RemoveBlockedIP(r.Context(), ip)
 	if err := s.app.AddThreatIntelAllowIP(r.Context(), ip, strings.TrimSpace(in.Reason)); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

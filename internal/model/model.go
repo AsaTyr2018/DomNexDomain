@@ -128,6 +128,8 @@ type SSHBastionKeyAuth struct {
 type ThreatIntelConfig struct {
 	Enabled          bool   `json:"enabled"`
 	Mode             string `json:"mode"`
+	OSFirewall       bool   `json:"osFirewall"`
+	OSFirewallMode   string `json:"osFirewallMode"`
 	SyncHours        int    `json:"syncHours"`
 	EventMinHits     int    `json:"eventMinHits"`
 	OffenderMinHits  int    `json:"offenderMinHits"`

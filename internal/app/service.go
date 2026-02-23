@@ -32,6 +32,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/config"
 	"github.com/domnexdomain/domnexdomain/internal/crypto"
 	"github.com/domnexdomain/domnexdomain/internal/dns"
+	"github.com/domnexdomain/domnexdomain/internal/firewall"
 	"github.com/domnexdomain/domnexdomain/internal/logx"
 	"github.com/domnexdomain/domnexdomain/internal/mfa"
 	"github.com/domnexdomain/domnexdomain/internal/model"
@@ -68,6 +69,7 @@ type Service struct {
 	setupCooldown    time.Time
 	setupRestore     *backupSnapshot
 	backupRunMu      sync.Mutex
+	nft              *firewall.NftEnforcer
 }
 
 type tiWindow struct {
@@ -510,6 +512,7 @@ func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dn
 			FeedByIP:         map[string][]string{},
 		},
 		tiWin: map[string]tiWindow{},
+		nft:   firewall.NewNftEnforcer(),
 	}
 	if svc.hostName == "" {
 		svc.hostName = "domnexdomain"
@@ -3345,6 +3348,7 @@ func (s *Service) SetThreatIntelConfig(ctx context.Context, cfg model.ThreatInte
 	if err := s.store.SetThreatIntelConfig(ctx, cfg); err != nil {
 		return err
 	}
+	_ = s.reconcileOSFirewall(ctx)
 	_, err := s.RefreshThreatIntelSnapshot(ctx)
 	return err
 }
@@ -3963,8 +3967,13 @@ func (s *Service) RemoveThreatIntelAllowIP(ctx context.Context, ip string) error
 func (s *Service) StartThreatIntelSync(ctx context.Context) {
 	syncTicker := time.NewTicker(1 * time.Hour)
 	decayTicker := time.NewTicker(5 * time.Minute)
+	firewallTicker := time.NewTicker(1 * time.Minute)
 	defer syncTicker.Stop()
 	defer decayTicker.Stop()
+	defer firewallTicker.Stop()
+	if err := s.reconcileOSFirewall(ctx); err != nil {
+		s.log.Warn("threat intel os firewall reconcile failed", map[string]any{"err": err.Error()})
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -4009,8 +4018,75 @@ func (s *Service) StartThreatIntelSync(ctx context.Context) {
 			if _, err := s.SyncThreatIntelFeeds(ctx); err != nil {
 				s.log.Warn("threat intel scheduled sync failed", map[string]any{"err": err.Error()})
 			}
+		case <-firewallTicker.C:
+			if err := s.reconcileOSFirewall(ctx); err != nil {
+				s.log.Warn("threat intel os firewall reconcile failed", map[string]any{"err": err.Error()})
+			}
 		}
 	}
+}
+
+func (s *Service) reconcileOSFirewall(ctx context.Context) error {
+	if s.nft == nil {
+		return nil
+	}
+	cfg, err := s.store.GetThreatIntelConfig(ctx)
+	if err != nil {
+		return err
+	}
+	if !cfg.OSFirewall {
+		return s.nft.Disable(ctx)
+	}
+	mode := strings.TrimSpace(strings.ToLower(cfg.OSFirewallMode))
+	if mode == "" {
+		mode = "hard_only"
+	}
+	blocked, err := s.store.ListBlockedIPs(ctx, 200000)
+	if err != nil {
+		return err
+	}
+	set := map[string]bool{}
+	for _, b := range blocked {
+		ip := strings.TrimSpace(b.IP)
+		if !isPublicIPv4(ip) {
+			continue
+		}
+		if mode == "hard_only" && !strings.Contains(strings.ToLower(strings.TrimSpace(b.Reason)), "hard") {
+			continue
+		}
+		set[ip] = true
+	}
+	ips := make([]string, 0, len(set))
+	for ip := range set {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+	return s.nft.ReplaceIPv4(ctx, ips)
+}
+
+func isPublicIPv4(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	if v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalMulticast() || v4.IsLinkLocalUnicast() || v4.IsUnspecified() {
+		return false
+	}
+	switch {
+	case v4[0] == 0:
+		return false
+	case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127:
+		return false
+	case v4[0] == 169 && v4[1] == 254:
+		return false
+	case v4[0] >= 224:
+		return false
+	}
+	return true
 }
 
 func (s *Service) RunRetentionPurge(ctx context.Context) (RetentionPurgeResult, error) {
@@ -4173,5 +4249,17 @@ func (s *Service) IsIPBlocked(ctx context.Context, ip string) (bool, error) {
 }
 
 func (s *Service) UpsertBlockedIP(ctx context.Context, ip, reason string) error {
-	return s.store.UpsertBlockedIP(ctx, ip, reason)
+	if err := s.store.UpsertBlockedIP(ctx, ip, reason); err != nil {
+		return err
+	}
+	_ = s.reconcileOSFirewall(ctx)
+	return nil
+}
+
+func (s *Service) RemoveBlockedIP(ctx context.Context, ip string) error {
+	if err := s.store.RemoveBlockedIP(ctx, ip); err != nil {
+		return err
+	}
+	_ = s.reconcileOSFirewall(ctx)
+	return nil
 }

@@ -111,6 +111,8 @@ type SSHBastionGenerate = { key: SSHBastionKey; privateKey?: string; privateKeyP
 type ThreatIntelConfig = {
   enabled: boolean;
   mode: 'monitor_only' | 'auto_mode';
+  osFirewall: boolean;
+  osFirewallMode: 'hard_only' | 'all_blocked';
   syncHours: number;
   eventMinHits: number;
   offenderMinHits: number;
@@ -487,6 +489,8 @@ function App() {
   const [tiConfig, setTiConfig] = useState<ThreatIntelConfig>({
     enabled: false,
     mode: 'monitor_only',
+    osFirewall: false,
+    osFirewallMode: 'hard_only',
     syncHours: 24,
     eventMinHits: 2,
     offenderMinHits: 10,
@@ -4506,6 +4510,19 @@ function App() {
                             <select value={tiConfig.mode} onChange={(e) => setTiConfig((p) => ({ ...p, mode: e.target.value as 'monitor_only' | 'auto_mode' }))} disabled={isReadOnlyRole || identity?.role !== 'admin'}>
                               <option value="monitor_only">Monitor only</option>
                               <option value="auto_mode">Auto mode (soft + hard)</option>
+                            </select>
+                          </div>
+                          <div className="field">
+                            <label>OS Firewall Enforcement</label>
+                            <label className="check">
+                              <input type="checkbox" checked={!!tiConfig.osFirewall} onChange={(e) => setTiConfig((p) => ({ ...p, osFirewall: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> nftables hard drop
+                            </label>
+                          </div>
+                          <div className="field">
+                            <label>OS Firewall Mode</label>
+                            <select value={tiConfig.osFirewallMode || 'hard_only'} onChange={(e) => setTiConfig((p) => ({ ...p, osFirewallMode: e.target.value as 'hard_only' | 'all_blocked' }))} disabled={isReadOnlyRole || identity?.role !== 'admin' || !tiConfig.osFirewall}>
+                              <option value="hard_only">Hard blocks only</option>
+                              <option value="all_blocked">All blocked IPs</option>
                             </select>
                           </div>
                           <div className="field">

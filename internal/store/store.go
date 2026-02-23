@@ -1039,7 +1039,7 @@ func (s *Store) RemoveBlockedIP(ctx context.Context, ip string) error {
 }
 
 func (s *Store) ListBlockedIPs(ctx context.Context, limit int) ([]model.BlockedIP, error) {
-	if limit <= 0 || limit > 1000 {
+	if limit <= 0 || limit > 200000 {
 		limit = 200
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT ip, reason, created_at, updated_at FROM blocked_ips ORDER BY updated_at DESC LIMIT ?`, limit)
@@ -1959,6 +1959,8 @@ func (s *Store) GetThreatIntelConfig(ctx context.Context) (model.ThreatIntelConf
 	cfg := model.ThreatIntelConfig{
 		Enabled:          false,
 		Mode:             "monitor_only",
+		OSFirewall:       false,
+		OSFirewallMode:   "hard_only",
 		SyncHours:        24,
 		EventMinHits:     2,
 		OffenderMinHits:  10,
@@ -1979,6 +1981,16 @@ func (s *Store) GetThreatIntelConfig(ctx context.Context) (model.ThreatIntelConf
 			cfg.Mode = "monitor_only"
 		case "hard_check", "soft_block", "hard_block":
 			cfg.Mode = "auto_mode"
+		}
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.os_firewall"); err == nil {
+		cfg.OSFirewall = strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	if v, err := s.GetSetting(ctx, "threatintel.os_firewall_mode"); err == nil {
+		mode := strings.ToLower(strings.TrimSpace(v))
+		switch mode {
+		case "hard_only", "all_blocked":
+			cfg.OSFirewallMode = mode
 		}
 	}
 	if v, err := s.GetSetting(ctx, "threatintel.sync_hours"); err == nil {
@@ -2038,6 +2050,14 @@ func (s *Store) SetThreatIntelConfig(ctx context.Context, cfg model.ThreatIntelC
 	default:
 		return fmt.Errorf("invalid threat intel mode")
 	}
+	osfwMode := strings.ToLower(strings.TrimSpace(cfg.OSFirewallMode))
+	switch osfwMode {
+	case "", "hard_only":
+		osfwMode = "hard_only"
+	case "all_blocked":
+	default:
+		return fmt.Errorf("invalid os firewall mode")
+	}
 	if cfg.SyncHours <= 0 {
 		cfg.SyncHours = 24
 	}
@@ -2069,6 +2089,12 @@ func (s *Store) SetThreatIntelConfig(ctx context.Context, cfg model.ThreatIntelC
 		return err
 	}
 	if err := s.SetSetting(ctx, "threatintel.mode", mode); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, "threatintel.os_firewall", strconv.FormatBool(cfg.OSFirewall)); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, "threatintel.os_firewall_mode", osfwMode); err != nil {
 		return err
 	}
 	if err := s.SetSetting(ctx, "threatintel.sync_hours", strconv.Itoa(cfg.SyncHours)); err != nil {
