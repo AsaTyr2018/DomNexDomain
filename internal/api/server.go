@@ -101,6 +101,8 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/system/health", s.handleGetSystemHealth)
 		pr.Get("/api/v1/backup/settings", s.handleBackupSettingsGet)
 		pr.Get("/api/v1/backup/archives", s.handleBackupArchivesList)
+		pr.Get("/api/v1/geoip/sources", s.handleListGeoIPSources)
+		pr.Get("/api/v1/geoip/stats", s.handleGeoIPStats)
 		pr.Get("/api/v1/users", s.handleListUsers)
 		pr.Get("/api/v1/tokens", s.handleListTokens)
 		pr.Get("/api/v1/ssh/routes", s.handleListSSHBastionRoutes)
@@ -151,6 +153,7 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/backup/create", s.handleBackupCreate)
 		pr.Post("/api/v1/backup/analyze", s.handleBackupAnalyze)
 		pr.Post("/api/v1/backup/restore", s.handleBackupRestore)
+		pr.Post("/api/v1/geoip/sources/upload", s.handleUploadGeoIPSource)
 		pr.Post("/api/v1/backup/post-restore-check", s.handleBackupPostRestoreCheck)
 		pr.Post("/api/v1/backup/archives/{id}/restore", s.handleBackupArchiveRestore)
 		pr.Delete("/api/v1/backup/archives/{id}", s.handleBackupArchiveDelete)
@@ -2443,6 +2446,65 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": users})
+}
+
+func (s *Server) handleListGeoIPSources(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:read") {
+		return
+	}
+	items, err := s.app.ListGeoIPSources(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleGeoIPStats(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:read") {
+		return
+	}
+	stats, err := s.app.GeoIPSourceStats(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleUploadGeoIPSource(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	if err := r.ParseMultipartForm(2 << 30); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid multipart form")
+		return
+	}
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "missing file")
+		return
+	}
+	defer f.Close()
+	item, err := s.app.UploadGeoIPSource(r.Context(), hdr.Filename, f)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "geoip.source.upload",
+		Target: item.Name,
+		Meta:   "size=" + strconv.FormatInt(item.Size, 10),
+	})
+	writeJSON(w, http.StatusCreated, map[string]any{"item": item})
 }
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {

@@ -227,6 +227,7 @@ func main() {
 	go pruneSessions(ctx, st, log)
 	go tr.Start(ctx)
 	go appSvc.StartThreatIntelSync(ctx)
+	go appSvc.StartGeoIPCompiler(ctx)
 	go appSvc.StartRetentionWorker(ctx)
 	go appSvc.StartPublicIPSync(ctx)
 	go appSvc.StartBackupScheduler(ctx)

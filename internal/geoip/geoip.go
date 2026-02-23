@@ -16,12 +16,13 @@ import (
 )
 
 type Resolver struct {
-	mu     sync.RWMutex
-	cache  map[string]cacheItem
-	http   *http.Client
-	ttl    time.Duration
-	mmdbs  []*maxminddb.Reader
-	labels []string
+	mu       sync.RWMutex
+	cache    map[string]cacheItem
+	http     *http.Client
+	ttl      time.Duration
+	mmdbs    []*maxminddb.Reader
+	labels   []string
+	lastScan time.Time
 }
 
 type cacheItem struct {
@@ -44,6 +45,7 @@ func New(ttl time.Duration) *Resolver {
 }
 
 func (r *Resolver) CountryCode(ctx context.Context, ip string) string {
+	r.maybeReloadSources()
 	parsed := net.ParseIP(strings.TrimSpace(ip))
 	if parsed == nil {
 		return "ZZ"
@@ -75,6 +77,38 @@ func (r *Resolver) CountryCode(ctx context.Context, ip string) string {
 	r.cache[ip] = cacheItem{country: country, expires: now.Add(r.ttl)}
 	r.mu.Unlock()
 	return country
+}
+
+func (r *Resolver) maybeReloadSources() {
+	now := time.Now()
+	r.mu.RLock()
+	if !r.lastScan.IsZero() && now.Sub(r.lastScan) < 5*time.Minute {
+		r.mu.RUnlock()
+		return
+	}
+	r.mu.RUnlock()
+	readers, labels := openLocalMMDBs()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.lastScan.IsZero() && now.Sub(r.lastScan) < 5*time.Minute {
+		for _, db := range readers {
+			_ = db.Close()
+		}
+		return
+	}
+	r.lastScan = now
+	if sameStringSlice(r.labels, labels) {
+		for _, db := range readers {
+			_ = db.Close()
+		}
+		return
+	}
+	for _, db := range r.mmdbs {
+		_ = db.Close()
+	}
+	r.mmdbs = readers
+	r.labels = labels
+	r.cache = map[string]cacheItem{}
 }
 
 func (r *Resolver) lookupCountryCodeMMDB(ip net.IP) string {
@@ -129,6 +163,8 @@ func openLocalMMDBs() ([]*maxminddb.Reader, []string) {
 		paths = append(paths, env)
 	}
 	paths = append(paths,
+		"/var/lib/domnexdomain/geoip-compiled/domnex-country.mmdb",
+		"/var/lib/domnexdomain/geoip/compiled/domnex-country.mmdb",
 		"/var/lib/domnexdomain/geoip/dbip-country-lite.mmdb",
 		"/var/lib/domnexdomain/geoip/dbip-country-lite-2026-02.mmdb",
 		"/var/lib/domnexdomain/geoip/DBIP-Country-Lite.mmdb",
@@ -157,6 +193,18 @@ func openLocalMMDBs() ([]*maxminddb.Reader, []string) {
 		}
 	}
 	return readers, labels
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Resolver) lookupCountryCode(ctx context.Context, ip string) string {

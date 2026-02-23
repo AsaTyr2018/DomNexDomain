@@ -148,9 +148,25 @@ type MeProfile = { email: string; dashboardLayout?: DashboardLayout };
 type MFAStatus = { enabled: boolean; requiredByPolicy: boolean; enrolledAt?: string; recoveryCodesRemaining: number };
 type MFAEnrollStart = { secret: string; otpAuthUri: string; issuer: string; account: string; startedAt: string };
 type MFAEnrollConfirm = { enabled: boolean; enrolledAt?: string; recoveryCodes: string[] };
+type GeoIPSource = { name: string; size: number; modTime: string };
+type GeoIPStats = {
+  sourceFiles: number;
+  sourceCSVFiles: number;
+  sourceMMDBFiles: number;
+  sourceBytes: number;
+  compiledPath: string;
+  compiledExists: boolean;
+  compiledSize: number;
+  compiledModTime?: string;
+  lastCompileAt?: string;
+  lastCompileSources?: number;
+  lastCompileRecords?: number;
+  lastUploadAt?: string;
+  lastUploadFile?: string;
+};
 
 type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'ssh' | 'audit' | 'account' | 'accessControl' | 'integrations' | 'help';
-type SettingsTab = 'general' | 'security' | 'mfa' | 'logservers' | 'appearance' | 'advanced';
+type SettingsTab = 'general' | 'security' | 'mfa' | 'logservers' | 'geoip' | 'appearance' | 'advanced';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
 type PublicStyle = { styleProfile?: string; styleCustom?: string };
@@ -377,23 +393,40 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
-async function apiMultipart<T>(path: string, form: FormData, csrf?: string): Promise<T> {
-  const headers: Record<string, string> = {};
-  if (csrf) headers['X-CSRF-Token'] = csrf;
-  const res = await fetch(path, {
-    method: 'POST',
-    credentials: 'include',
-    headers,
-    body: form,
+async function apiMultipart<T>(path: string, form: FormData, csrf?: string, onProgress?: (percent: number) => void): Promise<T> {
+  return await new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', path, true);
+    xhr.withCredentials = true;
+    if (csrf) xhr.setRequestHeader('X-CSRF-Token', csrf);
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (evt) => {
+        if (!evt.lengthComputable || evt.total <= 0) return;
+        const pct = Math.max(0, Math.min(100, Math.round((evt.loaded / evt.total) * 100)));
+        onProgress(pct);
+      };
+    }
+    xhr.onerror = () => reject(new Error('network error'));
+    xhr.onload = () => {
+      const text = xhr.responseText || '';
+      let data: any = {};
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = {};
+        }
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const err = new Error(data.error || `${xhr.status} ${xhr.statusText}`) as Error & { status?: number };
+        err.status = xhr.status;
+        reject(err);
+        return;
+      }
+      resolve(data as T);
+    };
+    xhr.send(form);
   });
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!res.ok) {
-    const err = new Error(data.error || `${res.status} ${res.statusText}`) as Error & { status?: number };
-    err.status = res.status;
-    throw err;
-  }
-  return data as T;
 }
 
 function getCookie(name: string): string {
@@ -634,6 +667,11 @@ function App() {
   const [settingsLogHTTPBearer, setSettingsLogHTTPBearer] = useState('');
   const [settingsRetention, setSettingsRetention] = useState<RetentionPolicy>(defaultRetentionPolicy());
   const [settingsMFAPolicy, setSettingsMFAPolicy] = useState<MFAPolicy>({ enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
+  const [geoipSources, setGeoipSources] = useState<GeoIPSource[]>([]);
+  const [geoipStats, setGeoipStats] = useState<GeoIPStats | null>(null);
+  const [geoipUploadFile, setGeoipUploadFile] = useState<File | null>(null);
+  const [geoipUploading, setGeoipUploading] = useState(false);
+  const [geoipUploadProgress, setGeoipUploadProgress] = useState(0);
   const [backupPassphrase, setBackupPassphrase] = useState('');
   const [backupRestorePassphrase, setBackupRestorePassphrase] = useState('');
   const [backupRestoreConfirm, setBackupRestoreConfirm] = useState('');
@@ -857,6 +895,18 @@ function App() {
         setBackupSettings(defaultBackupScheduleSettings());
       }
       try {
+        const gs = await api<{ items: GeoIPSource[] }>('/api/v1/geoip/sources');
+        setGeoipSources(gs.items || []);
+      } catch {
+        setGeoipSources([]);
+      }
+      try {
+        const gsx = await api<GeoIPStats>('/api/v1/geoip/stats');
+        setGeoipStats(gsx || null);
+      } catch {
+        setGeoipStats(null);
+      }
+      try {
         const ba = await api<{ items: BackupArchive[]; stats: BackupStats }>('/api/v1/backup/archives?limit=500');
         setBackupArchives(ba.items || []);
         setBackupStats(ba.stats || { totalArchives: 0, localArchives: 0, ftpArchives: 0 });
@@ -1059,6 +1109,16 @@ function App() {
     const t = window.setInterval(() => { void loadTimeSyncStatus(); }, 20000);
     return () => window.clearInterval(t);
   }, [tab, identity?.role]);
+
+  useEffect(() => {
+    if (!identity) return;
+    if (tab !== 'settings' || settingsTab !== 'geoip') return;
+    void Promise.all([loadGeoIPSources(), loadGeoIPStats()]);
+    const t = window.setInterval(() => {
+      void Promise.all([loadGeoIPSources(), loadGeoIPStats()]);
+    }, 6000);
+    return () => window.clearInterval(t);
+  }, [tab, settingsTab, identity?.role]);
 
   useEffect(() => {
     if (!identity) return;
@@ -3220,6 +3280,49 @@ function App() {
     }
   };
 
+  const loadGeoIPSources = async () => {
+    try {
+      const out = await api<{ items: GeoIPSource[] }>('/api/v1/geoip/sources');
+      setGeoipSources(out.items || []);
+    } catch {
+      setGeoipSources([]);
+    }
+  };
+
+  const loadGeoIPStats = async () => {
+    try {
+      const out = await api<GeoIPStats>('/api/v1/geoip/stats');
+      setGeoipStats(out || null);
+    } catch {
+      setGeoipStats(null);
+    }
+  };
+
+  const uploadGeoIPSource = async () => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    if (!geoipUploadFile) {
+      setError('Select a GeoIP source file first.');
+      return;
+    }
+    setLoading(true);
+    setGeoipUploading(true);
+    setGeoipUploadProgress(0);
+    setError('');
+    try {
+      const fd = new FormData();
+      fd.append('file', geoipUploadFile);
+      await apiMultipart('/api/v1/geoip/sources/upload', fd, csrf, (pct) => setGeoipUploadProgress(pct));
+      setGeoipUploadProgress(100);
+      setGeoipUploadFile(null);
+      await Promise.all([loadGeoIPSources(), loadGeoIPStats()]);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setGeoipUploading(false);
+      setLoading(false);
+    }
+  };
+
   const addThreatIntelFeed = async () => {
     if (isReadOnlyRole || identity?.role !== 'admin') return;
     if (!tiFeedName.trim() || !tiFeedURL.trim()) return;
@@ -4449,6 +4552,7 @@ function App() {
                     <button className={settingsTab === 'security' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('security')}>Security &amp; Time</button>
                     <button className={settingsTab === 'mfa' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('mfa')}>MFA</button>
                     <button className={settingsTab === 'logservers' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('logservers')}>Logservers</button>
+                    <button className={settingsTab === 'geoip' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('geoip')}>GeoIP Sources</button>
                     <button className={settingsTab === 'appearance' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('appearance')}>Appearance</button>
                     <button className={settingsTab === 'advanced' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('advanced')}>Advanced</button>
                   </div>
@@ -4727,6 +4831,81 @@ function App() {
                               <option value="error">error</option>
                             </select>
                           </div>
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+                  {settingsTab === 'geoip' ? (
+                    <>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>GeoIP Stats</h3></div>
+                        <div className="metric-grid">
+                          <MetricTile label="Source Files" value={String(geoipStats?.sourceFiles || 0)} hint={`${geoipStats?.sourceMMDBFiles || 0} MMDB, ${geoipStats?.sourceCSVFiles || 0} CSV`} />
+                          <MetricTile label="Source Size" value={formatBytes(geoipStats?.sourceBytes || 0)} hint="All source files in pool" />
+                          <MetricTile label="Compiled DB" value={geoipStats?.compiledExists ? formatBytes(geoipStats?.compiledSize || 0) : '-'} hint={geoipStats?.compiledExists ? `Updated ${formatDateTime(geoipStats?.compiledModTime || '')}` : 'Not built yet'} />
+                          <MetricTile label="Compiled Records" value={String(geoipStats?.lastCompileRecords || 0)} hint={`Last compile used ${geoipStats?.lastCompileSources || 0} sources`} />
+                        </div>
+                        <div className="muted" style={{ marginTop: '.45rem' }}>
+                          Last upload: {geoipStats?.lastUploadAt ? `${geoipStats.lastUploadFile || '-'} (${formatDateTime(geoipStats.lastUploadAt)})` : '-'}
+                        </div>
+                      </div>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>GeoIP Source Upload</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Source File</label>
+                            <input
+                              type="file"
+                              accept=".mmdb,.MMDB,.csv,.CSV,.gz,.GZ,.zip,.ZIP"
+                              onChange={(e) => setGeoipUploadFile((e.target.files && e.target.files[0]) ? e.target.files[0] : null)}
+                              disabled={isReadOnlyRole || identity?.role !== 'admin'}
+                            />
+                            <div className="muted">Accepted: `.mmdb`, `.csv`, `.mmdb.gz`, `.csv.gz`, `.zip` (zip must include exactly one `.mmdb` or `.csv`). Uploads are stored under `/var/lib/domnexdomain/geoip-sources` and compiled into one main database under `/var/lib/domnexdomain/geoip-compiled` overnight or on change.</div>
+                          </div>
+                        </div>
+                        {geoipUploadFile ? (
+                          <div className="muted" style={{ marginBottom: '.35rem' }}>
+                            Selected: {geoipUploadFile.name} ({formatBytes(geoipUploadFile.size || 0)})
+                          </div>
+                        ) : null}
+                        {geoipUploading ? (
+                          <div style={{ marginBottom: '.45rem' }}>
+                            <div style={{ height: 8, borderRadius: 999, background: 'var(--panel)', border: '1px solid var(--border)', overflow: 'hidden' }}>
+                              <div style={{ height: '100%', width: `${Math.max(0, Math.min(100, geoipUploadProgress))}%`, background: 'linear-gradient(90deg, var(--accent), var(--success))', transition: 'width .15s ease' }} />
+                            </div>
+                            <div className="muted" style={{ marginTop: '.3rem' }}>
+                              Upload progress: {geoipUploadProgress}% {geoipUploadProgress >= 100 ? '(uploaded, compiling...)' : ''}
+                            </div>
+                          </div>
+                        ) : null}
+                        <div className="row" style={{ marginBottom: 0 }}>
+                          <button className="btn" onClick={uploadGeoIPSource} disabled={loading || geoipUploading || isReadOnlyRole || identity?.role !== 'admin' || !geoipUploadFile}>Upload Source</button>
+                          <button className="btn" onClick={() => { void Promise.all([loadGeoIPSources(), loadGeoIPStats()]); }} disabled={loading || geoipUploading}>Refresh Index</button>
+                        </div>
+                      </div>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>Source Index</h3></div>
+                        <div className="table-wrap">
+                          <table className="table">
+                            <thead>
+                              <tr>
+                                <th>File</th>
+                                <th>Size</th>
+                                <th>Modified</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {geoipSources.length === 0 ? (
+                                <tr><td colSpan={3} className="muted">No GeoIP source files uploaded yet.</td></tr>
+                              ) : geoipSources.map((g) => (
+                                <tr key={`${g.name}:${g.modTime}`}>
+                                  <td><strong>{g.name}</strong></td>
+                                  <td>{formatBytes(g.size || 0)}</td>
+                                  <td>{formatDateTime(g.modTime)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
                         </div>
                       </div>
                     </>

@@ -1,7 +1,9 @@
 package app
 
 import (
+	"archive/zip"
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -22,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -219,6 +222,28 @@ type MFAEnrollConfirm struct {
 	Enabled       bool      `json:"enabled"`
 	EnrolledAt    time.Time `json:"enrolledAt"`
 	RecoveryCodes []string  `json:"recoveryCodes"`
+}
+
+type GeoIPSourceFile struct {
+	Name    string    `json:"name"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"modTime"`
+}
+
+type GeoIPStats struct {
+	SourceFiles        int       `json:"sourceFiles"`
+	SourceCSVFiles     int       `json:"sourceCSVFiles"`
+	SourceMMDBFiles    int       `json:"sourceMMDBFiles"`
+	SourceBytes        int64     `json:"sourceBytes"`
+	CompiledPath       string    `json:"compiledPath"`
+	CompiledExists     bool      `json:"compiledExists"`
+	CompiledSize       int64     `json:"compiledSize"`
+	CompiledModTime    time.Time `json:"compiledModTime,omitempty"`
+	LastCompileAt      time.Time `json:"lastCompileAt,omitempty"`
+	LastCompileSources int       `json:"lastCompileSources"`
+	LastCompileRecords int       `json:"lastCompileRecords"`
+	LastUploadAt       time.Time `json:"lastUploadAt,omitempty"`
+	LastUploadFile     string    `json:"lastUploadFile"`
 }
 
 func (s *Service) GetSystemHealth(ctx context.Context) (SystemHealthStatus, error) {
@@ -4305,4 +4330,217 @@ func (s *Service) RemoveBlockedIP(ctx context.Context, ip string) error {
 	}
 	_ = s.reconcileOSFirewall(ctx)
 	return nil
+}
+
+func (s *Service) geoIPSourcesDir() string {
+	return filepath.Join(s.cfg.DataDir, "geoip-sources")
+}
+
+func (s *Service) ListGeoIPSources(_ context.Context) ([]GeoIPSourceFile, error) {
+	dir := s.geoIPSourcesDir()
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]GeoIPSourceFile, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(e.Name())
+		ext := strings.ToLower(filepath.Ext(name))
+		if ext != ".mmdb" && ext != ".csv" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, GeoIPSourceFile{
+			Name:    name,
+			Size:    info.Size(),
+			ModTime: info.ModTime().UTC(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ModTime.After(out[j].ModTime)
+	})
+	return out, nil
+}
+
+func (s *Service) UploadGeoIPSource(_ context.Context, filename string, in io.Reader) (GeoIPSourceFile, error) {
+	origName := filepath.Base(strings.TrimSpace(filename))
+	if origName == "" || origName == "." || origName == ".." {
+		return GeoIPSourceFile{}, fmt.Errorf("invalid filename")
+	}
+	dir := s.geoIPSourcesDir()
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return GeoIPSourceFile{}, err
+	}
+	name := origName
+	src := in
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext == ".zip" {
+		const maxZipUpload int64 = 1 << 30 // 1 GiB compressed archive
+		zipTmp := filepath.Join(dir, fmt.Sprintf(".geoip-upload-%d.zip", time.Now().UnixNano()))
+		defer os.Remove(zipTmp)
+		zf, err := os.OpenFile(zipTmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
+		if err != nil {
+			return GeoIPSourceFile{}, err
+		}
+		written, copyErr := io.Copy(zf, io.LimitReader(in, maxZipUpload+1))
+		closeErr := zf.Close()
+		if copyErr != nil {
+			return GeoIPSourceFile{}, copyErr
+		}
+		if closeErr != nil {
+			return GeoIPSourceFile{}, closeErr
+		}
+		if written <= 0 || written > maxZipUpload {
+			return GeoIPSourceFile{}, fmt.Errorf("invalid zip upload size")
+		}
+		zr, err := zip.OpenReader(zipTmp)
+		if err != nil {
+			return GeoIPSourceFile{}, fmt.Errorf("invalid zip file")
+		}
+		defer zr.Close()
+		var selected *zip.File
+		for _, zentry := range zr.File {
+			if zentry.FileInfo().IsDir() {
+				continue
+			}
+			base := filepath.Base(strings.TrimSpace(zentry.Name))
+			if base == "" || base == "." || base == ".." {
+				continue
+			}
+			e := strings.ToLower(filepath.Ext(base))
+			if e != ".mmdb" && e != ".csv" {
+				continue
+			}
+			if selected != nil {
+				return GeoIPSourceFile{}, fmt.Errorf("zip must contain exactly one .mmdb or .csv file")
+			}
+			selected = zentry
+		}
+		if selected == nil {
+			return GeoIPSourceFile{}, fmt.Errorf("zip must contain one .mmdb or .csv file")
+		}
+		zsrc, err := selected.Open()
+		if err != nil {
+			return GeoIPSourceFile{}, err
+		}
+		defer zsrc.Close()
+		name = filepath.Base(selected.Name)
+		src = zsrc
+		ext = strings.ToLower(filepath.Ext(name))
+	}
+	if ext == ".gz" {
+		base := strings.TrimSuffix(name, filepath.Ext(name))
+		baseExt := strings.ToLower(filepath.Ext(base))
+		if baseExt != ".mmdb" && baseExt != ".csv" {
+			return GeoIPSourceFile{}, fmt.Errorf("gzip must contain a .mmdb or .csv file")
+		}
+		gz, err := gzip.NewReader(in)
+		if err != nil {
+			return GeoIPSourceFile{}, fmt.Errorf("invalid gzip file")
+		}
+		defer gz.Close()
+		name = filepath.Base(base)
+		src = gz
+		ext = baseExt
+	}
+	if ext != ".mmdb" && ext != ".csv" {
+		return GeoIPSourceFile{}, fmt.Errorf("only .mmdb, .csv, .mmdb.gz, .csv.gz or .zip are allowed")
+	}
+	dst := filepath.Join(dir, name)
+	tmp := dst + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
+	if err != nil {
+		return GeoIPSourceFile{}, err
+	}
+	const maxUpload int64 = 2 << 30 // 2 GiB (decompressed payload limit)
+	written, copyErr := io.Copy(f, io.LimitReader(src, maxUpload+1))
+	closeErr := f.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		return GeoIPSourceFile{}, copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return GeoIPSourceFile{}, closeErr
+	}
+	if written <= 0 || written > maxUpload {
+		_ = os.Remove(tmp)
+		return GeoIPSourceFile{}, fmt.Errorf("invalid upload size")
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return GeoIPSourceFile{}, err
+	}
+	st, err := os.Stat(dst)
+	if err != nil {
+		return GeoIPSourceFile{}, err
+	}
+	out := GeoIPSourceFile{
+		Name:    name,
+		Size:    st.Size(),
+		ModTime: st.ModTime().UTC(),
+	}
+	if _, err := s.CompileGeoIPSources(context.Background(), false); err != nil {
+		s.log.Warn("geoip compile after upload failed", map[string]any{"err": err.Error()})
+	}
+	return out, nil
+}
+
+func (s *Service) GeoIPSourceStats(ctx context.Context) (GeoIPStats, error) {
+	items, err := s.ListGeoIPSources(ctx)
+	if err != nil {
+		return GeoIPStats{}, err
+	}
+	out := GeoIPStats{
+		SourceFiles:  len(items),
+		CompiledPath: s.geoIPCompiledMMDBPath(),
+	}
+	for _, it := range items {
+		out.SourceBytes += it.Size
+		switch strings.ToLower(filepath.Ext(it.Name)) {
+		case ".csv":
+			out.SourceCSVFiles++
+		case ".mmdb":
+			out.SourceMMDBFiles++
+		}
+	}
+	if st, err := os.Stat(out.CompiledPath); err == nil {
+		out.CompiledExists = true
+		out.CompiledSize = st.Size()
+		out.CompiledModTime = st.ModTime().UTC()
+	}
+	events, err := s.store.ListAuditEvents(ctx, 1000)
+	if err == nil {
+		for _, ev := range events {
+			if out.LastCompileAt.IsZero() && ev.Action == "geoip.compile.success" {
+				out.LastCompileAt = ev.CreatedAt.UTC()
+				for _, part := range strings.Split(ev.Meta, ";") {
+					p := strings.TrimSpace(part)
+					if strings.HasPrefix(p, "sources=") {
+						out.LastCompileSources, _ = strconv.Atoi(strings.TrimPrefix(p, "sources="))
+					}
+					if strings.HasPrefix(p, "records=") {
+						out.LastCompileRecords, _ = strconv.Atoi(strings.TrimPrefix(p, "records="))
+					}
+				}
+			}
+			if out.LastUploadAt.IsZero() && ev.Action == "geoip.source.upload" {
+				out.LastUploadAt = ev.CreatedAt.UTC()
+				out.LastUploadFile = strings.TrimSpace(ev.Target)
+			}
+			if !out.LastCompileAt.IsZero() && !out.LastUploadAt.IsZero() {
+				break
+			}
+		}
+	}
+	return out, nil
 }
