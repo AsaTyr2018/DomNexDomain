@@ -231,6 +231,7 @@ func main() {
 	go appSvc.StartRetentionWorker(ctx)
 	go appSvc.StartPublicIPSync(ctx)
 	go appSvc.StartBackupScheduler(ctx)
+	go appSvc.StartLDAPUserSync(ctx)
 
 	if cfg.SSHBastionOn {
 		sshBastion := bastion.New(cfg.SSHBastionAddr, cfg.SSHBastionKey, appSvc, log)

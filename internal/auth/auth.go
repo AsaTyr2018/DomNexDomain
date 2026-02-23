@@ -37,6 +37,9 @@ type Store interface {
 	IsIPBlocked(ctx context.Context, ip string) (bool, error)
 	ConsumeUserMFARecoveryCode(ctx context.Context, userID int64, codeHash string) (bool, error)
 	GetSetting(ctx context.Context, key string) (string, error)
+	GetSecret(ctx context.Context, key string) (string, error)
+	UpsertExternalUser(ctx context.Context, username string, role model.Role, domainIDs []int64, provider, passHash string) (model.User, error)
+	ListDomainIDs(ctx context.Context) ([]int64, error)
 }
 
 type Service struct {
@@ -82,6 +85,11 @@ func New(store Store, ks *crypto.Keystore, sessionTTL time.Duration, allowedCIDR
 
 func (s *Service) AuthenticatePassword(ctx context.Context, username, password, otpOrRecovery, source string) (string, model.User, error) {
 	failErr := errors.New("login failed")
+	username = strings.TrimSpace(username)
+	normUsername := strings.ToLower(username)
+	if normUsername == "" {
+		normUsername = username
+	}
 	if strings.TrimSpace(source) == "" {
 		source = "n/a"
 	}
@@ -90,7 +98,7 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.blocked_ip", Target: "user", Meta: "source=" + source})
 		return "", model.User{}, failErr
 	}
-	failed, lockUntil, err := s.store.GetLoginAttempt(ctx, username)
+	failed, lockUntil, err := s.store.GetLoginAttempt(ctx, normUsername)
 	if err != nil {
 		return "", model.User{}, err
 	}
@@ -100,38 +108,95 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 		return "", model.User{}, failErr
 	}
 
-	u, err := s.store.FindUserByUsername(ctx, username)
+	u, err := s.store.FindUserByUsername(ctx, normUsername)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			s.burnPasswordCheck(password)
-			fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
-			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "unknown_user;failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
-			return "", model.User{}, failErr
+			extUser, detail, extErr := s.tryLDAPLogin(ctx, username, password)
+			if extErr == nil {
+				u = extUser
+			} else {
+				s.burnPasswordCheck(password)
+				fc, lu, counted := s.registerFailureIfEligible(ctx, normUsername, detail)
+				meta := "unknown_user;source=" + source + ";" + loginFailureMeta(fc, lu, counted)
+				if strings.TrimSpace(detail) != "" {
+					meta += ";ldap=" + detail
+				}
+				_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: normUsername, Action: "auth.login.failed", Target: "user", Meta: meta})
+				return "", model.User{}, failErr
+			}
 		}
 		return "", model.User{}, err
 	}
-	if !crypto.VerifyPassword(password, u.PasswordHash) {
-		fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
-		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "bad_password;failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
-		return "", model.User{}, failErr
+	if strings.EqualFold(strings.TrimSpace(u.AuthProvider), "ldap") {
+		extUser, detail, extErr := s.tryLDAPLogin(ctx, username, password)
+		if extErr != nil {
+			fc, lu, counted := s.registerFailureIfEligible(ctx, normUsername, detail)
+			meta := "ldap_auth_failed;source=" + source + ";" + loginFailureMeta(fc, lu, counted)
+			if strings.TrimSpace(detail) != "" {
+				meta += ";ldap=" + detail
+			}
+			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: normUsername, Action: "auth.login.failed", Target: "user", Meta: meta})
+			return "", model.User{}, failErr
+		}
+		u = extUser
+	} else {
+		if !crypto.VerifyPassword(password, u.PasswordHash) {
+			fc, lu, _ := s.store.RegisterLoginFailure(ctx, normUsername)
+			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: normUsername, Action: "auth.login.failed", Target: "user", Meta: "bad_password;failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
+			return "", model.User{}, failErr
+		}
 	}
 	if ok, detail := s.isSourceAllowedForUser(u, source); !ok {
-		fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
-		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "ip_policy_denied;" + detail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
+		fc, lu, _ := s.store.RegisterLoginFailure(ctx, normUsername)
+		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: normUsername, Action: "auth.login.failed", Target: "user", Meta: "ip_policy_denied;" + detail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
 		return "", model.User{}, failErr
 	}
 	if required, mfaDetail := s.userRequiresMFA(ctx, u); required {
 		if !u.MFAEnabled {
-			fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
-			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "mfa_required_not_enrolled;" + mfaDetail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
+			fc, lu, _ := s.store.RegisterLoginFailure(ctx, normUsername)
+			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: normUsername, Action: "auth.login.failed", Target: "user", Meta: "mfa_required_not_enrolled;" + mfaDetail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
 			return "", model.User{}, failErr
 		}
 		ok, detail := s.validateMFA(ctx, u, otpOrRecovery)
 		if !ok {
-			fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
-			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "mfa_failed;" + detail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
+			fc, lu, _ := s.store.RegisterLoginFailure(ctx, normUsername)
+			_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: normUsername, Action: "auth.login.failed", Target: "user", Meta: "mfa_failed;" + detail + ";failures=" + strconv.Itoa(fc) + ";lock_until=" + lu.Format(time.RFC3339) + ";source=" + source})
 			return "", model.User{}, failErr
 		}
+	}
+	_ = s.store.ClearLoginFailures(ctx, normUsername)
+	sid, err := randomHex(32)
+	if err != nil {
+		return "", model.User{}, err
+	}
+	expires := time.Now().UTC().Add(s.sessionTTL)
+	if err := s.store.CreateSession(ctx, sid, u.ID, expires); err != nil {
+		return "", model.User{}, err
+	}
+	_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: u.Username, Action: "auth.login.success", Target: "session", Meta: "password+mfa;provider=" + strings.TrimSpace(u.AuthProvider) + ";source=" + source})
+	return sid, u, nil
+}
+
+func (s *Service) AuthenticateExternal(ctx context.Context, username string, role model.Role, domainIDs []int64, provider, source string) (string, model.User, error) {
+	failErr := errors.New("login failed")
+	username = strings.ToLower(strings.TrimSpace(username))
+	if username == "" {
+		return "", model.User{}, failErr
+	}
+	if strings.TrimSpace(source) == "" {
+		source = "n/a"
+	}
+	if blocked, err := s.store.IsIPBlocked(ctx, source); err == nil && blocked {
+		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.blocked_ip", Target: "user", Meta: "source=" + source + ";provider=" + strings.TrimSpace(provider)})
+		return "", model.User{}, failErr
+	}
+	u, err := s.store.UpsertExternalUser(ctx, username, role, domainIDs, provider, s.dummyPasswordHash)
+	if err != nil {
+		return "", model.User{}, err
+	}
+	if ok, detail := s.isSourceAllowedForUser(u, source); !ok {
+		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: username, Action: "auth.login.failed", Target: "user", Meta: "ip_policy_denied;" + detail + ";source=" + source + ";provider=" + strings.TrimSpace(provider)})
+		return "", model.User{}, failErr
 	}
 	_ = s.store.ClearLoginFailures(ctx, username)
 	sid, err := randomHex(32)
@@ -142,7 +207,7 @@ func (s *Service) AuthenticatePassword(ctx context.Context, username, password, 
 	if err := s.store.CreateSession(ctx, sid, u.ID, expires); err != nil {
 		return "", model.User{}, err
 	}
-	_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: u.Username, Action: "auth.login.success", Target: "session", Meta: "password+mfa;source=" + source})
+	_ = s.store.AddAuditEvent(ctx, model.AuditEvent{Actor: u.Username, Action: "auth.login.success", Target: "session", Meta: "provider=" + strings.TrimSpace(provider) + ";source=" + source})
 	return sid, u, nil
 }
 
@@ -153,7 +218,34 @@ func (s *Service) burnPasswordCheck(password string) {
 	_ = crypto.VerifyPassword(password, s.dummyPasswordHash)
 }
 
+func shouldCountLoginFailure(ldapDetail string) bool {
+	switch strings.ToLower(strings.TrimSpace(ldapDetail)) {
+	case "dial_failed", "starttls_failed", "bind_failed", "rebind_failed", "group_search_failed", "account_locked", "config_error", "ldap_disabled":
+		return false
+	default:
+		return true
+	}
+}
+
+func loginFailureMeta(fails int, lockUntil time.Time, counted bool) string {
+	if !counted {
+		return "failures=skipped;lock_until=none"
+	}
+	return "failures=" + strconv.Itoa(fails) + ";lock_until=" + lockUntil.Format(time.RFC3339)
+}
+
+func (s *Service) registerFailureIfEligible(ctx context.Context, username, ldapDetail string) (int, time.Time, bool) {
+	if !shouldCountLoginFailure(ldapDetail) {
+		return 0, time.Time{}, false
+	}
+	fc, lu, _ := s.store.RegisterLoginFailure(ctx, username)
+	return fc, lu, true
+}
+
 func (s *Service) userRequiresMFA(ctx context.Context, u model.User) (bool, string) {
+	if strings.EqualFold(strings.TrimSpace(u.AuthProvider), "ldap") {
+		return false, "external_provider_ldap"
+	}
 	if u.MFAEnabled {
 		return true, "user_enrolled"
 	}

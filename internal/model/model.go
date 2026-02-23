@@ -15,6 +15,7 @@ type User struct {
 	ID           int64     `json:"id"`
 	Username     string    `json:"username"`
 	Role         Role      `json:"role"`
+	AuthProvider string    `json:"authProvider,omitempty"`
 	AllowedCIDRs string    `json:"allowedCidrs"`
 	IPCheckOff   bool      `json:"ipCheckOff"`
 	MFAEnabled   bool      `json:"mfaEnabled"`

@@ -21,8 +21,10 @@ import (
 	"sync"
 	"time"
 
+	oidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/oauth2"
 
 	"github.com/domnexdomain/domnexdomain/internal/app"
 	"github.com/domnexdomain/domnexdomain/internal/auth"
@@ -45,11 +47,13 @@ type Server struct {
 	trusted []*net.IPNet
 	loginMu sync.Mutex
 	login   map[string]loginFlow
+	oidcMu  sync.Mutex
+	oidc    map[string]oidcFlow
 }
 
 func New(appSvc *app.Service, authSvc *auth.Service, log *logx.Logger, m *metrics.Collector, live *traffic.LiveHub, trustedProxyCIDRs []string) *Server {
 	trusted, _ := netutil.ParseCIDRs(trustedProxyCIDRs)
-	return &Server{app: appSvc, auth: authSvc, log: log, metrics: m, live: live, trusted: trusted, login: map[string]loginFlow{}}
+	return &Server{app: appSvc, auth: authSvc, log: log, metrics: m, live: live, trusted: trusted, login: map[string]loginFlow{}, oidc: map[string]oidcFlow{}}
 }
 
 func (s *Server) Router() http.Handler {
@@ -62,6 +66,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, map[string]any{"ok": true}) })
 	r.Get("/api/v1/style", s.handlePublicStyle)
 	r.Get("/api/v1/csrf", s.handleCSRF)
+	r.Get("/api/v1/login/options", s.handleLoginOptions)
 	r.Get("/api/v1/setup/status", s.handleSetupStatus)
 	r.Post("/api/v1/setup/unlock", s.handleSetupUnlock)
 	r.Post("/api/v1/setup/restore/upload", s.handleSetupRestoreUpload)
@@ -70,6 +75,8 @@ func (s *Server) Router() http.Handler {
 	r.Post("/api/v1/login/start", s.handleLoginStart)
 	r.Post("/api/v1/login/password", s.handleLoginPassword)
 	r.Post("/api/v1/login/finish", s.handleLoginFinish)
+	r.Post("/api/v1/login/oidc/start", s.handleLoginOIDCStart)
+	r.Get("/api/v1/login/oidc/callback", s.handleLoginOIDCCallback)
 	r.Post("/api/v1/password-reset/consume", s.handleConsumePasswordReset)
 
 	r.Group(func(pr chi.Router) {
@@ -227,7 +234,7 @@ func (s *Server) setupGateMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		switch r.URL.Path {
-		case "/api/v1/style", "/api/v1/csrf", "/api/v1/setup/status", "/api/v1/setup/unlock", "/api/v1/setup/restore/upload", "/api/v1/setup/restore/analyze", "/api/v1/setup/apply":
+		case "/api/v1/style", "/api/v1/csrf", "/api/v1/login/options", "/api/v1/login/oidc/start", "/api/v1/login/oidc/callback", "/api/v1/setup/status", "/api/v1/setup/unlock", "/api/v1/setup/restore/upload", "/api/v1/setup/restore/analyze", "/api/v1/setup/apply":
 			next.ServeHTTP(w, r)
 			return
 		default:
@@ -659,6 +666,170 @@ func (s *Server) handlePublicStyle(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleLoginOptions(w http.ResponseWriter, r *http.Request) {
+	cfg := s.app.GetOIDCSettings(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"oidcEnabled": cfg.Enabled,
+	})
+}
+
+func (s *Server) handleLoginOIDCStart(w http.ResponseWriter, r *http.Request) {
+	cfg := s.app.GetOIDCSettings(r.Context())
+	if !cfg.Enabled {
+		writeErr(w, http.StatusUnauthorized, "login failed")
+		return
+	}
+	clientSecret, err := s.app.GetOIDCClientSecret(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "login failed")
+		return
+	}
+	provider, err := oidc.NewProvider(r.Context(), strings.TrimSpace(cfg.IssuerURL))
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "login failed")
+		return
+	}
+	state, err := randomHex(24)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "login failed")
+		return
+	}
+	nonce, err := randomHex(24)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "login failed")
+		return
+	}
+	scopes := []string{oidc.ScopeOpenID, "profile", "email"}
+	for _, sc := range strings.Fields(strings.ReplaceAll(strings.TrimSpace(cfg.Scopes), ",", " ")) {
+		sc = strings.TrimSpace(sc)
+		if sc == "" {
+			continue
+		}
+		dup := false
+		for _, ex := range scopes {
+			if ex == sc {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			scopes = append(scopes, sc)
+		}
+	}
+	oauthCfg := oauth2.Config{
+		ClientID:     strings.TrimSpace(cfg.ClientID),
+		ClientSecret: clientSecret,
+		RedirectURL:  strings.TrimSpace(cfg.RedirectURL),
+		Endpoint:     provider.Endpoint(),
+		Scopes:       scopes,
+	}
+	now := time.Now().UTC()
+	s.oidcMu.Lock()
+	s.pruneOIDCFlowsLocked(now)
+	s.oidc[state] = oidcFlow{
+		SourceIP: s.auth.SourceIP(r),
+		Nonce:    nonce,
+		Expires:  now.Add(loginFlowTTL),
+	}
+	s.oidcMu.Unlock()
+	authURL := oauthCfg.AuthCodeURL(state, oidc.Nonce(nonce))
+	writeJSON(w, http.StatusOK, map[string]any{"authUrl": authURL})
+}
+
+func (s *Server) handleLoginOIDCCallback(w http.ResponseWriter, r *http.Request) {
+	cfg := s.app.GetOIDCSettings(r.Context())
+	if !cfg.Enabled {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if state == "" || code == "" {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	now := time.Now().UTC()
+	source := s.auth.SourceIP(r)
+	s.oidcMu.Lock()
+	s.pruneOIDCFlowsLocked(now)
+	flow, ok := s.oidc[state]
+	if ok {
+		delete(s.oidc, state)
+	}
+	s.oidcMu.Unlock()
+	if !ok || flow.SourceIP != source {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	clientSecret, err := s.app.GetOIDCClientSecret(r.Context())
+	if err != nil {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	provider, err := oidc.NewProvider(r.Context(), strings.TrimSpace(cfg.IssuerURL))
+	if err != nil {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	scopes := []string{oidc.ScopeOpenID, "profile", "email"}
+	for _, sc := range strings.Fields(strings.ReplaceAll(strings.TrimSpace(cfg.Scopes), ",", " ")) {
+		sc = strings.TrimSpace(sc)
+		if sc != "" {
+			scopes = append(scopes, sc)
+		}
+	}
+	oauthCfg := oauth2.Config{
+		ClientID:     strings.TrimSpace(cfg.ClientID),
+		ClientSecret: clientSecret,
+		RedirectURL:  strings.TrimSpace(cfg.RedirectURL),
+		Endpoint:     provider.Endpoint(),
+		Scopes:       scopes,
+	}
+	token, err := oauthCfg.Exchange(r.Context(), code)
+	if err != nil {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	rawID, _ := token.Extra("id_token").(string)
+	if strings.TrimSpace(rawID) == "" {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	verifier := provider.Verifier(&oidc.Config{ClientID: strings.TrimSpace(cfg.ClientID)})
+	idToken, err := verifier.Verify(r.Context(), rawID)
+	if err != nil {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	var claims map[string]any
+	if err := idToken.Claims(&claims); err != nil {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	if !oidcNonceMatch(claims, flow.Nonce) {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	username := oidcUsernameFromClaims(claims, cfg.UsernameClaim)
+	if username == "" {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	groups := oidcGroupsFromClaims(claims, cfg.GroupsClaim)
+	role, domainIDs, err := s.app.ResolveOIDCRole(r.Context(), groups, cfg)
+	if err != nil {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	sid, _, err := s.auth.AuthenticateExternal(r.Context(), username, role, domainIDs, "oidc", source)
+	if err != nil {
+		http.Redirect(w, r, "/?login=failed", http.StatusFound)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "domnex_session", Value: sid, Path: "/", HttpOnly: true, Secure: isSecureRequest(r), SameSite: http.SameSiteStrictMode, MaxAge: int((12 * time.Hour).Seconds())})
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
 func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Username string `json:"username"`
@@ -803,6 +974,12 @@ type loginFlow struct {
 	Expires  time.Time
 }
 
+type oidcFlow struct {
+	SourceIP string
+	Nonce    string
+	Expires  time.Time
+}
+
 func (s *Server) requireLoginFlow(r *http.Request, stage string) (string, loginFlow, bool) {
 	c, err := r.Cookie(loginFlowCookie)
 	if err != nil || strings.TrimSpace(c.Value) == "" {
@@ -846,6 +1023,82 @@ func (s *Server) pruneLoginFlowsLocked(now time.Time) {
 			delete(s.login, token)
 		}
 	}
+}
+
+func (s *Server) pruneOIDCFlowsLocked(now time.Time) {
+	for state, flow := range s.oidc {
+		if !flow.Expires.After(now) {
+			delete(s.oidc, state)
+		}
+	}
+}
+
+func oidcNonceMatch(claims map[string]any, expected string) bool {
+	v, ok := claims["nonce"]
+	if !ok {
+		return false
+	}
+	raw, ok := v.(string)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(raw) == strings.TrimSpace(expected)
+}
+
+func oidcUsernameFromClaims(claims map[string]any, preferredClaim string) string {
+	keys := []string{strings.TrimSpace(preferredClaim), "preferred_username", "email", "sub"}
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if v, ok := claims[k]; ok {
+			if s, ok := v.(string); ok {
+				s = strings.ToLower(strings.TrimSpace(s))
+				if s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func oidcGroupsFromClaims(claims map[string]any, claim string) []string {
+	claim = strings.TrimSpace(claim)
+	if claim == "" {
+		claim = "groups"
+	}
+	v, ok := claims[claim]
+	if !ok {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(s string) {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	switch g := v.(type) {
+	case string:
+		for _, p := range strings.Fields(strings.ReplaceAll(g, ",", " ")) {
+			add(p)
+		}
+	case []any:
+		for _, it := range g {
+			if s, ok := it.(string); ok {
+				add(s)
+			}
+		}
+	case []string:
+		for _, s := range g {
+			add(s)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleGetOwnMFAStatus(w http.ResponseWriter, r *http.Request) {
@@ -2048,17 +2301,21 @@ func (s *Server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 		LogHTTPBearer      string                `json:"logHttpBearer"`
 		Retention          app.RetentionPolicy   `json:"retention"`
 		MFAPolicy          app.MFAPolicy         `json:"mfaPolicy"`
+		LDAP               app.LDAPSettings      `json:"ldap"`
+		LDAPBindPassword   string                `json:"ldapBindPassword"`
+		OIDC               app.OIDCSettings      `json:"oidc"`
+		OIDCClientSecret   string                `json:"oidcClientSecret"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom, in.TimeSyncMode, in.TimeSyncLANServers, in.LogServers, in.LogHTTPBearer, in.Retention, in.MFAPolicy); err != nil {
+	if err := s.app.SetRuntimeSettings(r.Context(), in.ACMEEmail, in.ACMEStaging, in.CFToken, in.PublicIPv4, in.BaseDomain, in.StyleProfile, in.StyleCustom, in.TimeSyncMode, in.TimeSyncLANServers, in.LogServers, in.LogHTTPBearer, in.Retention, in.MFAPolicy, in.LDAP, in.LDAPBindPassword, in.OIDC, in.OIDCClientSecret); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	actor := id.Username
-	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "settings.update", Target: "runtime", Meta: "acme/cloudflare/base-domain/time-sync/logservers/retention/mfa-policy"})
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: actor, Action: "settings.update", Target: "runtime", Meta: "acme/cloudflare/base-domain/time-sync/logservers/retention/mfa-policy/ldap/oidc"})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
 		"restartNeeded": true,

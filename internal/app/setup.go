@@ -252,6 +252,10 @@ func (s *Service) ApplyInitialSetup(ctx context.Context, in SetupApplyInput) err
 			in.LogHTTPBearer,
 			in.Retention,
 			MFAPolicy{},
+			LDAPSettings{},
+			"",
+			OIDCSettings{},
+			"",
 		); err != nil {
 			return err
 		}

@@ -97,6 +97,8 @@ const (
 	settingMFAEnforceAdmin       = "auth.mfa.enforce_admin"
 	settingMFAEnforceDomainAdmin = "auth.mfa.enforce_domain_admin"
 	settingMFAEnforceReadOnly    = "auth.mfa.enforce_read_only"
+	settingLDAPConfig            = "auth.ldap.config"
+	settingOIDCConfig            = "auth.oidc.config"
 )
 
 const (
@@ -109,21 +111,54 @@ const (
 )
 
 type RuntimeSettings struct {
-	Domain             string            `json:"domain"`
-	BaseDomain         string            `json:"baseDomain"`
-	AdminFQDN          string            `json:"adminFqdn"`
-	ACMEEmail          string            `json:"acmeEmail"`
-	ACMEStaging        bool              `json:"acmeStaging"`
-	HasCFToken         bool              `json:"hasCloudflareToken"`
-	PublicIPv4         string            `json:"publicIpv4"`
-	StyleProfile       string            `json:"styleProfile"`
-	StyleCustom        string            `json:"styleCustom"`
-	TimeSyncMode       string            `json:"timeSyncMode"`
-	TimeSyncLANServers []string          `json:"timeSyncLANServers"`
-	LogServers         LogServerSettings `json:"logServers"`
-	HasLogHTTPBearer   bool              `json:"hasLogHTTPBearer"`
-	Retention          RetentionPolicy   `json:"retention"`
-	MFAPolicy          MFAPolicy         `json:"mfaPolicy"`
+	Domain              string            `json:"domain"`
+	BaseDomain          string            `json:"baseDomain"`
+	AdminFQDN           string            `json:"adminFqdn"`
+	ACMEEmail           string            `json:"acmeEmail"`
+	ACMEStaging         bool              `json:"acmeStaging"`
+	HasCFToken          bool              `json:"hasCloudflareToken"`
+	PublicIPv4          string            `json:"publicIpv4"`
+	StyleProfile        string            `json:"styleProfile"`
+	StyleCustom         string            `json:"styleCustom"`
+	TimeSyncMode        string            `json:"timeSyncMode"`
+	TimeSyncLANServers  []string          `json:"timeSyncLANServers"`
+	LogServers          LogServerSettings `json:"logServers"`
+	HasLogHTTPBearer    bool              `json:"hasLogHTTPBearer"`
+	Retention           RetentionPolicy   `json:"retention"`
+	MFAPolicy           MFAPolicy         `json:"mfaPolicy"`
+	LDAP                LDAPSettings      `json:"ldap"`
+	HasLDAPBindPass     bool              `json:"hasLdapBindPassword"`
+	OIDC                OIDCSettings      `json:"oidc"`
+	HasOIDCClientSecret bool              `json:"hasOidcClientSecret"`
+}
+
+type LDAPSettings struct {
+	Enabled              bool    `json:"enabled"`
+	URL                  string  `json:"url"`
+	StartTLS             bool    `json:"startTls"`
+	InsecureSkipVerify   bool    `json:"insecureSkipVerify"`
+	BindDN               string  `json:"bindDn"`
+	UserBaseDN           string  `json:"userBaseDn"`
+	GroupBaseDN          string  `json:"groupBaseDn"`
+	UserAttr             string  `json:"userAttr"`
+	AdminGroup           string  `json:"adminGroup"`
+	DomainAdminGroup     string  `json:"domainAdminGroup"`
+	ReadOnlyGroup        string  `json:"readOnlyGroup"`
+	DomainAdminDomainIDs []int64 `json:"domainAdminDomainIds"`
+}
+
+type OIDCSettings struct {
+	Enabled              bool    `json:"enabled"`
+	IssuerURL            string  `json:"issuerUrl"`
+	ClientID             string  `json:"clientId"`
+	RedirectURL          string  `json:"redirectUrl"`
+	Scopes               string  `json:"scopes"`
+	UsernameClaim        string  `json:"usernameClaim"`
+	GroupsClaim          string  `json:"groupsClaim"`
+	AdminGroup           string  `json:"adminGroup"`
+	DomainAdminGroup     string  `json:"domainAdminGroup"`
+	ReadOnlyGroup        string  `json:"readOnlyGroup"`
+	DomainAdminDomainIDs []int64 `json:"domainAdminDomainIds"`
 }
 
 type MFAPolicy struct {
@@ -194,6 +229,7 @@ type ManagedUser struct {
 	ID              int64      `json:"id"`
 	Username        string     `json:"username"`
 	Role            model.Role `json:"role"`
+	AuthProvider    string     `json:"authProvider"`
 	DomainIDs       []int64    `json:"domainIds"`
 	AllowedCIDRs    string     `json:"allowedCidrs"`
 	IPCheckDisabled bool       `json:"ipCheckDisabled"`
@@ -759,10 +795,18 @@ func (s *Service) GetRuntimeSettings(ctx context.Context) (RuntimeSettings, erro
 	}
 	out.Retention = s.getRetentionPolicy(ctx)
 	out.MFAPolicy = s.getMFAPolicy(ctx)
+	out.LDAP = s.getLDAPSettings(ctx)
+	if _, err := s.store.GetSecret(ctx, "auth.ldap.bind_password"); err == nil {
+		out.HasLDAPBindPass = true
+	}
+	out.OIDC = s.getOIDCSettings(ctx)
+	if _, err := s.store.GetSecret(ctx, "auth.oidc.client_secret"); err == nil {
+		out.HasOIDCClientSecret = true
+	}
 	return out, nil
 }
 
-func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom, timeSyncMode, timeSyncLANServers string, logServers LogServerSettings, logHTTPBearer string, retention RetentionPolicy, mfaPolicy MFAPolicy) error {
+func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acmeStaging bool, cfToken, publicIPv4, baseDomain, styleProfile, styleCustom, timeSyncMode, timeSyncLANServers string, logServers LogServerSettings, logHTTPBearer string, retention RetentionPolicy, mfaPolicy MFAPolicy, ldap LDAPSettings, ldapBindPass string, oidc OIDCSettings, oidcClientSecret string) error {
 	acmeEmail = strings.TrimSpace(acmeEmail)
 	if acmeEmail != "" {
 		if err := s.store.SetSetting(ctx, "acme.email", acmeEmail); err != nil {
@@ -883,7 +927,197 @@ func (s *Service) SetRuntimeSettings(ctx context.Context, acmeEmail string, acme
 	if err := s.store.SetSetting(ctx, settingMFAEnforceReadOnly, strconv.FormatBool(mfaPolicy.EnforceReadOnly)); err != nil {
 		return err
 	}
+	ldap = normalizeLDAPSettings(ldap)
+	if ldap.Enabled {
+		if strings.TrimSpace(ldap.URL) == "" {
+			return fmt.Errorf("ldap url required when ldap is enabled")
+		}
+		if strings.TrimSpace(ldap.BindDN) == "" {
+			return fmt.Errorf("ldap bind dn required when ldap is enabled")
+		}
+		if strings.TrimSpace(ldap.UserBaseDN) == "" {
+			return fmt.Errorf("ldap user base dn required when ldap is enabled")
+		}
+		if strings.TrimSpace(ldap.GroupBaseDN) == "" {
+			return fmt.Errorf("ldap group base dn required when ldap is enabled")
+		}
+		if strings.TrimSpace(ldap.AdminGroup) == "" && strings.TrimSpace(ldap.DomainAdminGroup) == "" && strings.TrimSpace(ldap.ReadOnlyGroup) == "" {
+			return fmt.Errorf("at least one ldap role mapping group is required")
+		}
+	}
+	if err := s.store.SetSetting(ctx, settingLDAPConfig, mustJSON(ldap)); err != nil {
+		return err
+	}
+	if strings.TrimSpace(ldapBindPass) != "" {
+		enc, err := s.keystore.Encrypt(strings.TrimSpace(ldapBindPass))
+		if err != nil {
+			return err
+		}
+		if err := s.store.StoreSecret(ctx, "auth.ldap.bind_password", enc); err != nil {
+			return err
+		}
+	}
+	oidc = normalizeOIDCSettings(oidc)
+	if oidc.Enabled {
+		if strings.TrimSpace(oidc.IssuerURL) == "" {
+			return fmt.Errorf("oidc issuer url required when oidc is enabled")
+		}
+		if strings.TrimSpace(oidc.ClientID) == "" {
+			return fmt.Errorf("oidc client id required when oidc is enabled")
+		}
+		if strings.TrimSpace(oidc.RedirectURL) == "" {
+			return fmt.Errorf("oidc redirect url required when oidc is enabled")
+		}
+		if strings.TrimSpace(oidc.AdminGroup) == "" && strings.TrimSpace(oidc.DomainAdminGroup) == "" && strings.TrimSpace(oidc.ReadOnlyGroup) == "" {
+			return fmt.Errorf("at least one oidc role mapping group is required")
+		}
+		if strings.TrimSpace(oidcClientSecret) == "" {
+			if _, err := s.store.GetSecret(ctx, "auth.oidc.client_secret"); err != nil {
+				return fmt.Errorf("oidc client secret required when oidc is enabled")
+			}
+		}
+	}
+	if err := s.store.SetSetting(ctx, settingOIDCConfig, mustJSON(oidc)); err != nil {
+		return err
+	}
+	if strings.TrimSpace(oidcClientSecret) != "" {
+		enc, err := s.keystore.Encrypt(strings.TrimSpace(oidcClientSecret))
+		if err != nil {
+			return err
+		}
+		if err := s.store.StoreSecret(ctx, "auth.oidc.client_secret", enc); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func normalizeLDAPSettings(in LDAPSettings) LDAPSettings {
+	out := in
+	out.URL = strings.TrimSpace(out.URL)
+	out.BindDN = strings.TrimSpace(out.BindDN)
+	out.UserBaseDN = strings.TrimSpace(out.UserBaseDN)
+	out.GroupBaseDN = strings.TrimSpace(out.GroupBaseDN)
+	out.UserAttr = strings.TrimSpace(out.UserAttr)
+	if out.UserAttr == "" {
+		out.UserAttr = "uid"
+	}
+	out.AdminGroup = strings.TrimSpace(out.AdminGroup)
+	out.DomainAdminGroup = strings.TrimSpace(out.DomainAdminGroup)
+	out.ReadOnlyGroup = strings.TrimSpace(out.ReadOnlyGroup)
+	d := out.DomainAdminDomainIDs[:0]
+	seen := map[int64]bool{}
+	for _, id := range out.DomainAdminDomainIDs {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		d = append(d, id)
+	}
+	out.DomainAdminDomainIDs = d
+	return out
+}
+
+func (s *Service) getLDAPSettings(ctx context.Context) LDAPSettings {
+	raw, err := s.store.GetSetting(ctx, settingLDAPConfig)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return normalizeLDAPSettings(LDAPSettings{})
+	}
+	var out LDAPSettings
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return normalizeLDAPSettings(LDAPSettings{})
+	}
+	return normalizeLDAPSettings(out)
+}
+
+func normalizeOIDCSettings(in OIDCSettings) OIDCSettings {
+	out := in
+	out.IssuerURL = strings.TrimSpace(out.IssuerURL)
+	out.ClientID = strings.TrimSpace(out.ClientID)
+	out.RedirectURL = strings.TrimSpace(out.RedirectURL)
+	out.Scopes = strings.TrimSpace(out.Scopes)
+	out.UsernameClaim = strings.TrimSpace(out.UsernameClaim)
+	if out.UsernameClaim == "" {
+		out.UsernameClaim = "preferred_username"
+	}
+	out.GroupsClaim = strings.TrimSpace(out.GroupsClaim)
+	if out.GroupsClaim == "" {
+		out.GroupsClaim = "groups"
+	}
+	out.AdminGroup = strings.TrimSpace(out.AdminGroup)
+	out.DomainAdminGroup = strings.TrimSpace(out.DomainAdminGroup)
+	out.ReadOnlyGroup = strings.TrimSpace(out.ReadOnlyGroup)
+	d := out.DomainAdminDomainIDs[:0]
+	seen := map[int64]bool{}
+	for _, id := range out.DomainAdminDomainIDs {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		d = append(d, id)
+	}
+	out.DomainAdminDomainIDs = d
+	return out
+}
+
+func (s *Service) getOIDCSettings(ctx context.Context) OIDCSettings {
+	raw, err := s.store.GetSetting(ctx, settingOIDCConfig)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return normalizeOIDCSettings(OIDCSettings{})
+	}
+	var out OIDCSettings
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return normalizeOIDCSettings(OIDCSettings{})
+	}
+	return normalizeOIDCSettings(out)
+}
+
+func (s *Service) GetOIDCSettings(ctx context.Context) OIDCSettings {
+	return s.getOIDCSettings(ctx)
+}
+
+func (s *Service) GetOIDCClientSecret(ctx context.Context) (string, error) {
+	enc, err := s.store.GetSecret(ctx, "auth.oidc.client_secret")
+	if err != nil {
+		return "", err
+	}
+	return s.keystore.Decrypt(enc)
+}
+
+func (s *Service) ResolveOIDCRole(ctx context.Context, groups []string, cfg OIDCSettings) (model.Role, []int64, error) {
+	groupSet := map[string]bool{}
+	for _, g := range groups {
+		g = strings.ToLower(strings.TrimSpace(g))
+		if g != "" {
+			groupSet[g] = true
+		}
+	}
+	admin := strings.ToLower(strings.TrimSpace(cfg.AdminGroup))
+	domAdmin := strings.ToLower(strings.TrimSpace(cfg.DomainAdminGroup))
+	readOnly := strings.ToLower(strings.TrimSpace(cfg.ReadOnlyGroup))
+
+	switch {
+	case admin != "" && groupSet[admin]:
+		return model.RoleAdmin, nil, nil
+	case domAdmin != "" && groupSet[domAdmin]:
+		ids := append([]int64(nil), cfg.DomainAdminDomainIDs...)
+		if len(ids) == 0 {
+			all, err := s.store.ListDomainIDs(ctx)
+			if err == nil {
+				ids = all
+			}
+		}
+		return model.RoleDomainAdmin, ids, nil
+	case readOnly != "" && groupSet[readOnly]:
+		return model.RoleReadOnly, nil, nil
+	default:
+		return "", nil, fmt.Errorf("oidc group mapping missing")
+	}
+}
+
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 func normalizeMFAPolicy(in MFAPolicy) MFAPolicy {
@@ -3101,6 +3335,7 @@ func (s *Service) CreateManagedUser(ctx context.Context, username, password stri
 		ID:              u.ID,
 		Username:        u.Username,
 		Role:            u.Role,
+		AuthProvider:    strings.TrimSpace(u.AuthProvider),
 		DomainIDs:       ids,
 		AllowedCIDRs:    u.AllowedCIDRs,
 		IPCheckDisabled: u.IPCheckOff,
@@ -3123,6 +3358,7 @@ func (s *Service) ListManagedUsers(ctx context.Context) ([]ManagedUser, error) {
 			ID:              u.ID,
 			Username:        u.Username,
 			Role:            u.Role,
+			AuthProvider:    strings.TrimSpace(u.AuthProvider),
 			DomainIDs:       ids,
 			AllowedCIDRs:    u.AllowedCIDRs,
 			IPCheckDisabled: u.IPCheckOff,
@@ -3174,6 +3410,15 @@ func (s *Service) SetManagedUserAccess(ctx context.Context, userID int64, role m
 }
 
 func (s *Service) DeleteManagedUser(ctx context.Context, userID int64) error {
+	u, err := s.store.GetUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if strings.EqualFold(strings.TrimSpace(u.AuthProvider), "ldap") {
+		if err := s.store.EnqueueLDAPDelete(ctx, u.Username); err != nil {
+			return err
+		}
+	}
 	return s.store.DeleteUser(ctx, userID)
 }
 

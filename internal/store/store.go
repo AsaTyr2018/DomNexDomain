@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL UNIQUE,
   role TEXT NOT NULL,
+  auth_provider TEXT NOT NULL DEFAULT 'local',
   allowed_cidrs TEXT NOT NULL DEFAULT '',
   ip_check_disabled INTEGER NOT NULL DEFAULT 0,
   mfa_enabled INTEGER NOT NULL DEFAULT 0,
@@ -163,6 +164,13 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   failed_count INTEGER NOT NULL DEFAULT 0,
   last_failed_at TEXT NOT NULL,
   lock_until TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ldap_delete_queue (
+  username TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_error TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS blocked_ips (
@@ -420,6 +428,9 @@ CREATE INDEX IF NOT EXISTS idx_backup_archives_storage_created ON backup_archive
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local'`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN mfa_secret_enc TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return err
 	}
@@ -438,7 +449,7 @@ func (s *Store) EnsureBootstrapUser(ctx context.Context, username, role, passHas
 		return false, nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, username, role, "", 0, passHash, now, now)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, auth_provider, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)`, username, role, "local", "", 0, passHash, now, now)
 	return true, err
 }
 
@@ -454,8 +465,8 @@ func (s *Store) FindUserByUsername(ctx context.Context, username string) (model.
 	var u model.User
 	var created, updated, mfaEnrolledAt string
 	var ipCheckDisabled, mfaEnabled int
-	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users WHERE username=?`, username).
-		Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated)
+	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, auth_provider, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users WHERE username=?`, username).
+		Scan(&u.ID, &u.Username, &u.Role, &u.AuthProvider, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated)
 	if err != nil {
 		return u, err
 	}
@@ -471,8 +482,8 @@ func (s *Store) GetUserByID(ctx context.Context, id int64) (model.User, error) {
 	var u model.User
 	var created, updated, mfaEnrolledAt string
 	var ipCheckDisabled, mfaEnabled int
-	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users WHERE id=?`, id).
-		Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated)
+	err := s.db.QueryRowContext(ctx, `SELECT id, username, role, auth_provider, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users WHERE id=?`, id).
+		Scan(&u.ID, &u.Username, &u.Role, &u.AuthProvider, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated)
 	if err != nil {
 		return u, err
 	}
@@ -1648,10 +1659,11 @@ func (s *Store) ClearLoginFailures(ctx context.Context, username string) error {
 }
 
 func loginFailureDelay(fails int) time.Duration {
-	if fails < 5 {
+	if fails < 3 {
 		return 0
 	}
-	sec := 1 << min(fails-4, 8)
+	steps := fails - 2
+	sec := steps * 6
 	if sec > 300 {
 		sec = 300
 	}
@@ -1779,7 +1791,7 @@ func (s *Store) CreateUser(ctx context.Context, username string, role model.Role
 		return model.User{}, fmt.Errorf("ip check can be disabled only after MFA is enabled for this user")
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	res, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, username, string(role), strings.TrimSpace(allowedCIDRs), boolToInt(ipCheckDisabled), passHash, now, now)
+	res, err := s.db.ExecContext(ctx, `INSERT INTO users(username, role, auth_provider, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)`, username, string(role), "local", strings.TrimSpace(allowedCIDRs), boolToInt(ipCheckDisabled), passHash, now, now)
 	if err != nil {
 		return model.User{}, err
 	}
@@ -1787,8 +1799,86 @@ func (s *Store) CreateUser(ctx context.Context, username string, role model.Role
 	return s.GetUserByID(ctx, id)
 }
 
+func (s *Store) UpsertExternalUser(ctx context.Context, username string, role model.Role, domainIDs []int64, provider, passHash string) (model.User, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return model.User{}, fmt.Errorf("username required")
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		provider = "ldap"
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return model.User{}, err
+	}
+	defer tx.Rollback()
+
+	var id int64
+	var existingProvider string
+	err = tx.QueryRowContext(ctx, `SELECT id, auth_provider FROM users WHERE username=?`, username).Scan(&id, &existingProvider)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		res, exErr := tx.ExecContext(ctx, `INSERT INTO users(username, role, auth_provider, allowed_cidrs, ip_check_disabled, password_hash, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)`,
+			username, string(role), provider, "", 0, passHash, now, now)
+		if exErr != nil {
+			return model.User{}, exErr
+		}
+		id, _ = res.LastInsertId()
+	case err != nil:
+		return model.User{}, err
+	default:
+		existingProvider = strings.ToLower(strings.TrimSpace(existingProvider))
+		if existingProvider == "" {
+			existingProvider = "local"
+		}
+		if existingProvider != provider {
+			return model.User{}, fmt.Errorf("username already exists with local auth provider")
+		}
+		if _, exErr := tx.ExecContext(ctx, `UPDATE users SET role=?, auth_provider=?, updated_at=? WHERE id=?`, string(role), provider, now, id); exErr != nil {
+			return model.User{}, exErr
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_domain_scopes WHERE user_id=?`, id); err != nil {
+		return model.User{}, err
+	}
+	if role == model.RoleDomainAdmin {
+		for _, did := range domainIDs {
+			if did <= 0 {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO user_domain_scopes(user_id, domain_id, created_at) VALUES(?,?,?)`, id, did, now); err != nil {
+				return model.User{}, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return model.User{}, err
+	}
+	return s.GetUserByID(ctx, id)
+}
+
+func (s *Store) ListDomainIDs(ctx context.Context) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM domains ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]int64, 0, 16)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, username, role, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users ORDER BY username`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, username, role, auth_provider, allowed_cidrs, ip_check_disabled, mfa_enabled, mfa_secret_enc, mfa_enrolled_at, password_hash, created_at, updated_at FROM users ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
@@ -1798,7 +1888,7 @@ func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
 		var u model.User
 		var created, updated, mfaEnrolledAt string
 		var ipCheckDisabled, mfaEnabled int
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.AuthProvider, &u.AllowedCIDRs, &ipCheckDisabled, &mfaEnabled, &u.MFASecretEnc, &mfaEnrolledAt, &u.PasswordHash, &created, &updated); err != nil {
 			return nil, err
 		}
 		u.IPCheckOff = ipCheckDisabled != 0
@@ -1813,6 +1903,62 @@ func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
 
 func (s *Store) DeleteUser(ctx context.Context, userID int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM users WHERE id=?`, userID)
+	return err
+}
+
+func (s *Store) EnqueueLDAPDelete(ctx context.Context, username string) error {
+	username = strings.ToLower(strings.TrimSpace(username))
+	if username == "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO ldap_delete_queue(username, created_at, updated_at, last_error)
+VALUES(?,?,?,'')
+ON CONFLICT(username) DO UPDATE SET updated_at=excluded.updated_at, last_error=''`,
+		username, now, now)
+	return err
+}
+
+func (s *Store) ListLDAPDeleteQueue(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT username FROM ldap_delete_queue ORDER BY updated_at ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0, limit)
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, err
+		}
+		u = strings.ToLower(strings.TrimSpace(u))
+		if u != "" {
+			out = append(out, u)
+		}
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SetLDAPDeleteQueueError(ctx context.Context, username, lastErr string) error {
+	username = strings.ToLower(strings.TrimSpace(username))
+	if username == "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `UPDATE ldap_delete_queue SET updated_at=?, last_error=? WHERE username=?`, now, strings.TrimSpace(lastErr), username)
+	return err
+}
+
+func (s *Store) RemoveLDAPDeleteQueue(ctx context.Context, username string) error {
+	username = strings.ToLower(strings.TrimSpace(username))
+	if username == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ldap_delete_queue WHERE username=?`, username)
 	return err
 }
 

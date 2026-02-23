@@ -18,10 +18,38 @@ type LogServerTCPJSONSettings = { enabled: boolean; address: string; timeoutSec:
 type LogServerSettings = { syslog: LogServerSyslogSettings; http: LogServerHTTPSettings; tcpJson: LogServerTCPJSONSettings };
 type RetentionPolicy = { auditDays: number; trafficDays: number; visitorsDays: number; threatDays: number; blockedDays: number; loginAttemptDays: number; passwordResetDays: number };
 type MFAPolicy = { enforceAdmin: boolean; enforceDomainAdmin: boolean; enforceReadOnly: boolean };
-type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean; retention?: RetentionPolicy; mfaPolicy?: MFAPolicy };
+type LDAPSettings = {
+  enabled: boolean;
+  url: string;
+  startTls: boolean;
+  insecureSkipVerify: boolean;
+  bindDn: string;
+  userBaseDn: string;
+  groupBaseDn: string;
+  userAttr: string;
+  adminGroup: string;
+  domainAdminGroup: string;
+  readOnlyGroup: string;
+  domainAdminDomainIds: number[];
+};
+type OIDCSettings = {
+  enabled: boolean;
+  issuerUrl: string;
+  clientId: string;
+  redirectUrl: string;
+  scopes: string;
+  usernameClaim: string;
+  groupsClaim: string;
+  adminGroup: string;
+  domainAdminGroup: string;
+  readOnlyGroup: string;
+  domainAdminDomainIds: number[];
+};
+type RuntimeSettings = { domain: string; baseDomain?: string; adminFqdn?: string; acmeEmail: string; acmeStaging: boolean; hasCloudflareToken: boolean; publicIpv4?: string; styleProfile?: string; styleCustom?: string; timeSyncMode?: 'system_only' | 'external_public' | 'external_lan'; timeSyncLANServers?: string[]; logServers?: LogServerSettings; hasLogHTTPBearer?: boolean; retention?: RetentionPolicy; mfaPolicy?: MFAPolicy; ldap?: LDAPSettings; hasLdapBindPassword?: boolean; oidc?: OIDCSettings; hasOidcClientSecret?: boolean };
 type SetupStatus = { initialized: boolean; locked: boolean; unlocked: boolean; restoreReady?: boolean; otsExpiresAt?: string; unlockUntil?: string; cooldownUntil?: string };
 type SetupBackupMeta = { fileName: string; format: string; createdAt: string; domnexVersion: string; domains: number; subdomains: number; users: number };
 type LoginStep = 'username' | 'password' | 'otp';
+type LoginOptions = { oidcEnabled?: boolean };
 type BackupMeta = SetupBackupMeta & { dbSha256?: string; keySha256?: string };
 type BackupFTPSettings = { enabled: boolean; host: string; port: number; username: string; remoteDir: string; tlsMode: 'off' | 'explicit' | 'implicit'; hasPassword?: boolean };
 type BackupLocalSettings = { enabled: boolean; dir: string };
@@ -59,6 +87,7 @@ type ManagedUser = {
   id: number;
   username: string;
   role: string;
+  authProvider?: string;
   domainIds: number[];
   allowedCidrs?: string;
   ipCheckDisabled?: boolean;
@@ -166,7 +195,7 @@ type GeoIPStats = {
 };
 
 type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'ssh' | 'audit' | 'account' | 'accessControl' | 'integrations' | 'help';
-type SettingsTab = 'general' | 'security' | 'mfa' | 'logservers' | 'geoip' | 'appearance' | 'advanced';
+type SettingsTab = 'general' | 'security' | 'idp' | 'mfa' | 'logservers' | 'geoip' | 'appearance' | 'advanced';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
 type PublicStyle = { styleProfile?: string; styleCustom?: string };
@@ -223,6 +252,33 @@ const defaultBackupScheduleSettings = (): BackupScheduleSettings => ({
     tlsMode: 'explicit',
     hasPassword: false,
   },
+});
+const defaultLDAPSettings = (): LDAPSettings => ({
+  enabled: false,
+  url: '',
+  startTls: false,
+  insecureSkipVerify: false,
+  bindDn: '',
+  userBaseDn: '',
+  groupBaseDn: '',
+  userAttr: 'uid',
+  adminGroup: 'DomNexAdmin',
+  domainAdminGroup: 'DomNexSubAdmin',
+  readOnlyGroup: 'DomNexReadOnly',
+  domainAdminDomainIds: [],
+});
+const defaultOIDCSettings = (): OIDCSettings => ({
+  enabled: false,
+  issuerUrl: '',
+  clientId: '',
+  redirectUrl: '',
+  scopes: 'openid profile email',
+  usernameClaim: 'preferred_username',
+  groupsClaim: 'groups',
+  adminGroup: 'DomNexAdmin',
+  domainAdminGroup: 'DomNexSubAdmin',
+  readOnlyGroup: 'DomNexReadOnly',
+  domainAdminDomainIds: [],
 });
 
 const mkID = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -581,6 +637,7 @@ function App() {
   const [loginPass, setLoginPass] = useState('');
   const [loginOTP, setLoginOTP] = useState('');
   const [loginStep, setLoginStep] = useState<LoginStep>('username');
+  const [loginOptions, setLoginOptions] = useState<LoginOptions>({});
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
   const [setupMode, setSetupMode] = useState<'fresh' | 'restore'>('fresh');
   const [setupStep, setSetupStep] = useState(1);
@@ -667,6 +724,10 @@ function App() {
   const [settingsLogHTTPBearer, setSettingsLogHTTPBearer] = useState('');
   const [settingsRetention, setSettingsRetention] = useState<RetentionPolicy>(defaultRetentionPolicy());
   const [settingsMFAPolicy, setSettingsMFAPolicy] = useState<MFAPolicy>({ enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
+  const [settingsLDAP, setSettingsLDAP] = useState<LDAPSettings>(defaultLDAPSettings());
+  const [settingsLDAPBindPassword, setSettingsLDAPBindPassword] = useState('');
+  const [settingsOIDC, setSettingsOIDC] = useState<OIDCSettings>(defaultOIDCSettings());
+  const [settingsOIDCClientSecret, setSettingsOIDCClientSecret] = useState('');
   const [geoipSources, setGeoipSources] = useState<GeoIPSource[]>([]);
   const [geoipStats, setGeoipStats] = useState<GeoIPStats | null>(null);
   const [geoipUploadFile, setGeoipUploadFile] = useState<File | null>(null);
@@ -720,6 +781,7 @@ function App() {
   const [editUserAllowedCIDRs, setEditUserAllowedCIDRs] = useState('');
   const [editUserIPCheckDisabled, setEditUserIPCheckDisabled] = useState(false);
   const [usersRoleFilter, setUsersRoleFilter] = useState<'all' | 'admin' | 'domain-admin' | 'read-only'>('all');
+  const [usersProviderFilter, setUsersProviderFilter] = useState<'all' | 'local' | 'ldap' | 'oidc'>('all');
   const [usersQuery, setUsersQuery] = useState('');
   const [selfNotifyEmail, setSelfNotifyEmail] = useState('');
   const [selfCurrentPassword, setSelfCurrentPassword] = useState('');
@@ -764,10 +826,20 @@ function App() {
     }
   };
 
+  const loadLoginOptions = async () => {
+    try {
+      const out = await api<LoginOptions>('/api/v1/login/options');
+      setLoginOptions(out || {});
+    } catch {
+      setLoginOptions({});
+    }
+  };
+
   const refresh = async () => {
     setLoading(true);
     setError('');
     try {
+      await loadLoginOptions();
       const st = await loadSetupStatus();
       if (st && !st.initialized) {
         setIdentity(null);
@@ -876,6 +948,8 @@ function App() {
         setSettingsLogServers(s.logServers || defaultLogServers());
         setSettingsRetention(s.retention || defaultRetentionPolicy());
         setSettingsMFAPolicy(s.mfaPolicy || { enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
+        setSettingsLDAP(s.ldap || defaultLDAPSettings());
+        setSettingsOIDC(s.oidc || defaultOIDCSettings());
       } catch {
         setSettings(null);
         setSettingsPublicIPv4('');
@@ -887,6 +961,8 @@ function App() {
         setSettingsLogServers(defaultLogServers());
         setSettingsRetention(defaultRetentionPolicy());
         setSettingsMFAPolicy({ enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
+        setSettingsLDAP(defaultLDAPSettings());
+        setSettingsOIDC(defaultOIDCSettings());
       }
       try {
         const b = await api<BackupScheduleSettings>('/api/v1/backup/settings');
@@ -1186,6 +1262,22 @@ function App() {
       setLoginStep('username');
       setError('Invalid login.');
     } finally {
+      setLoading(false);
+    }
+  };
+
+  const loginWithOIDC = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const out = await api<{ authUrl?: string }>('/api/v1/login/oidc/start', {
+        method: 'POST',
+      });
+      const url = (out.authUrl || '').trim();
+      if (!url) throw new Error('OIDC login unavailable');
+      window.location.href = url;
+    } catch {
+      setError('Invalid login.');
       setLoading(false);
     }
   };
@@ -2032,10 +2124,12 @@ function App() {
     const q = usersQuery.trim().toLowerCase();
     return users.filter((u) => {
       if (usersRoleFilter !== 'all' && u.role !== usersRoleFilter) return false;
+      const provider = String(u.authProvider || 'local').trim().toLowerCase() || 'local';
+      if (usersProviderFilter !== 'all' && provider !== usersProviderFilter) return false;
       if (!q) return true;
-      return u.username.toLowerCase().includes(q) || String(u.id).includes(q) || u.role.toLowerCase().includes(q);
+      return u.username.toLowerCase().includes(q) || String(u.id).includes(q) || u.role.toLowerCase().includes(q) || provider.includes(q);
     });
-  }, [users, usersRoleFilter, usersQuery]);
+  }, [users, usersRoleFilter, usersProviderFilter, usersQuery]);
   const editingUser = editUserID ? (users.find((u) => u.id === editUserID) || null) : null;
   const configuredAdminFQDN = settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '');
   const activeTheme = useMemo<ThemeVars>(() => {
@@ -2507,10 +2601,16 @@ function App() {
           logHttpBearer: settingsLogHTTPBearer,
           retention: settingsRetention,
           mfaPolicy: settingsMFAPolicy,
+          ldap: settingsLDAP,
+          ldapBindPassword: settingsLDAPBindPassword,
+          oidc: settingsOIDC,
+          oidcClientSecret: settingsOIDCClientSecret,
         }),
       });
       setSettingsCFToken('');
       setSettingsLogHTTPBearer('');
+      setSettingsLDAPBindPassword('');
+      setSettingsOIDCClientSecret('');
       setSettingsMessage(out.message || 'Settings saved.');
       await refresh();
       await loadTimeSyncStatus();
@@ -4550,6 +4650,7 @@ function App() {
                   <div className="wizard-steps" style={{ marginBottom: '.75rem' }}>
                     <button className={settingsTab === 'general' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('general')}>General</button>
                     <button className={settingsTab === 'security' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('security')}>Security &amp; Time</button>
+                    <button className={settingsTab === 'idp' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('idp')}>Identity Providers</button>
                     <button className={settingsTab === 'mfa' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('mfa')}>MFA</button>
                     <button className={settingsTab === 'logservers' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('logservers')}>Logservers</button>
                     <button className={settingsTab === 'geoip' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('geoip')}>GeoIP Sources</button>
@@ -4670,6 +4771,122 @@ function App() {
                           <button className="btn" onClick={saveThreatIntelConfig} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Save Threat Intel Policy</button>
                         </div>
                         {tiConfigSavedAt ? <div className="muted" style={{ marginTop: '.5rem' }}>Policy saved: {new Date(tiConfigSavedAt).toLocaleString()}</div> : null}
+                      </div>
+                    </>
+                  ) : null}
+                  {settingsTab === 'idp' ? (
+                    <>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>LDAP / Active Directory</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Enable LDAP</label>
+                            <label className="check"><input type="checkbox" checked={!!settingsLDAP.enabled} onChange={(e) => setSettingsLDAP((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> Enable external LDAP authentication</label>
+                          </div>
+                          <div className="field">
+                            <label>LDAP URL</label>
+                            <input value={settingsLDAP.url} onChange={(e) => setSettingsLDAP((p) => ({ ...p, url: e.target.value }))} placeholder="ldaps://mylab.intern:636" />
+                          </div>
+                          <div className="field">
+                            <label>User Attribute</label>
+                            <input value={settingsLDAP.userAttr || 'uid'} onChange={(e) => setSettingsLDAP((p) => ({ ...p, userAttr: e.target.value }))} placeholder="uid" />
+                          </div>
+                          <div className="field">
+                            <label>StartTLS (ldap:// only)</label>
+                            <label className="check"><input type="checkbox" checked={!!settingsLDAP.startTls} onChange={(e) => setSettingsLDAP((p) => ({ ...p, startTls: e.target.checked }))} /> Upgrade LDAP 389 via StartTLS</label>
+                          </div>
+                          <div className="field">
+                            <label>Insecure TLS Verify (test only)</label>
+                            <label className="check"><input type="checkbox" checked={!!settingsLDAP.insecureSkipVerify} onChange={(e) => setSettingsLDAP((p) => ({ ...p, insecureSkipVerify: e.target.checked }))} /> Accept self-signed/invalid certs</label>
+                          </div>
+                          <div className="field">
+                            <label>Bind DN</label>
+                            <input value={settingsLDAP.bindDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, bindDn: e.target.value }))} placeholder="cn=admin,dc=mylab,dc=intern" />
+                          </div>
+                          <div className="field">
+                            <label>Bind Password</label>
+                            <input type="password" value={settingsLDAPBindPassword} onChange={(e) => setSettingsLDAPBindPassword(e.target.value)} placeholder={settings?.hasLdapBindPassword ? 'Stored. Enter only to rotate' : 'LDAP bind password'} />
+                          </div>
+                          <div className="field">
+                            <label>User Base DN</label>
+                            <input value={settingsLDAP.userBaseDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, userBaseDn: e.target.value }))} placeholder="ou=people,dc=mylab,dc=intern" />
+                          </div>
+                          <div className="field">
+                            <label>Group Base DN</label>
+                            <input value={settingsLDAP.groupBaseDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, groupBaseDn: e.target.value }))} placeholder="ou=group,dc=mylab,dc=intern" />
+                          </div>
+                          <div className="field">
+                            <label>Admin Group</label>
+                            <input value={settingsLDAP.adminGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, adminGroup: e.target.value }))} placeholder="DomNexAdmin" />
+                          </div>
+                          <div className="field">
+                            <label>Domain Admin Group</label>
+                            <input value={settingsLDAP.domainAdminGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, domainAdminGroup: e.target.value }))} placeholder="DomNexSubAdmin" />
+                          </div>
+                          <div className="field">
+                            <label>Read-Only Group</label>
+                            <input value={settingsLDAP.readOnlyGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, readOnlyGroup: e.target.value }))} placeholder="DomNexReadOnly" />
+                          </div>
+                          <div className="field">
+                            <label>Domain IDs for Domain Admin (optional)</label>
+                            <input value={(settingsLDAP.domainAdminDomainIds || []).join(',')} onChange={(e) => setSettingsLDAP((p) => ({ ...p, domainAdminDomainIds: (e.target.value || '').split(',').map((x) => Number((x || '').trim())).filter((n) => Number.isFinite(n) && n > 0) }))} placeholder="1,2,3 (blank => all domains)" />
+                          </div>
+                        </div>
+                        <div className="muted">LDAP users are provisioned as external users in DomNex on first successful login. Local break-glass admin remains available.</div>
+                      </div>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>OIDC / OAuth2</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Enable OIDC</label>
+                            <label className="check"><input type="checkbox" checked={!!settingsOIDC.enabled} onChange={(e) => setSettingsOIDC((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> Enable external OIDC authentication</label>
+                          </div>
+                          <div className="field">
+                            <label>Issuer URL</label>
+                            <input value={settingsOIDC.issuerUrl} onChange={(e) => setSettingsOIDC((p) => ({ ...p, issuerUrl: e.target.value }))} placeholder="https://idp.example.com/realms/main" />
+                          </div>
+                          <div className="field">
+                            <label>Client ID</label>
+                            <input value={settingsOIDC.clientId} onChange={(e) => setSettingsOIDC((p) => ({ ...p, clientId: e.target.value }))} placeholder="domnexdomain" />
+                          </div>
+                          <div className="field">
+                            <label>Client Secret</label>
+                            <input type="password" value={settingsOIDCClientSecret} onChange={(e) => setSettingsOIDCClientSecret(e.target.value)} placeholder={settings?.hasOidcClientSecret ? 'Stored. Enter only to rotate' : 'OIDC client secret'} />
+                          </div>
+                          <div className="field">
+                            <label>Redirect URL</label>
+                            <input value={settingsOIDC.redirectUrl} onChange={(e) => setSettingsOIDC((p) => ({ ...p, redirectUrl: e.target.value }))} placeholder="https://admin.example.com/api/v1/login/oidc/callback" />
+                          </div>
+                          <div className="field">
+                            <label>Scopes (space/comma separated)</label>
+                            <input value={settingsOIDC.scopes} onChange={(e) => setSettingsOIDC((p) => ({ ...p, scopes: e.target.value }))} placeholder="openid profile email groups" />
+                          </div>
+                          <div className="field">
+                            <label>Username Claim</label>
+                            <input value={settingsOIDC.usernameClaim} onChange={(e) => setSettingsOIDC((p) => ({ ...p, usernameClaim: e.target.value }))} placeholder="preferred_username" />
+                          </div>
+                          <div className="field">
+                            <label>Groups Claim</label>
+                            <input value={settingsOIDC.groupsClaim} onChange={(e) => setSettingsOIDC((p) => ({ ...p, groupsClaim: e.target.value }))} placeholder="groups" />
+                          </div>
+                          <div className="field">
+                            <label>Admin Group</label>
+                            <input value={settingsOIDC.adminGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, adminGroup: e.target.value }))} placeholder="DomNexAdmin" />
+                          </div>
+                          <div className="field">
+                            <label>Domain Admin Group</label>
+                            <input value={settingsOIDC.domainAdminGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, domainAdminGroup: e.target.value }))} placeholder="DomNexSubAdmin" />
+                          </div>
+                          <div className="field">
+                            <label>Read-Only Group</label>
+                            <input value={settingsOIDC.readOnlyGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, readOnlyGroup: e.target.value }))} placeholder="DomNexReadOnly" />
+                          </div>
+                          <div className="field">
+                            <label>Domain IDs for Domain Admin (optional)</label>
+                            <input value={(settingsOIDC.domainAdminDomainIds || []).join(',')} onChange={(e) => setSettingsOIDC((p) => ({ ...p, domainAdminDomainIds: (e.target.value || '').split(',').map((x) => Number((x || '').trim())).filter((n) => Number.isFinite(n) && n > 0) }))} placeholder="1,2,3 (blank => all domains)" />
+                          </div>
+                        </div>
+                        <div className="muted">OIDC login creates/updates external users and maps roles by configured IdP groups.</div>
                       </div>
                     </>
                   ) : null}
@@ -5200,7 +5417,13 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                       <option value="domain-admin">Domain Admin</option>
                       <option value="read-only">Read Only</option>
                     </select>
-                    <input value={usersQuery} onChange={(e) => setUsersQuery(e.target.value)} placeholder="Search username, role, id..." />
+                    <select value={usersProviderFilter} onChange={(e) => setUsersProviderFilter(e.target.value as 'all' | 'local' | 'ldap' | 'oidc')}>
+                      <option value="all">All providers</option>
+                      <option value="local">Local</option>
+                      <option value="ldap">LDAP</option>
+                      <option value="oidc">OIDC</option>
+                    </select>
+                    <input value={usersQuery} onChange={(e) => setUsersQuery(e.target.value)} placeholder="Search username, role, provider, id..." />
                     <div className="row" style={{ marginBottom: 0 }}>
                       <button className="btn" onClick={() => {
                         setNewUserName('');
@@ -5243,7 +5466,15 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                             <tr key={u.id}>
                               <td>
                                 <div><strong>{u.username}</strong></div>
-                                <div className="muted">ID {u.id}</div>
+                                <div className="diag" style={{ marginTop: '.2rem' }}>
+                                  <span className={`badge ${(String(u.authProvider || 'local').toLowerCase() === 'local') ? 'ok' : 'warn'}`}>{(() => {
+                                    const p = String(u.authProvider || 'local').toLowerCase();
+                                    if (p === 'ldap') return 'LDAP';
+                                    if (p === 'oidc') return 'OIDC';
+                                    return 'Local';
+                                  })()}</span>
+                                  <span className="muted">ID {u.id}</span>
+                                </div>
                               </td>
                               <td><span className="badge warn">{u.role}</span></td>
                               <td>
@@ -5862,6 +6093,9 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
               <button className="btn" onClick={login} disabled={loading}>
                 {loginStep === 'username' ? 'Continue' : loginStep === 'password' ? 'Continue' : 'Login'}
               </button>
+              {loginOptions?.oidcEnabled ? (
+                <button className="btn ghost" onClick={loginWithOIDC} disabled={loading}>Sign in with OIDC</button>
+              ) : null}
             </div>
           </div>
         </div>
