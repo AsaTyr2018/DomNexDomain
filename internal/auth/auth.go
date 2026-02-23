@@ -17,6 +17,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/crypto"
 	"github.com/domnexdomain/domnexdomain/internal/mfa"
 	"github.com/domnexdomain/domnexdomain/internal/model"
+	"github.com/domnexdomain/domnexdomain/internal/netutil"
 	"github.com/domnexdomain/domnexdomain/internal/store"
 )
 
@@ -42,6 +43,7 @@ type Service struct {
 	store      Store
 	sessionTTL time.Duration
 	allowed    []*net.IPNet
+	trusted    []*net.IPNet
 	keystore   *crypto.Keystore
 }
 
@@ -54,16 +56,16 @@ type Identity struct {
 	Type      string          `json:"type"`
 }
 
-func New(store Store, ks *crypto.Keystore, sessionTTL time.Duration, allowedCIDRs []string) (*Service, error) {
-	allowed := make([]*net.IPNet, 0, len(allowedCIDRs))
-	for _, c := range allowedCIDRs {
-		_, network, err := net.ParseCIDR(c)
-		if err != nil {
-			return nil, err
-		}
-		allowed = append(allowed, network)
+func New(store Store, ks *crypto.Keystore, sessionTTL time.Duration, allowedCIDRs, trustedProxyCIDRs []string) (*Service, error) {
+	allowed, err := netutil.ParseCIDRs(allowedCIDRs)
+	if err != nil {
+		return nil, err
 	}
-	return &Service{store: store, keystore: ks, sessionTTL: sessionTTL, allowed: allowed}, nil
+	trusted, err := netutil.ParseCIDRs(trustedProxyCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	return &Service{store: store, keystore: ks, sessionTTL: sessionTTL, allowed: allowed, trusted: trusted}, nil
 }
 
 func (s *Service) AuthenticatePassword(ctx context.Context, username, password, otpOrRecovery, source string) (string, model.User, error) {
@@ -177,7 +179,7 @@ func (s *Service) validateMFA(ctx context.Context, u model.User, otpOrRecovery s
 }
 
 func (s *Service) ResolveIdentity(r *http.Request) (Identity, error) {
-	source := requestIP(r)
+	source := s.requestIP(r)
 	if blocked, err := s.store.IsIPBlocked(r.Context(), source); err == nil && blocked {
 		return Identity{}, errors.New("unauthorized")
 	}
@@ -276,7 +278,7 @@ func (s *Service) LogoutAll(ctx context.Context, userID int64, actor string) err
 }
 
 func (s *Service) CheckAdminNetwork(r *http.Request) bool {
-	source := requestIP(r)
+	source := s.requestIP(r)
 	if blocked, err := s.store.IsIPBlocked(r.Context(), source); err == nil && blocked {
 		_ = s.store.AddAuditEvent(r.Context(), model.AuditEvent{Actor: "system", Action: "auth.admin_network.blocked_ip", Target: "admin_api", Meta: "source=" + source})
 		return false
@@ -293,23 +295,12 @@ func (s *Service) CheckAdminNetwork(r *http.Request) bool {
 	return false
 }
 
-func requestIP(r *http.Request) string {
-	if cfip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfip != "" {
-		return cfip
-	}
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		if p := strings.TrimSpace(strings.Split(xff, ",")[0]); p != "" {
-			return p
-		}
-	}
-	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
-		return xrip
-	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil && host != "" {
-		return host
-	}
-	return strings.TrimSpace(r.RemoteAddr)
+func (s *Service) requestIP(r *http.Request) string {
+	return netutil.ClientIP(r, s.trusted)
+}
+
+func (s *Service) SourceIP(r *http.Request) string {
+	return s.requestIP(r)
 }
 
 func RoleAllows(role model.Role, need model.Role) bool {

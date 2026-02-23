@@ -126,7 +126,7 @@ func main() {
 		})
 	}
 
-	authSvc, err := auth.New(st, ks, cfg.SessionTTL, cfg.AllowedCIDRs)
+	authSvc, err := auth.New(st, ks, cfg.SessionTTL, cfg.AllowedCIDRs, cfg.TrustedProxies)
 	if err != nil {
 		log.Error("auth init failed", map[string]any{"err": err.Error()})
 		os.Exit(1)
@@ -135,7 +135,7 @@ func main() {
 	tr := traffic.NewRecorder(st, log)
 	liveHub := traffic.NewLiveHub()
 
-	apiSrv := api.New(appSvc, authSvc, log, m, liveHub)
+	apiSrv := api.New(appSvc, authSvc, log, m, liveHub, cfg.TrustedProxies)
 	adminServer := &http.Server{
 		Addr:              cfg.AdminBindAddr,
 		Handler:           apiSrv.Router(),
@@ -146,7 +146,7 @@ func main() {
 		ErrorLog:          logx.StdLogger(log),
 	}
 
-	px := proxy.New(appSvc, log, m, tr, liveHub)
+	px := proxy.New(appSvc, log, m, tr, liveHub, cfg.TrustedProxies)
 	if err := px.Refresh(context.Background()); err != nil {
 		log.Warn("initial proxy refresh failed", map[string]any{"err": err.Error()})
 	}

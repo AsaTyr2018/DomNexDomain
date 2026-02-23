@@ -26,6 +26,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/logx"
 	"github.com/domnexdomain/domnexdomain/internal/metrics"
 	"github.com/domnexdomain/domnexdomain/internal/model"
+	"github.com/domnexdomain/domnexdomain/internal/netutil"
 	"github.com/domnexdomain/domnexdomain/internal/traffic"
 )
 
@@ -61,6 +62,7 @@ type Engine struct {
 	wafBlock map[string]time.Time
 	wafWhy   map[string]string
 	tiSnap   model.ThreatIntelSnapshot
+	trusted  []*net.IPNet
 }
 
 type wafCounter struct {
@@ -82,7 +84,8 @@ type edgeTheme struct {
 	heroB   string
 }
 
-func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.Recorder, live *traffic.LiveHub) *Engine {
+func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.Recorder, live *traffic.LiveHub, trustedProxyCIDRs []string) *Engine {
+	trusted, _ := netutil.ParseCIDRs(trustedProxyCIDRs)
 	return &Engine{
 		source:   source,
 		log:      log,
@@ -103,6 +106,7 @@ func New(source HostSource, log *logx.Logger, m *metrics.Collector, tr *traffic.
 			Allowlist: map[string]bool{},
 			FeedByIP:  map[string][]string{},
 		},
+		trusted: trusted,
 	}
 }
 
@@ -338,7 +342,7 @@ func (e *Engine) Handler() http.Handler {
 			if e.live != nil && e.live.SubscriberCount() > 0 && clientIP != "" {
 				liveCountry := strings.TrimSpace(strings.ToUpper(country))
 				if liveCountry == "" {
-					liveCountry = countryFromHeaders(r)
+					liveCountry = e.countryFromHeaders(r)
 				}
 				if liveCountry == "" {
 					liveCountry = e.geo.CountryCode(r.Context(), clientIP)
@@ -406,7 +410,7 @@ func (e *Engine) Handler() http.Handler {
 		}
 
 		host := normalizeHostHeader(r.Host)
-		clientIP = clientIPFromRequest(r)
+		clientIP = e.clientIPFromRequest(r)
 		scannerSignal = isLikelyCrawlerUA(r.UserAgent())
 		e.mu.RLock()
 		publicIP = e.publicIP
@@ -436,7 +440,7 @@ func (e *Engine) Handler() http.Handler {
 		if hasThreatSignal {
 			scannerSignal = true
 			if country == "" {
-				country = countryFromHeaders(r)
+				country = e.countryFromHeaders(r)
 				if country == "" {
 					country = e.geo.CountryCode(r.Context(), clientIP)
 				}
@@ -590,7 +594,7 @@ func (e *Engine) Handler() http.Handler {
 			e.renderHostMaintenancePage(route.host, traceID, sw, r)
 			return
 		}
-		country = countryFromHeaders(r)
+		country = e.countryFromHeaders(r)
 		if country == "" {
 			country = e.geo.CountryCode(r.Context(), clientIP)
 		}
@@ -694,63 +698,12 @@ func (e *Engine) isGeoBlocked(country string, h model.Host) (bool, string) {
 	}
 }
 
-func clientIPFromRequest(r *http.Request) string {
-	if cfip := parseCandidateIP(r.Header.Get("CF-Connecting-IP")); cfip != "" {
-		return cfip
-	}
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		for _, part := range strings.Split(xff, ",") {
-			if ip := parseCandidateIP(part); ip != "" {
-				return ip
-			}
-		}
-	}
-	if xrip := parseCandidateIP(r.Header.Get("X-Real-IP")); xrip != "" {
-		return xrip
-	}
-	if host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr)); err == nil {
-		if ip := parseCandidateIP(host); ip != "" {
-			return ip
-		}
-	}
-	return parseCandidateIP(strings.TrimSpace(r.RemoteAddr))
+func (e *Engine) clientIPFromRequest(r *http.Request) string {
+	return netutil.ClientIP(r, e.trusted)
 }
 
-func parseCandidateIP(raw string) string {
-	raw = strings.TrimSpace(strings.Trim(raw, `"`))
-	if raw == "" {
-		return ""
-	}
-	if strings.HasPrefix(raw, "[") && strings.Contains(raw, "]") {
-		raw = strings.TrimPrefix(raw, "[")
-		if idx := strings.Index(raw, "]"); idx >= 0 {
-			raw = raw[:idx]
-		}
-	}
-	if ip := net.ParseIP(raw); ip != nil {
-		return ip.String()
-	}
-	if host, _, err := net.SplitHostPort(raw); err == nil {
-		if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil {
-			return ip.String()
-		}
-	}
-	return ""
-}
-
-func countryFromHeaders(r *http.Request) string {
-	candidates := []string{
-		r.Header.Get("CF-IPCountry"),
-		r.Header.Get("X-Country-Code"),
-		r.Header.Get("X-Appengine-Country"),
-	}
-	for _, c := range candidates {
-		cc := strings.ToUpper(strings.TrimSpace(c))
-		if len(cc) == 2 && cc != "XX" && cc != "T1" {
-			return cc
-		}
-	}
-	return ""
+func (e *Engine) countryFromHeaders(r *http.Request) string {
+	return netutil.CountryFromHeaders(r, e.trusted)
 }
 
 func isLANClient(raw, publicIP string) bool {
@@ -1030,7 +983,7 @@ func newReverseProxy(e *Engine, u *url.URL, h model.Host, upstreamRef string) *h
 	rp.Transport = transport
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		traceID, _ := randomHex(8)
-		clientIP := clientIPFromRequest(r)
+		clientIP := e.clientIPFromRequest(r)
 		e.log.Error("proxy error", map[string]any{"host": r.Host, "upstream": upstreamRef, "traceID": traceID, "source": clientIP, "err": err.Error()})
 		e.auditProxyEvent(r.Context(), "proxy.error.origin_unreachable", h.FQDN, "trace="+traceID+";source="+clientIP+";upstream="+upstreamRef+";path="+r.URL.Path+";err="+err.Error())
 		e.mu.RLock()

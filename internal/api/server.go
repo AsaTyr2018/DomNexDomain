@@ -28,6 +28,7 @@ import (
 	"github.com/domnexdomain/domnexdomain/internal/logx"
 	"github.com/domnexdomain/domnexdomain/internal/metrics"
 	"github.com/domnexdomain/domnexdomain/internal/model"
+	"github.com/domnexdomain/domnexdomain/internal/netutil"
 	"github.com/domnexdomain/domnexdomain/internal/traffic"
 )
 
@@ -40,15 +41,16 @@ type Server struct {
 	log     *logx.Logger
 	metrics *metrics.Collector
 	live    *traffic.LiveHub
+	trusted []*net.IPNet
 }
 
-func New(appSvc *app.Service, authSvc *auth.Service, log *logx.Logger, m *metrics.Collector, live *traffic.LiveHub) *Server {
-	return &Server{app: appSvc, auth: authSvc, log: log, metrics: m, live: live}
+func New(appSvc *app.Service, authSvc *auth.Service, log *logx.Logger, m *metrics.Collector, live *traffic.LiveHub, trustedProxyCIDRs []string) *Server {
+	trusted, _ := netutil.ParseCIDRs(trustedProxyCIDRs)
+	return &Server{app: appSvc, auth: authSvc, log: log, metrics: m, live: live, trusted: trusted}
 }
 
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
 	r.Use(s.metricsMiddleware("admin_api"))
@@ -659,7 +661,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	source := clientIP(r)
+	source := s.auth.SourceIP(r)
 	sid, user, err := s.auth.AuthenticatePassword(r.Context(), in.Username, in.Password, in.OTP, source)
 	if err != nil {
 		s.metrics.Failures.WithLabelValues("auth").Inc()
@@ -2831,22 +2833,6 @@ func isSecureRequest(r *http.Request) bool {
 		return true
 	}
 	return false
-}
-
-func clientIP(r *http.Request) string {
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		if p := strings.TrimSpace(strings.Split(xff, ",")[0]); p != "" {
-			return p
-		}
-	}
-	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
-		return xrip
-	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil && host != "" {
-		return host
-	}
-	return strings.TrimSpace(r.RemoteAddr)
 }
 
 func isGlobalAdmin(id auth.Identity) bool {

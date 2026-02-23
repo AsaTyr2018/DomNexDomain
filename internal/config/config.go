@@ -30,6 +30,7 @@ type Config struct {
 	BootstrapUser  string
 	BootstrapPass  string
 	AllowedCIDRs   []string
+	TrustedProxies []string
 	EnableFileLogs bool
 	SSHBastionAddr string
 	SSHBastionOn   bool
@@ -63,12 +64,16 @@ func Load() (Config, error) {
 	cfg.ACMECacheDir = getenv("DOMNEX_ACME_CACHE", filepath.Join(cfg.DataDir, "acme"))
 	cfg.SSHBastionKey = getenv("DOMNEX_SSH_BASTION_HOST_KEY", filepath.Join(cfg.DataDir, "ssh_bastion_host_key.pem"))
 	cfg.AllowedCIDRs = splitCSV(getenv("DOMNEX_ADMIN_ALLOWED_CIDRS", "127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"))
+	cfg.TrustedProxies = splitCSV(getenv("DOMNEX_TRUSTED_PROXY_CIDRS", ""))
 
 	if cfg.Domain != "" && strings.Count(cfg.Domain, ".") < 1 {
 		return Config{}, errors.New("DOMNEX_DOMAIN must be an apex domain (e.g. example.com) or empty")
 	}
 	if err := validateCIDRs(cfg.AllowedCIDRs); err != nil {
 		return Config{}, fmt.Errorf("invalid DOMNEX_ADMIN_ALLOWED_CIDRS: %w", err)
+	}
+	if err := validateCIDRs(cfg.TrustedProxies); err != nil {
+		return Config{}, fmt.Errorf("invalid DOMNEX_TRUSTED_PROXY_CIDRS: %w", err)
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
 		return Config{}, err
