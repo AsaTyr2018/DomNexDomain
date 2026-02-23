@@ -43,6 +43,20 @@ keystore.key
 *.mmdb
 *.MMDB
 *.mmdb.*
+*.mmdb.gz
+*.MMDB.gz
+*.csv.gz
+*.CSV.gz
+geoip-sources/
+geoip-compiled/
+geolocationDatabase*.csv
+geolocationDatabase*.CSV
+dbip-*.csv
+dbip-*.CSV
+IP2LOCATION-LITE-DB*.CSV
+IP2LOCATION-LITE-DB*.csv
+GeoLite2-*.csv
+GeoLite2-*.CSV
 IP2LOCATION-LITE-DB1.*
 GeoLite2-*.mmdb
 
