@@ -459,6 +459,7 @@ func (e *Engine) Handler() http.Handler {
 				IP:          clientIP,
 				Host:        host,
 				Path:        recordPath,
+				UserAgent:   r.UserAgent(),
 				Country:     country,
 				SourceScope: scope,
 				TraceID:     traceID,

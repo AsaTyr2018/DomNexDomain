@@ -26,6 +26,32 @@ type User struct {
 	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
+type PermissionGroup struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	Template    string    `json:"template"`
+	System      bool      `json:"system"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+type PermissionGroupEntry struct {
+	GroupID    int64     `json:"groupId"`
+	Permission string    `json:"permission"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+type UserGroupMembership struct {
+	UserID     int64     `json:"userId"`
+	GroupID    int64     `json:"groupId"`
+	Priority   int       `json:"priority"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+	GroupName  string    `json:"groupName,omitempty"`
+	IsTemplate bool      `json:"isTemplate,omitempty"`
+}
+
 type Session struct {
 	ID        string    `json:"id"`
 	UserID    int64     `json:"userId"`
@@ -253,6 +279,20 @@ type ThreatIntelGeoPoint struct {
 	Hits    int64  `json:"hits"`
 }
 
+type ThreatIntelMetaDashboard struct {
+	TotalBannedIPs             int64   `json:"totalBannedIps"`
+	AverageEscalationSeconds   float64 `json:"averageEscalationSeconds"`
+	AverageXPBeforeBan         float64 `json:"averageXpBeforeBan"`
+	AverageRehabSeconds        float64 `json:"averageRehabSeconds"`
+	FalsePositiveRehabSharePct float64 `json:"falsePositiveRehabSharePct"`
+	RehabCount                 int64   `json:"rehabCount"`
+	FalsePositiveRehabCount    int64   `json:"falsePositiveRehabCount"`
+	SoftBanCount               int64   `json:"softBanCount"`
+	HardBanCount               int64   `json:"hardBanCount"`
+	SoftBanAvgDecaySeconds     float64 `json:"softBanAvgDecaySeconds"`
+	HardBanAvgDecaySeconds     float64 `json:"hardBanAvgDecaySeconds"`
+}
+
 type ThreatIntelIPState struct {
 	IP             string
 	XP             int
@@ -281,6 +321,7 @@ type ThreatIntelEventInput struct {
 	IP          string
 	Host        string
 	Path        string
+	UserAgent   string
 	Country     string
 	SourceScope string
 	TraceID     string

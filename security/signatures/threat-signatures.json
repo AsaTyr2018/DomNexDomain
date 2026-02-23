@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "source": "DomNexDomain Community Signatures",
+  "rules": [
+    {
+      "id": "wp-core",
+      "signal": "signature.wp_scanner",
+      "family": "wp_scanner",
+      "pathContains": [
+        "/wp-admin",
+        "/wp-login",
+        "/wp-content",
+        "/wp-includes",
+        "xmlrpc.php",
+        "wlwmanifest.xml",
+        "wp-trackback"
+      ]
+    },
+    {
+      "id": "secret-leaks",
+      "signal": "signature.secret_hunter",
+      "family": "secret_hunter",
+      "pathContains": [
+        "/.env",
+        "/.git/config",
+        "/config.env",
+        "/api/.env",
+        "/laravel/.env",
+        "/docker/.env"
+      ]
+    },
+    {
+      "id": "webshell-probe",
+      "signal": "signature.webshell_probe",
+      "family": "webshell_probe",
+      "pathContains": [
+        "ioxi-o.php",
+        "/file.php",
+        "/rip.php",
+        "/sf.php",
+        "/wso.php",
+        "/r57.php",
+        "/shell.php",
+        "/cmd.php"
+      ]
+    },
+    {
+      "id": "admin-surface",
+      "signal": "signature.admin_surface_probe",
+      "family": "admin_surface_probe",
+      "pathContains": [
+        "/admin.php",
+        "/admin/",
+        "/manager/html",
+        "/hudson",
+        "/jenkins",
+        "/server-status",
+        "/actuator/env"
+      ]
+    },
+    {
+      "id": "api-enum",
+      "signal": "signature.api_enum",
+      "family": "api_enum",
+      "pathPrefix": [
+        "/api/"
+      ],
+      "pathContains": [
+        "/api/settings",
+        "/api/config",
+        "/graphql"
+      ]
+    },
+    {
+      "id": "scanner-ua",
+      "signal": "signature.scanner_ua",
+      "family": "scanner_ua",
+      "uaContains": [
+        "zgrab",
+        "masscan",
+        "nmap",
+        "sqlmap",
+        "nikto",
+        "nuclei",
+        "dirbuster",
+        "gobuster",
+        "wpscan"
+      ]
+    }
+  ]
+}

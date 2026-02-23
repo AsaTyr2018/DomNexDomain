@@ -60,6 +60,13 @@ type Service struct {
 	tiSnap           model.ThreatIntelSnapshot
 	tiWinMu          sync.Mutex
 	tiWin            map[string]tiWindow
+	sigMu            sync.RWMutex
+	sigRules         []threatSignatureRule
+	sigEnabled       bool
+	sigAutoUpdate    bool
+	sigLastSync      time.Time
+	sigSourceURL     string
+	sigSourceHash    string
 	sysMu            sync.Mutex
 	netLast          uint64
 	netLastT         time.Time
@@ -83,6 +90,7 @@ type tiWindow struct {
 
 const settingPublicIPv4 = "network.public_ipv4"
 const defaultThreatIntelFeedURL = "https://lists.blocklist.de/lists/all.txt"
+const defaultThreatIntelSignatureURL = "https://raw.githubusercontent.com/AsaTyr2018/DomNexDomain/main/security/signatures/threat-signatures.json"
 const (
 	settingTimeSyncMode          = "runtime.time_sync_mode"
 	settingTimeSyncLANServers    = "runtime.time_sync_lan_servers"
@@ -226,17 +234,18 @@ type SystemHealthStatus struct {
 }
 
 type ManagedUser struct {
-	ID              int64      `json:"id"`
-	Username        string     `json:"username"`
-	Role            model.Role `json:"role"`
-	AuthProvider    string     `json:"authProvider"`
-	DomainIDs       []int64    `json:"domainIds"`
-	AllowedCIDRs    string     `json:"allowedCidrs"`
-	IPCheckDisabled bool       `json:"ipCheckDisabled"`
-	MFAEnabled      bool       `json:"mfaEnabled"`
-	MFAEnrolledAt   time.Time  `json:"mfaEnrolledAt"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	UpdatedAt       time.Time  `json:"updatedAt"`
+	ID              int64                       `json:"id"`
+	Username        string                      `json:"username"`
+	Role            model.Role                  `json:"role"`
+	AuthProvider    string                      `json:"authProvider"`
+	DomainIDs       []int64                     `json:"domainIds"`
+	GroupMembership []model.UserGroupMembership `json:"groupMemberships,omitempty"`
+	AllowedCIDRs    string                      `json:"allowedCidrs"`
+	IPCheckDisabled bool                        `json:"ipCheckDisabled"`
+	MFAEnabled      bool                        `json:"mfaEnabled"`
+	MFAEnrolledAt   time.Time                   `json:"mfaEnrolledAt"`
+	CreatedAt       time.Time                   `json:"createdAt"`
+	UpdatedAt       time.Time                   `json:"updatedAt"`
 }
 
 type MFAStatus struct {
@@ -589,8 +598,15 @@ func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dn
 func (s *Service) Store() *store.Store { return s.store }
 
 func (s *Service) Bootstrap(ctx context.Context, bootstrapUser, bootstrapPass string) error {
+	if err := s.EnsureIdentityTemplates(ctx); err != nil {
+		s.log.Warn("identity templates setup failed", map[string]any{"err": err.Error()})
+	}
 	if err := s.store.EnsureThreatIntelDefaultFeed(ctx, defaultThreatIntelFeedURL); err != nil {
 		s.log.Warn("threat intel default feed setup failed", map[string]any{"err": err.Error()})
+	}
+	s.ensureThreatSignaturesLoaded(ctx)
+	if err := s.syncThreatSignatures(ctx, false); err != nil {
+		s.log.Warn("threat signature sync failed", map[string]any{"err": err.Error()})
 	}
 	if _, err := s.GetThreatIntelSnapshot(ctx); err != nil {
 		s.log.Warn("threat intel snapshot init failed", map[string]any{"err": err.Error()})
@@ -3296,7 +3312,7 @@ func (s *Service) ConsumePasswordResetToken(ctx context.Context, token, newPassw
 	return nil
 }
 
-func (s *Service) CreateManagedUser(ctx context.Context, username, password string, role model.Role, domainIDs []int64, allowedCIDRs string, ipCheckDisabled bool) (ManagedUser, error) {
+func (s *Service) CreateManagedUser(ctx context.Context, username, password string, role model.Role, domainIDs []int64, allowedCIDRs string, ipCheckDisabled bool, groupIDs []int64) (ManagedUser, error) {
 	username = strings.ToLower(strings.TrimSpace(username))
 	if username == "" {
 		return ManagedUser{}, fmt.Errorf("username required")
@@ -3330,13 +3346,18 @@ func (s *Service) CreateManagedUser(ctx context.Context, username, password stri
 			return ManagedUser{}, err
 		}
 	}
+	if err := s.store.SetUserGroupMemberships(ctx, u.ID, groupIDs); err != nil {
+		return ManagedUser{}, err
+	}
 	ids, _ := s.store.GetUserDomainIDs(ctx, u.ID)
+	gm, _ := s.store.ListUserGroupMemberships(ctx, u.ID)
 	return ManagedUser{
 		ID:              u.ID,
 		Username:        u.Username,
 		Role:            u.Role,
 		AuthProvider:    strings.TrimSpace(u.AuthProvider),
 		DomainIDs:       ids,
+		GroupMembership: gm,
 		AllowedCIDRs:    u.AllowedCIDRs,
 		IPCheckDisabled: u.IPCheckOff,
 		MFAEnabled:      u.MFAEnabled,
@@ -3351,6 +3372,7 @@ func (s *Service) ListManagedUsers(ctx context.Context) ([]ManagedUser, error) {
 	if err != nil {
 		return nil, err
 	}
+	groupMap, _ := s.store.ListUsersGroupMemberships(ctx)
 	out := make([]ManagedUser, 0, len(users))
 	for _, u := range users {
 		ids, _ := s.store.GetUserDomainIDs(ctx, u.ID)
@@ -3360,6 +3382,7 @@ func (s *Service) ListManagedUsers(ctx context.Context) ([]ManagedUser, error) {
 			Role:            u.Role,
 			AuthProvider:    strings.TrimSpace(u.AuthProvider),
 			DomainIDs:       ids,
+			GroupMembership: groupMap[u.ID],
 			AllowedCIDRs:    u.AllowedCIDRs,
 			IPCheckDisabled: u.IPCheckOff,
 			MFAEnabled:      u.MFAEnabled,
@@ -3385,7 +3408,7 @@ func (s *Service) SetManagedUserDomains(ctx context.Context, userID int64, domai
 	return s.store.SetUserDomainScopes(ctx, userID, domainIDs)
 }
 
-func (s *Service) SetManagedUserAccess(ctx context.Context, userID int64, role model.Role, domainIDs []int64, allowedCIDRs string, ipCheckDisabled bool) error {
+func (s *Service) SetManagedUserAccess(ctx context.Context, userID int64, role model.Role, domainIDs []int64, allowedCIDRs string, ipCheckDisabled bool, groupIDs []int64) error {
 	if role != model.RoleAdmin && role != model.RoleDomainAdmin && role != model.RoleReadOnly {
 		return fmt.Errorf("role must be admin, domain-admin, or read-only")
 	}
@@ -3406,7 +3429,10 @@ func (s *Service) SetManagedUserAccess(ctx context.Context, userID int64, role m
 	if role != model.RoleDomainAdmin {
 		domainIDs = nil
 	}
-	return s.store.SetUserAccessPolicy(ctx, userID, role, domainIDs, normCIDRs, ipCheckDisabled)
+	if err := s.store.SetUserAccessPolicy(ctx, userID, role, domainIDs, normCIDRs, ipCheckDisabled); err != nil {
+		return err
+	}
+	return s.store.SetUserGroupMemberships(ctx, userID, groupIDs)
 }
 
 func (s *Service) DeleteManagedUser(ctx context.Context, userID int64) error {
@@ -3685,6 +3711,11 @@ func (s *Service) SyncThreatIntelFeeds(ctx context.Context) (map[string]any, err
 	summary["synced"] = synced
 	summary["errors"] = errs
 	summary["totalIPs"] = totalIPs
+	sigErr := s.syncThreatSignatures(ctx, true)
+	summary["signatureUpdated"] = sigErr == nil
+	if sigErr != nil {
+		summary["signatureError"] = sigErr.Error()
+	}
 	_, _ = s.RefreshThreatIntelSnapshot(ctx)
 	return summary, nil
 }
@@ -3788,6 +3819,11 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 	if in.Mode == "" {
 		in.Mode = "monitor_only"
 	}
+	sigSignals := s.detectThreatSignatureSignals(in.Host, in.Path, in.UserAgent)
+	if len(sigSignals) > 0 {
+		in.Signals = append(in.Signals, sigSignals...)
+	}
+	in.Signals = uniqueThreatSignals(in.Signals)
 	tiCfg, _ := s.GetThreatIntelConfig(ctx)
 	hardLevel := tiCfg.HardLevel
 	if hardLevel <= 0 {
@@ -3878,6 +3914,7 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 		res.HardBlock = true
 		res.Decision = "hard_block_permanent"
 		_ = s.store.UpsertBlockedIP(ctx, in.IP, "threat_intel_auto:"+topSignal)
+		_ = s.store.EnsureThreatIntelBanHistoryForIP(ctx, in.IP, "threat_intel_auto:"+topSignal, "hard")
 	} else if !st.BanUntil.IsZero() && st.BanUntil.After(now) {
 		res.Blocked = true
 		res.Decision = "soft_block_active"
@@ -3895,6 +3932,7 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 				res.Blocked = true
 				res.BanUntil = st.BanUntil
 				res.Decision = "soft_block_set"
+				_ = s.store.EnsureThreatIntelBanHistoryForIP(ctx, in.IP, "threat_intel_auto:soft_block", "soft")
 			} else {
 				res.Decision = "monitor_observe"
 			}
@@ -3948,13 +3986,19 @@ func uniqueThreatSignals(in []string) []string {
 
 func calcThreatBaseXP(signals []string) (int, string) {
 	points := map[string]int{
-		"behavior.unknown_host":       1,
-		"behavior.path_scan":          4,
-		"behavior.ua_scanner":         2,
-		"behavior.invalid_host":       2,
-		"behavior.auth_failed":        3,
-		"protocol.ssh.auth_denied":    3,
-		"protocol.ssh.forward_denied": 4,
+		"behavior.unknown_host":         1,
+		"behavior.path_scan":            4,
+		"behavior.ua_scanner":           2,
+		"behavior.invalid_host":         2,
+		"behavior.auth_failed":          3,
+		"protocol.ssh.auth_denied":      3,
+		"protocol.ssh.forward_denied":   4,
+		"signature.wp_scanner":          6,
+		"signature.secret_hunter":       7,
+		"signature.webshell_probe":      8,
+		"signature.admin_surface_probe": 4,
+		"signature.api_enum":            4,
+		"signature.scanner_ua":          3,
 	}
 	total := 0
 	top := ""
@@ -3962,6 +4006,9 @@ func calcThreatBaseXP(signals []string) (int, string) {
 	seenExternal := false
 	for _, sig := range uniqueThreatSignals(signals) {
 		p := points[sig]
+		if p == 0 && strings.HasPrefix(sig, "signature.") {
+			p = 4
+		}
 		if p == 0 && !strings.HasPrefix(sig, "behavior.") {
 			seenExternal = true
 		}
@@ -4228,6 +4275,10 @@ func (s *Service) ListThreatIntelGeoPoints(ctx context.Context) ([]model.ThreatI
 	return s.store.ListThreatIntelGeoPoints(ctx)
 }
 
+func (s *Service) GetThreatIntelMetaDashboard(ctx context.Context) (model.ThreatIntelMetaDashboard, error) {
+	return s.store.GetThreatIntelMetaDashboard(ctx)
+}
+
 func (s *Service) AddThreatIntelAllowIP(ctx context.Context, ip, reason string) error {
 	if err := s.store.UpsertThreatIntelAllowIP(ctx, ip, reason); err != nil {
 		return err
@@ -4245,6 +4296,7 @@ func (s *Service) RemoveThreatIntelAllowIP(ctx context.Context, ip string) error
 }
 
 func (s *Service) StartThreatIntelSync(ctx context.Context) {
+	s.ensureThreatSignaturesLoaded(ctx)
 	syncTicker := time.NewTicker(1 * time.Hour)
 	decayTicker := time.NewTicker(5 * time.Minute)
 	firewallTicker := time.NewTicker(1 * time.Minute)
@@ -4275,7 +4327,13 @@ func (s *Service) StartThreatIntelSync(ctx context.Context) {
 		case <-syncTicker.C:
 			cfg, err := s.store.GetThreatIntelConfig(ctx)
 			if err != nil || !cfg.Enabled {
+				if err := s.syncThreatSignatures(ctx, false); err != nil {
+					s.log.Warn("threat signature scheduled sync failed", map[string]any{"err": err.Error()})
+				}
 				continue
+			}
+			if err := s.syncThreatSignatures(ctx, false); err != nil {
+				s.log.Warn("threat signature scheduled sync failed", map[string]any{"err": err.Error()})
 			}
 			feeds, err := s.store.ListThreatIntelFeeds(ctx)
 			if err != nil {
@@ -4321,6 +4379,23 @@ func (s *Service) reconcileOSFirewall(ctx context.Context) error {
 	if mode == "" {
 		mode = "hard_only"
 	}
+	hardByIP := map[string]bool{}
+	if mode == "hard_only" {
+		states, stErr := s.store.ListThreatIntelIPStates(ctx, 50000)
+		if stErr != nil {
+			return stErr
+		}
+		for _, st := range states {
+			ip := strings.TrimSpace(st.IP)
+			if ip == "" {
+				continue
+			}
+			rs := strings.ToLower(strings.TrimSpace(st.RiskState))
+			if st.PermBlocked || rs == "hardblock" || st.Level >= cfg.HardLevel {
+				hardByIP[ip] = true
+			}
+		}
+	}
 	blocked, err := s.store.ListBlockedIPs(ctx, 200000)
 	if err != nil {
 		return err
@@ -4332,8 +4407,10 @@ func (s *Service) reconcileOSFirewall(ctx context.Context) error {
 		if ip == "" {
 			continue
 		}
-		if mode == "hard_only" && !strings.Contains(strings.ToLower(strings.TrimSpace(b.Reason)), "hard") {
-			continue
+		if mode == "hard_only" {
+			if !hardByIP[ip] && !strings.Contains(strings.ToLower(strings.TrimSpace(b.Reason)), "hard") {
+				continue
+			}
 		}
 		if isPublicIPv4(ip) {
 			set4[ip] = true
@@ -4497,6 +4574,7 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 	if _, err := s.store.PromoteThreatIntelHardBlocks(ctx, hardLevel); err != nil {
 		s.log.Warn("threat intel hardblock promotion failed", map[string]any{"err": err.Error()})
 	}
+	_ = s.store.SyncThreatIntelBanHistoryOpen(ctx)
 	states, err := s.store.ListThreatIntelIPStates(ctx, 20000)
 	if err != nil {
 		return 0, err
@@ -4525,10 +4603,12 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 			st.XP = threatLevelThreshold(defaultTIWatchLevel)
 			st.LastSeenAt = now
 			idle = 0
-			_ = s.store.RemoveBlockedIP(ctx, st.IP)
+			_ = s.removeBlockedIPTracked(ctx, st.IP, false)
 		}
 		decayThreatState(&st, now)
 		if !st.BanUntil.IsZero() && !st.BanUntil.After(now) {
+			_ = s.store.RecordThreatIntelRehabEvent(ctx, st.IP, true, "soft_ban_expired")
+			_ = s.store.CloseThreatIntelBanHistory(ctx, st.IP, "soft", false)
 			st.BanUntil = time.Time{}
 		}
 		if st.RiskState != "watch" {
@@ -4544,6 +4624,7 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 			st.RiskState = "monitoring"
 			st.TempBlockCount = 0
 			if !allow[st.IP] {
+				_ = s.store.RecordThreatIntelRehabEvent(ctx, st.IP, false, "monitor_decay_cleanup")
 				_ = s.store.DeleteThreatIntelMatchesByIP(ctx, st.IP)
 				_ = s.store.DeleteThreatIntelState(ctx, st.IP)
 				rehab++
@@ -4565,16 +4646,27 @@ func (s *Service) UpsertBlockedIP(ctx context.Context, ip, reason string) error 
 	if err := s.store.UpsertBlockedIP(ctx, ip, reason); err != nil {
 		return err
 	}
+	_ = s.store.EnsureThreatIntelBanHistoryForIP(ctx, ip, reason, "hard")
+	_ = s.reconcileOSFirewall(ctx)
+	return nil
+}
+
+func (s *Service) removeBlockedIPTracked(ctx context.Context, ip string, falsePositive bool) error {
+	if err := s.store.RemoveBlockedIP(ctx, ip); err != nil {
+		return err
+	}
+	_ = s.store.RecordThreatIntelRehabEvent(ctx, ip, true, "blocked_ip_removed")
+	_ = s.store.CloseThreatIntelBanHistory(ctx, ip, "hard", falsePositive)
 	_ = s.reconcileOSFirewall(ctx)
 	return nil
 }
 
 func (s *Service) RemoveBlockedIP(ctx context.Context, ip string) error {
-	if err := s.store.RemoveBlockedIP(ctx, ip); err != nil {
-		return err
-	}
-	_ = s.reconcileOSFirewall(ctx)
-	return nil
+	return s.removeBlockedIPTracked(ctx, ip, false)
+}
+
+func (s *Service) RemoveBlockedIPFalsePositive(ctx context.Context, ip string) error {
+	return s.removeBlockedIPTracked(ctx, ip, true)
 }
 
 func (s *Service) geoIPSourcesDir() string {

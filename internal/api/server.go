@@ -96,11 +96,13 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/audit", s.handleListAudit)
 		pr.Get("/api/v1/security/ip-blocks", s.handleListBlockedIPs)
 		pr.Get("/api/v1/threat-intel/config", s.handleThreatIntelConfigGet)
+		pr.Get("/api/v1/threat-intel/signatures/config", s.handleThreatIntelSignatureConfigGet)
 		pr.Get("/api/v1/threat-intel/feeds", s.handleThreatIntelFeedsList)
 		pr.Get("/api/v1/threat-intel/matches", s.handleThreatIntelMatchesList)
 		pr.Get("/api/v1/threat-intel/matches/{ip}/targets", s.handleThreatIntelTargetsByIP)
 		pr.Get("/api/v1/threat-intel/offenders", s.handleThreatIntelOffendersList)
 		pr.Get("/api/v1/threat-intel/blocked", s.handleThreatIntelBlockedList)
+		pr.Get("/api/v1/threat-intel/meta", s.handleThreatIntelMeta)
 		pr.Get("/api/v1/threat-intel/geo", s.handleThreatIntelGeoList)
 		pr.Get("/api/v1/threat-intel/allowlist", s.handleThreatIntelAllowlistList)
 		pr.Get("/api/v1/settings", s.handleGetSettings)
@@ -111,6 +113,9 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/geoip/sources", s.handleListGeoIPSources)
 		pr.Get("/api/v1/geoip/stats", s.handleGeoIPStats)
 		pr.Get("/api/v1/users", s.handleListUsers)
+		pr.Get("/api/v1/identity/permissions", s.handleListIdentityPermissions)
+		pr.Get("/api/v1/identity/groups", s.handleListIdentityGroups)
+		pr.Get("/api/v1/identity/matrix", s.handleIdentityMatrix)
 		pr.Get("/api/v1/tokens", s.handleListTokens)
 		pr.Get("/api/v1/ssh/routes", s.handleListSSHBastionRoutes)
 		pr.Get("/api/v1/ssh/keys", s.handleListSSHBastionKeys)
@@ -166,10 +171,14 @@ func (s *Server) Router() http.Handler {
 		pr.Delete("/api/v1/backup/archives/{id}", s.handleBackupArchiveDelete)
 		pr.Post("/api/v1/users", s.handleCreateUser)
 		pr.Put("/api/v1/users/{id}", s.handleUpdateUserAccess)
+		pr.Put("/api/v1/users/{id}/groups", s.handleSetUserGroups)
 		pr.Put("/api/v1/users/{id}/domains", s.handleSetUserDomains)
 		pr.Put("/api/v1/users/{id}/password", s.handleSetUserPassword)
 		pr.Post("/api/v1/users/{id}/mfa/reset", s.handleAdminResetUserMFA)
 		pr.Delete("/api/v1/users/{id}", s.handleDeleteUser)
+		pr.Post("/api/v1/identity/groups", s.handleCreateIdentityGroup)
+		pr.Put("/api/v1/identity/groups/{id}", s.handleUpdateIdentityGroup)
+		pr.Delete("/api/v1/identity/groups/{id}", s.handleDeleteIdentityGroup)
 		pr.Post("/api/v1/logout-all", s.handleLogoutAll)
 		pr.Post("/api/v1/security/ip-blocks", s.handleAddBlockedIP)
 		pr.Post("/api/v1/security/ip-blocks/remove", s.handleRemoveBlockedIP)
@@ -179,6 +188,7 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/ssh/keys/generate", s.handleGenerateSSHBastionKey)
 		pr.Delete("/api/v1/ssh/keys/{id}", s.handleDeleteSSHBastionKey)
 		pr.Post("/api/v1/threat-intel/config", s.handleThreatIntelConfigSet)
+		pr.Post("/api/v1/threat-intel/signatures/config", s.handleThreatIntelSignatureConfigSet)
 		pr.Post("/api/v1/threat-intel/feeds", s.handleThreatIntelFeedUpsert)
 		pr.Delete("/api/v1/threat-intel/feeds/{id}", s.handleThreatIntelFeedDelete)
 		pr.Post("/api/v1/threat-intel/sync", s.handleThreatIntelSync)
@@ -2361,6 +2371,19 @@ func (s *Server) handleThreatIntelConfigGet(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, cfg)
 }
 
+func (s *Server) handleThreatIntelSignatureConfigGet(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:read") {
+		return
+	}
+	cfg, err := s.app.GetThreatSignatureConfig(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cfg)
+}
+
 func (s *Server) handleThreatIntelConfigSet(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
 	if !requireTokenScope(w, id, "settings:write") {
@@ -2384,6 +2407,33 @@ func (s *Server) handleThreatIntelConfigSet(w http.ResponseWriter, r *http.Reque
 		Action: "threatintel.config.update",
 		Target: "threat-intel",
 		Meta:   "mode=" + strings.ToLower(strings.TrimSpace(in.Mode)),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleThreatIntelSignatureConfigSet(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "settings:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in app.ThreatSignatureConfig
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.SetThreatSignatureConfig(r.Context(), in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{
+		Actor:  id.Username,
+		Action: "threatintel.signature.config.update",
+		Target: "threat-intel-signatures",
+		Meta:   "enabled=" + strconv.FormatBool(in.Enabled) + ";auto_update=" + strconv.FormatBool(in.AutoUpdate),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -2530,6 +2580,19 @@ func (s *Server) handleThreatIntelBlockedList(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, items)
 }
 
+func (s *Server) handleThreatIntelMeta(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "audit:read") {
+		return
+	}
+	out, err := s.app.GetThreatIntelMetaDashboard(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) handleThreatIntelGeoList(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
 	if !requireTokenScope(w, id, "audit:read") {
@@ -2627,7 +2690,7 @@ func (s *Server) handleThreatIntelActionAllow(w http.ResponseWriter, r *http.Req
 		writeErr(w, http.StatusBadRequest, "ip required")
 		return
 	}
-	_ = s.app.RemoveBlockedIP(r.Context(), ip)
+	_ = s.app.RemoveBlockedIPFalsePositive(r.Context(), ip)
 	if err := s.app.AddThreatIntelAllowIP(r.Context(), ip, strings.TrimSpace(in.Reason)); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -2705,6 +2768,152 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": users})
 }
 
+func (s *Server) handleListIdentityPermissions(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:read") {
+		return
+	}
+	items := s.app.PermissionCatalog()
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleListIdentityGroups(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:read") {
+		return
+	}
+	items, err := s.app.ListPermissionGroups(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleIdentityMatrix(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:read") {
+		return
+	}
+	rows, err := s.app.BuildPermissionMatrix(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": rows})
+}
+
+func (s *Server) handleCreateIdentityGroup(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	var in struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Template    string   `json:"template"`
+		Permissions []string `json:"permissions"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	out, err := s.app.CreatePermissionGroup(r.Context(), in.Name, in.Description, in.Template, in.Permissions)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "identity.group.create", Target: in.Name, Meta: strings.Join(out.Permissions, ",")})
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) handleUpdateIdentityGroup(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	groupID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if groupID <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid group id")
+		return
+	}
+	var in struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Template    string   `json:"template"`
+		Permissions []string `json:"permissions"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.UpdatePermissionGroup(r.Context(), groupID, in.Name, in.Description, in.Template, in.Permissions); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "identity.group.update", Target: strconv.FormatInt(groupID, 10), Meta: strings.Join(in.Permissions, ",")})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeleteIdentityGroup(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	groupID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if groupID <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid group id")
+		return
+	}
+	if err := s.app.DeletePermissionGroup(r.Context(), groupID); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "identity.group.delete", Target: strconv.FormatInt(groupID, 10), Meta: ""})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleSetUserGroups(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "users:write") {
+		return
+	}
+	if !isGlobalAdmin(id) {
+		writeErr(w, http.StatusForbidden, "global admin required")
+		return
+	}
+	userID, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if userID <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	var in struct {
+		GroupIDs []int64 `json:"groupIds"`
+	}
+	if err := decodeJSON(r.Body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.app.SetManagedUserGroups(r.Context(), userID, in.GroupIDs); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_ = s.app.Store().AddAuditEvent(r.Context(), model.AuditEvent{Actor: id.Username, Action: "user.update_groups", Target: strconv.FormatInt(userID, 10), Meta: "count=" + strconv.Itoa(len(in.GroupIDs))})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func (s *Server) handleListGeoIPSources(w http.ResponseWriter, r *http.Request) {
 	id := identityFrom(r.Context())
 	if !requireTokenScope(w, id, "settings:read") {
@@ -2778,6 +2987,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		Password        string  `json:"password"`
 		Role            string  `json:"role"`
 		DomainIDs       []int64 `json:"domainIds"`
+		GroupIDs        []int64 `json:"groupIds"`
 		AllowedCIDRs    string  `json:"allowedCidrs"`
 		IPCheckDisabled bool    `json:"ipCheckDisabled"`
 	}
@@ -2785,7 +2995,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	u, err := s.app.CreateManagedUser(r.Context(), in.Username, in.Password, model.Role(in.Role), in.DomainIDs, in.AllowedCIDRs, in.IPCheckDisabled)
+	u, err := s.app.CreateManagedUser(r.Context(), in.Username, in.Password, model.Role(in.Role), in.DomainIDs, in.AllowedCIDRs, in.IPCheckDisabled, in.GroupIDs)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -2840,6 +3050,7 @@ func (s *Server) handleUpdateUserAccess(w http.ResponseWriter, r *http.Request) 
 	var in struct {
 		Role            string  `json:"role"`
 		DomainIDs       []int64 `json:"domainIds"`
+		GroupIDs        []int64 `json:"groupIds"`
 		AllowedCIDRs    string  `json:"allowedCidrs"`
 		IPCheckDisabled bool    `json:"ipCheckDisabled"`
 	}
@@ -2847,7 +3058,7 @@ func (s *Server) handleUpdateUserAccess(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.app.SetManagedUserAccess(r.Context(), userID, model.Role(in.Role), in.DomainIDs, in.AllowedCIDRs, in.IPCheckDisabled); err != nil {
+	if err := s.app.SetManagedUserAccess(r.Context(), userID, model.Role(in.Role), in.DomainIDs, in.AllowedCIDRs, in.IPCheckDisabled, in.GroupIDs); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}

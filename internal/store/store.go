@@ -204,6 +204,35 @@ CREATE TABLE IF NOT EXISTS user_domain_scopes (
   FOREIGN KEY(domain_id) REFERENCES domains(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS permission_groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  template_name TEXT NOT NULL DEFAULT '',
+  is_system INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS permission_group_entries (
+  group_id INTEGER NOT NULL,
+  permission TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(group_id, permission),
+  FOREIGN KEY(group_id) REFERENCES permission_groups(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS user_group_memberships (
+  user_id INTEGER NOT NULL,
+  group_id INTEGER NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(user_id, group_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(group_id) REFERENCES permission_groups(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS user_mfa_recovery_codes (
   user_id INTEGER NOT NULL,
   code_hash TEXT NOT NULL,
@@ -350,6 +379,35 @@ CREATE TABLE IF NOT EXISTS threat_intel_ip_state (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS threat_intel_ban_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL DEFAULT '',
+  banned_at TEXT NOT NULL,
+  ban_kind TEXT NOT NULL DEFAULT 'hard',
+  xp_at_ban INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  rehab_at TEXT NOT NULL DEFAULT '',
+  false_positive INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_threat_intel_ban_history_ip ON threat_intel_ban_history(ip);
+CREATE INDEX IF NOT EXISTS idx_threat_intel_ban_history_open ON threat_intel_ban_history(ip, rehab_at);
+
+CREATE TABLE IF NOT EXISTS threat_intel_rehab_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ip TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL DEFAULT '',
+  rehab_at TEXT NOT NULL,
+  had_block INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_threat_intel_rehab_history_ip ON threat_intel_rehab_history(ip);
+CREATE INDEX IF NOT EXISTS idx_threat_intel_rehab_history_rehab_at ON threat_intel_rehab_history(rehab_at);
+
 CREATE TABLE IF NOT EXISTS backup_archives (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   file_name TEXT NOT NULL,
@@ -435,6 +493,15 @@ CREATE INDEX IF NOT EXISTS idx_backup_archives_storage_created ON backup_archive
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN mfa_enrolled_at TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE threat_intel_ban_history ADD COLUMN ban_kind TEXT NOT NULL DEFAULT 'hard'`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE threat_intel_ban_history SET ban_kind='hard' WHERE TRIM(COALESCE(ban_kind,''))=''`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_threat_intel_ban_history_kind ON threat_intel_ban_history(ban_kind, rehab_at)`); err != nil {
 		return err
 	}
 	return nil
@@ -1046,6 +1113,88 @@ ON CONFLICT(ip) DO UPDATE SET reason=excluded.reason, updated_at=excluded.update
 
 func (s *Store) RemoveBlockedIP(ctx context.Context, ip string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM blocked_ips WHERE ip=?`, strings.TrimSpace(ip))
+	return err
+}
+
+func normalizeBanKind(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "soft":
+		return "soft"
+	default:
+		return "hard"
+	}
+}
+
+func (s *Store) EnsureThreatIntelBanHistoryForIP(ctx context.Context, ip, reason, banKind string) error {
+	ip = strings.TrimSpace(ip)
+	reason = strings.TrimSpace(reason)
+	banKind = normalizeBanKind(banKind)
+	if ip == "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO threat_intel_ban_history(ip, first_seen_at, banned_at, ban_kind, xp_at_ban, reason, rehab_at, false_positive, created_at)
+SELECT ?, COALESCE((SELECT MIN(first_seen_at) FROM threat_intel_matches WHERE ip=?), ?), ?, ?, COALESCE((SELECT xp FROM threat_intel_ip_state WHERE ip=?), 0), ?, '', 0, ?
+WHERE NOT EXISTS (
+  SELECT 1 FROM threat_intel_ban_history
+  WHERE ip=? AND ban_kind=? AND rehab_at=''
+)`, ip, ip, now, now, banKind, ip, reason, now, ip, banKind)
+	return err
+}
+
+func (s *Store) SyncThreatIntelBanHistoryOpen(ctx context.Context) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO threat_intel_ban_history(ip, first_seen_at, banned_at, ban_kind, xp_at_ban, reason, rehab_at, false_positive, created_at)
+SELECT
+  b.ip,
+  COALESCE((SELECT MIN(m.first_seen_at) FROM threat_intel_matches m WHERE m.ip=b.ip), b.created_at),
+  b.created_at,
+  'hard',
+  COALESCE((SELECT s.xp FROM threat_intel_ip_state s WHERE s.ip=b.ip), 0),
+  b.reason,
+  '',
+  0,
+  ?
+FROM blocked_ips b
+WHERE NOT EXISTS (
+  SELECT 1 FROM threat_intel_ban_history h
+  WHERE h.ip=b.ip AND h.ban_kind='hard' AND h.rehab_at=''
+)`, now)
+	return err
+}
+
+func (s *Store) CloseThreatIntelBanHistory(ctx context.Context, ip, banKind string, falsePositive bool) error {
+	ip = strings.TrimSpace(ip)
+	banKind = normalizeBanKind(banKind)
+	if ip == "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+UPDATE threat_intel_ban_history
+SET rehab_at=?, false_positive=CASE WHEN ?=1 THEN 1 ELSE false_positive END
+WHERE id = (
+  SELECT id FROM threat_intel_ban_history
+  WHERE ip=? AND ban_kind=? AND rehab_at=''
+  ORDER BY banned_at DESC
+  LIMIT 1
+)`, now, boolToInt(falsePositive), ip, banKind)
+	return err
+}
+
+func (s *Store) RecordThreatIntelRehabEvent(ctx context.Context, ip string, hadBlock bool, reason string) error {
+	ip = strings.TrimSpace(ip)
+	reason = strings.TrimSpace(reason)
+	if ip == "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO threat_intel_rehab_history(ip, first_seen_at, rehab_at, had_block, reason, created_at)
+SELECT ?, COALESCE((SELECT MIN(first_seen_at) FROM threat_intel_matches WHERE ip=?), ''), ?, ?, ?, ?`,
+		ip, ip, now, boolToInt(hadBlock), reason, now)
 	return err
 }
 
@@ -3038,6 +3187,81 @@ ORDER BY ip_count DESC, total_hits DESC, country ASC`, now, now)
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) GetThreatIntelMetaDashboard(ctx context.Context) (model.ThreatIntelMetaDashboard, error) {
+	var out model.ThreatIntelMetaDashboard
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM blocked_ips`).Scan(&out.TotalBannedIPs); err != nil {
+		return out, err
+	}
+	var avgEsc, avgXP, avgRehab sql.NullFloat64
+	if err := s.db.QueryRowContext(ctx, `
+SELECT
+  AVG(CASE
+        WHEN first_seen_at <> '' AND banned_at <> '' THEN
+          (julianday(banned_at) - julianday(first_seen_at)) * 86400.0
+        ELSE NULL
+      END) AS avg_escalation_seconds,
+  AVG(CAST((
+    SELECT COALESCE(SUM(m.xp_delta), 0)
+    FROM threat_intel_matches m
+    WHERE m.ip = h.ip AND m.last_seen_at <= h.banned_at
+  ) AS REAL)) AS avg_xp_before_ban,
+  AVG(CASE
+        WHEN rehab_at <> '' THEN
+          (julianday(rehab_at) - julianday(banned_at)) * 86400.0
+        ELSE NULL
+      END) AS avg_rehab_seconds
+FROM threat_intel_ban_history h`).Scan(&avgEsc, &avgXP, &avgRehab); err != nil {
+		return out, err
+	}
+	if avgEsc.Valid {
+		out.AverageEscalationSeconds = avgEsc.Float64
+	}
+	if avgXP.Valid {
+		out.AverageXPBeforeBan = avgXP.Float64
+	}
+	if avgRehab.Valid {
+		out.AverageRehabSeconds = avgRehab.Float64
+	}
+	var rehabCount, falsePosCount int64
+	if err := s.db.QueryRowContext(ctx, `
+SELECT
+  COUNT(1) AS rehab_count,
+  COALESCE(SUM(CASE WHEN had_block = 0 THEN 1 ELSE 0 END), 0) AS false_positive_rehab_count
+FROM threat_intel_rehab_history`).Scan(&rehabCount, &falsePosCount); err != nil {
+		return out, err
+	}
+	out.RehabCount = rehabCount
+	out.FalsePositiveRehabCount = falsePosCount
+	if out.RehabCount > 0 {
+		out.FalsePositiveRehabSharePct = (float64(out.FalsePositiveRehabCount) / float64(out.RehabCount)) * 100.0
+	}
+	var softCount, hardCount int64
+	if err := s.db.QueryRowContext(ctx, `
+SELECT
+  COALESCE(SUM(CASE WHEN ban_kind='soft' THEN 1 ELSE 0 END), 0) AS soft_count,
+  COALESCE(SUM(CASE WHEN ban_kind='hard' THEN 1 ELSE 0 END), 0) AS hard_count
+FROM threat_intel_ban_history`).Scan(&softCount, &hardCount); err != nil {
+		return out, err
+	}
+	out.SoftBanCount = softCount
+	out.HardBanCount = hardCount
+	var softDecay, hardDecay sql.NullFloat64
+	if err := s.db.QueryRowContext(ctx, `
+SELECT
+  AVG(CASE WHEN ban_kind='soft' AND rehab_at<>'' THEN (julianday(rehab_at)-julianday(banned_at))*86400.0 ELSE NULL END) AS soft_decay,
+  AVG(CASE WHEN ban_kind='hard' AND rehab_at<>'' THEN (julianday(rehab_at)-julianday(banned_at))*86400.0 ELSE NULL END) AS hard_decay
+FROM threat_intel_ban_history`).Scan(&softDecay, &hardDecay); err != nil {
+		return out, err
+	}
+	if softDecay.Valid {
+		out.SoftBanAvgDecaySeconds = softDecay.Float64
+	}
+	if hardDecay.Valid {
+		out.HardBanAvgDecaySeconds = hardDecay.Float64
+	}
+	return out, nil
 }
 
 func parseNullableTime(v sql.NullString) time.Time {

@@ -89,6 +89,7 @@ type ManagedUser = {
   role: string;
   authProvider?: string;
   domainIds: number[];
+  groupMemberships?: UserGroupMembership[];
   allowedCidrs?: string;
   ipCheckDisabled?: boolean;
   mfaEnabled?: boolean;
@@ -96,6 +97,11 @@ type ManagedUser = {
   createdAt: string;
   updatedAt: string;
 };
+type UserGroupMembership = { userId: number; groupId: number; priority: number; groupName?: string; isTemplate?: boolean };
+type PermissionCatalogItem = { key: string; category: string; label: string; description: string; critical?: boolean };
+type PermissionGroup = { id: number; name: string; description: string; template: string; system: boolean; createdAt: string; updatedAt: string };
+type PermissionGroupView = { group: PermissionGroup; permissions: string[]; userCount: number };
+type PermissionMatrixRow = { permission: string; category: string; label: string; critical?: boolean; groupCount: number; userCount: number; groups: string[]; users: string[] };
 type DomainPreflightCheck = { name: string; ok: boolean; detail?: string };
 type DomainPreflight = { domain: string; dnsMode: string; provider: string; zoneId?: string; resolvedZone?: string; publicIpv4?: string; checks: DomainPreflightCheck[]; ready: boolean };
 type HostPreflightCheck = { name: string; ok: boolean; detail?: string };
@@ -150,11 +156,33 @@ type ThreatIntelConfig = {
   hardLevel: number;
   softBlockMinutes: number;
 };
+type ThreatSignatureConfig = {
+  enabled: boolean;
+  autoUpdate: boolean;
+  sourceUrl: string;
+  lastSyncAt?: string;
+  lastHash?: string;
+  ruleCount?: number;
+  source?: string;
+};
 type ThreatIntelFeed = { id: number; name: string; url: string; enabled: boolean; isDefault?: boolean; entryCount?: number; lastSyncAt?: string; lastError?: string; lastHash?: string; createdAt?: string; updatedAt?: string };
 type ThreatIntelMatch = { id: number; ip: string; feed: string; host: string; path: string; targetCount?: number; country: string; mode: string; decision: string; hits: number; firstSeenAt: string; lastSeenAt: string; lastTraceId?: string; sourceScope?: string; xp?: number; level?: number; tier?: string; riskState?: string };
 type ThreatIntelTarget = { host: string; path: string; feed: string; decision: string; hits: number; lastSeenAt: string };
 type ThreatIntelOffender = { ip: string; totalHits: number; distinctFeeds: number; distinctHosts: number; feedSummary?: string; decisions: string; lastSeenAt: string; blocked: boolean; allowlisted: boolean; xp?: number; level?: number; tier?: string; riskState?: string };
 type ThreatIntelBlocked = { ip: string; reason?: string; history?: string; blockedOn?: string; blockedUntil?: string; updatedAt: string; totalHits: number; distinctFeeds: number; distinctHosts: number; lastSeenAt?: string; xp?: number; level?: number; tier?: string; riskState?: string };
+type ThreatIntelMetaDashboard = {
+  totalBannedIps: number;
+  averageEscalationSeconds: number;
+  averageXpBeforeBan: number;
+  averageRehabSeconds: number;
+  falsePositiveRehabSharePct: number;
+  rehabCount: number;
+  falsePositiveRehabCount: number;
+  softBanCount: number;
+  hardBanCount: number;
+  softBanAvgDecaySeconds: number;
+  hardBanAvgDecaySeconds: number;
+};
 type ThreatIntelMatchesPage = { items: ThreatIntelMatch[]; total: number; page: number; pageSize: number };
 type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; page: number; pageSize: number };
 type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
@@ -195,7 +223,8 @@ type GeoIPStats = {
 };
 
 type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'ssh' | 'audit' | 'account' | 'accessControl' | 'integrations' | 'help';
-type SettingsTab = 'general' | 'security' | 'idp' | 'mfa' | 'logservers' | 'geoip' | 'appearance' | 'advanced';
+type SettingsTab = 'general' | 'security' | 'threatintel' | 'idp' | 'mfa' | 'logservers' | 'geoip' | 'appearance' | 'advanced';
+type IdentityTab = 'users' | 'groups' | 'matrix';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
 type PublicStyle = { styleProfile?: string; styleCustom?: string };
@@ -588,6 +617,11 @@ function App() {
     hardLevel: 6,
     softBlockMinutes: 15,
   });
+  const [tiSigConfig, setTiSigConfig] = useState<ThreatSignatureConfig>({
+    enabled: false,
+    autoUpdate: false,
+    sourceUrl: '',
+  });
   const [tiFeeds, setTiFeeds] = useState<ThreatIntelFeed[]>([]);
   const [tiMatches, setTiMatches] = useState<ThreatIntelMatch[]>([]);
   const [tiOffenders, setTiOffenders] = useState<ThreatIntelOffender[]>([]);
@@ -595,7 +629,8 @@ function App() {
   const [tiHours, setTiHours] = useState(24);
   const [tiDecision, setTiDecision] = useState('all');
   const [tiQuery, setTiQuery] = useState('');
-  const [tiView, setTiView] = useState<'events' | 'offenders'>('events');
+  const [tiView, setTiView] = useState<'meta' | 'events' | 'offenders'>('meta');
+  const [tiMeta, setTiMeta] = useState<ThreatIntelMetaDashboard | null>(null);
   const [tiPage, setTiPage] = useState(1);
   const [tiPageSize, setTiPageSize] = useState(100);
   const [tiTotalMatches, setTiTotalMatches] = useState(0);
@@ -616,6 +651,10 @@ function App() {
   const [tiConfigSavedAt, setTiConfigSavedAt] = useState('');
   const [tokens, setTokens] = useState<APIToken[]>([]);
   const [users, setUsers] = useState<ManagedUser[]>([]);
+  const [identityGroups, setIdentityGroups] = useState<PermissionGroupView[]>([]);
+  const [identityPermCatalog, setIdentityPermCatalog] = useState<PermissionCatalogItem[]>([]);
+  const [identityMatrix, setIdentityMatrix] = useState<PermissionMatrixRow[]>([]);
+  const [identityTab, setIdentityTab] = useState<IdentityTab>('users');
   const [domainChecks, setDomainChecks] = useState<Record<number, DomainLiveCheck>>({});
   const [trafficOverview, setTrafficOverview] = useState<TrafficOverview | null>(null);
   const [selectedHostTraffic, setSelectedHostTraffic] = useState<HostTrafficDetails | null>(null);
@@ -722,12 +761,17 @@ function App() {
   const [settingsTimeSyncLAN, setSettingsTimeSyncLAN] = useState('');
   const [settingsLogServers, setSettingsLogServers] = useState<LogServerSettings>(defaultLogServers());
   const [settingsLogHTTPBearer, setSettingsLogHTTPBearer] = useState('');
+  const [logSyslogExpanded, setLogSyslogExpanded] = useState(false);
+  const [logHTTPExpanded, setLogHTTPExpanded] = useState(false);
+  const [logTCPExpanded, setLogTCPExpanded] = useState(false);
   const [settingsRetention, setSettingsRetention] = useState<RetentionPolicy>(defaultRetentionPolicy());
   const [settingsMFAPolicy, setSettingsMFAPolicy] = useState<MFAPolicy>({ enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
   const [settingsLDAP, setSettingsLDAP] = useState<LDAPSettings>(defaultLDAPSettings());
   const [settingsLDAPBindPassword, setSettingsLDAPBindPassword] = useState('');
   const [settingsOIDC, setSettingsOIDC] = useState<OIDCSettings>(defaultOIDCSettings());
   const [settingsOIDCClientSecret, setSettingsOIDCClientSecret] = useState('');
+  const [idpLDAPExpanded, setIdpLDAPExpanded] = useState(false);
+  const [idpOIDCExpanded, setIdpOIDCExpanded] = useState(false);
   const [geoipSources, setGeoipSources] = useState<GeoIPSource[]>([]);
   const [geoipStats, setGeoipStats] = useState<GeoIPStats | null>(null);
   const [geoipUploadFile, setGeoipUploadFile] = useState<File | null>(null);
@@ -771,18 +815,26 @@ function App() {
   const [newUserPassword, setNewUserPassword] = useState('');
   const [newUserRole, setNewUserRole] = useState<'admin' | 'domain-admin' | 'read-only'>('domain-admin');
   const [newUserDomainIDs, setNewUserDomainIDs] = useState<number[]>([]);
+  const [newUserGroupIDs, setNewUserGroupIDs] = useState<number[]>([]);
   const [newUserAllowedCIDRs, setNewUserAllowedCIDRs] = useState('');
   const [newUserIPCheckDisabled, setNewUserIPCheckDisabled] = useState(false);
   const [showCreateUserDialog, setShowCreateUserDialog] = useState(false);
   const [editUserID, setEditUserID] = useState<number | null>(null);
   const [editUserRole, setEditUserRole] = useState<'admin' | 'domain-admin' | 'read-only'>('domain-admin');
   const [editUserDomainIDs, setEditUserDomainIDs] = useState<number[]>([]);
+  const [editUserGroupIDs, setEditUserGroupIDs] = useState<number[]>([]);
   const [editUserPassword, setEditUserPassword] = useState('');
   const [editUserAllowedCIDRs, setEditUserAllowedCIDRs] = useState('');
   const [editUserIPCheckDisabled, setEditUserIPCheckDisabled] = useState(false);
   const [usersRoleFilter, setUsersRoleFilter] = useState<'all' | 'admin' | 'domain-admin' | 'read-only'>('all');
   const [usersProviderFilter, setUsersProviderFilter] = useState<'all' | 'local' | 'ldap' | 'oidc'>('all');
   const [usersQuery, setUsersQuery] = useState('');
+  const [groupEditorID, setGroupEditorID] = useState<number | null>(null);
+  const [groupEditorName, setGroupEditorName] = useState('');
+  const [groupEditorDescription, setGroupEditorDescription] = useState('');
+  const [groupEditorTemplate, setGroupEditorTemplate] = useState('');
+  const [groupEditorPermissions, setGroupEditorPermissions] = useState<string[]>([]);
+  const [groupEditorOpen, setGroupEditorOpen] = useState(false);
   const [selfNotifyEmail, setSelfNotifyEmail] = useState('');
   const [selfCurrentPassword, setSelfCurrentPassword] = useState('');
   const [selfNewPassword, setSelfNewPassword] = useState('');
@@ -923,6 +975,24 @@ function App() {
         setUsers([]);
       }
       try {
+        const gp = await api<{ items: PermissionGroupView[] }>('/api/v1/identity/groups');
+        setIdentityGroups(gp.items || []);
+      } catch {
+        setIdentityGroups([]);
+      }
+      try {
+        const pc = await api<{ items: PermissionCatalogItem[] }>('/api/v1/identity/permissions');
+        setIdentityPermCatalog(pc.items || []);
+      } catch {
+        setIdentityPermCatalog([]);
+      }
+      try {
+        const mx = await api<{ items: PermissionMatrixRow[] }>('/api/v1/identity/matrix');
+        setIdentityMatrix(mx.items || []);
+      } catch {
+        setIdentityMatrix([]);
+      }
+      try {
         const sr = await api<{ items: SSHBastionRoute[] }>('/api/v1/ssh/routes');
         setSshRoutes(sr.items || []);
       } catch {
@@ -945,11 +1015,19 @@ function App() {
         setSettingsStyleCustom(s.styleCustom || '');
         setSettingsTimeSyncMode((s.timeSyncMode as 'system_only' | 'external_public' | 'external_lan') || 'system_only');
         setSettingsTimeSyncLAN((s.timeSyncLANServers || []).join(', '));
-        setSettingsLogServers(s.logServers || defaultLogServers());
+        const ls = s.logServers || defaultLogServers();
+        setSettingsLogServers(ls);
+        setLogSyslogExpanded(!!ls.syslog.enabled);
+        setLogHTTPExpanded(!!ls.http.enabled);
+        setLogTCPExpanded(!!ls.tcpJson.enabled);
         setSettingsRetention(s.retention || defaultRetentionPolicy());
         setSettingsMFAPolicy(s.mfaPolicy || { enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
-        setSettingsLDAP(s.ldap || defaultLDAPSettings());
-        setSettingsOIDC(s.oidc || defaultOIDCSettings());
+        const ldapCfg = s.ldap || defaultLDAPSettings();
+        const oidcCfg = s.oidc || defaultOIDCSettings();
+        setSettingsLDAP(ldapCfg);
+        setSettingsOIDC(oidcCfg);
+        setIdpLDAPExpanded(!!ldapCfg.enabled);
+        setIdpOIDCExpanded(!!oidcCfg.enabled);
       } catch {
         setSettings(null);
         setSettingsPublicIPv4('');
@@ -959,10 +1037,15 @@ function App() {
         setSettingsTimeSyncMode('system_only');
         setSettingsTimeSyncLAN('');
         setSettingsLogServers(defaultLogServers());
+        setLogSyslogExpanded(false);
+        setLogHTTPExpanded(false);
+        setLogTCPExpanded(false);
         setSettingsRetention(defaultRetentionPolicy());
         setSettingsMFAPolicy({ enforceAdmin: false, enforceDomainAdmin: false, enforceReadOnly: false });
         setSettingsLDAP(defaultLDAPSettings());
         setSettingsOIDC(defaultOIDCSettings());
+        setIdpLDAPExpanded(false);
+        setIdpOIDCExpanded(false);
       }
       try {
         const b = await api<BackupScheduleSettings>('/api/v1/backup/settings');
@@ -1026,6 +1109,20 @@ function App() {
       } catch {
         // Keep previous threat intel config on transient failures.
       }
+      try {
+        const sig = await api<ThreatSignatureConfig>('/api/v1/threat-intel/signatures/config');
+        setTiSigConfig({
+          enabled: !!sig.enabled,
+          autoUpdate: !!sig.autoUpdate,
+          sourceUrl: sig.sourceUrl || '',
+          lastSyncAt: sig.lastSyncAt,
+          lastHash: sig.lastHash,
+          ruleCount: Number(sig.ruleCount || 0),
+          source: sig.source || '',
+        });
+      } catch {
+        // Keep previous signature config on transient failures.
+      }
     } catch (e) {
       const err = e as Error & { status?: number };
       if (err.status === 503 && /setup required/i.test(err.message)) {
@@ -1081,11 +1178,13 @@ function App() {
 
   const loadThreatIntel = async () => {
     try {
-      const [cfg, feeds, allow, blockedSummary] = await Promise.all([
+      const [cfg, feeds, allow, blockedSummary, sig, meta] = await Promise.all([
         api<ThreatIntelConfig>('/api/v1/threat-intel/config'),
         api<{ items: ThreatIntelFeed[] }>('/api/v1/threat-intel/feeds'),
         api<{ items: BlockedIP[] }>('/api/v1/threat-intel/allowlist'),
         api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=&page=1&pageSize=1`),
+        api<ThreatSignatureConfig>('/api/v1/threat-intel/signatures/config'),
+        api<ThreatIntelMetaDashboard>('/api/v1/threat-intel/meta'),
       ]);
       setTiConfig({
         enabled: !!cfg.enabled,
@@ -1102,12 +1201,22 @@ function App() {
       });
       setTiFeeds(feeds.items || []);
       setTiAllowlist(allow.items || []);
+      setTiSigConfig({
+        enabled: !!sig.enabled,
+        autoUpdate: !!sig.autoUpdate,
+        sourceUrl: sig.sourceUrl || '',
+        lastSyncAt: sig.lastSyncAt,
+        lastHash: sig.lastHash,
+        ruleCount: Number(sig.ruleCount || 0),
+        source: sig.source || '',
+      });
+      setTiMeta(meta || null);
       setTiTotalBlocked(Number(blockedSummary.total || 0));
       if (tiView === 'events') {
         const matchesPage = await api<ThreatIntelMatchesPage>(`/api/v1/threat-intel/matches?hours=${encodeURIComponent(String(tiHours))}&decision=${encodeURIComponent(tiDecision)}&q=${encodeURIComponent(tiQuery)}&page=${encodeURIComponent(String(tiPage))}&pageSize=${encodeURIComponent(String(tiPageSize))}`);
         setTiMatches(matchesPage.items || []);
         setTiTotalMatches(Number(matchesPage.total || 0));
-      } else {
+      } else if (tiView === 'offenders') {
         const offendersPage = await api<ThreatIntelOffendersPage>(`/api/v1/threat-intel/offenders?hours=${encodeURIComponent(String(tiHours))}&page=${encodeURIComponent(String(tiPage))}&pageSize=${encodeURIComponent(String(tiPageSize))}`);
         setTiOffenders(offendersPage.items || []);
         setTiTotalOffenders(Number(offendersPage.total || 0));
@@ -1622,6 +1731,9 @@ function App() {
       setAudit([]);
       setTokens([]);
       setUsers([]);
+      setIdentityGroups([]);
+      setIdentityPermCatalog([]);
+      setIdentityMatrix([]);
       setSshRoutes([]);
       setSshKeys([]);
       setDomainChecks({});
@@ -2157,6 +2269,21 @@ function App() {
     setSshGeneratedPPKError('');
     setSshKeyPublic('');
   }, [isReadOnlyRole]);
+  useEffect(() => {
+    if (!settingsLDAP.enabled) setIdpLDAPExpanded(false);
+  }, [settingsLDAP.enabled]);
+  useEffect(() => {
+    if (!settingsOIDC.enabled) setIdpOIDCExpanded(false);
+  }, [settingsOIDC.enabled]);
+  useEffect(() => {
+    if (!settingsLogServers.syslog.enabled) setLogSyslogExpanded(false);
+  }, [settingsLogServers.syslog.enabled]);
+  useEffect(() => {
+    if (!settingsLogServers.http.enabled) setLogHTTPExpanded(false);
+  }, [settingsLogServers.http.enabled]);
+  useEffect(() => {
+    if (!settingsLogServers.tcpJson.enabled) setLogTCPExpanded(false);
+  }, [settingsLogServers.tcpJson.enabled]);
   const sshRouteByFQDN = useMemo(() => {
     const out: Record<string, SSHBastionRoute> = {};
     sshRoutes.forEach((r) => { out[r.fqdn.toLowerCase()] = r; });
@@ -2957,6 +3084,7 @@ function App() {
           password: newUserPassword,
           role: newUserRole,
           domainIds: newUserRole === 'domain-admin' ? newUserDomainIDs : [],
+          groupIds: newUserGroupIDs,
           allowedCidrs: newUserAllowedCIDRs.trim(),
           ipCheckDisabled: !!newUserIPCheckDisabled,
         }),
@@ -2965,6 +3093,7 @@ function App() {
       setNewUserPassword('');
       setNewUserRole('domain-admin');
       setNewUserDomainIDs([]);
+      setNewUserGroupIDs([]);
       setNewUserAllowedCIDRs('');
       setNewUserIPCheckDisabled(false);
       setShowCreateUserDialog(false);
@@ -3010,6 +3139,7 @@ function App() {
         body: JSON.stringify({
           role: editUserRole,
           domainIds: editUserRole === 'domain-admin' ? editUserDomainIDs : [],
+          groupIds: editUserGroupIDs,
           allowedCidrs: editUserAllowedCIDRs.trim(),
           ipCheckDisabled: !!editUserIPCheckDisabled,
         }),
@@ -3299,10 +3429,126 @@ function App() {
     setEditUserDomainIDs((prev) => (prev.includes(id) ? prev.filter((v) => v !== id) : [...prev, id]));
   };
 
+  const addUserGroup = (setter: (v: (prev: number[]) => number[]) => void, gid: number) => {
+    setter((prev) => (prev.includes(gid) ? prev : [...prev, gid]));
+  };
+
+  const removeUserGroup = (setter: (v: (prev: number[]) => number[]) => void, gid: number) => {
+    setter((prev) => prev.filter((id) => id !== gid));
+  };
+
+  const moveUserGroup = (setter: (v: (prev: number[]) => number[]) => void, gid: number, dir: -1 | 1) => {
+    setter((prev) => {
+      const idx = prev.indexOf(gid);
+      if (idx < 0) return prev;
+      const nx = idx + dir;
+      if (nx < 0 || nx >= prev.length) return prev;
+      const out = [...prev];
+      const tmp = out[idx];
+      out[idx] = out[nx];
+      out[nx] = tmp;
+      return out;
+    });
+  };
+
+  const openCreateGroupDialog = () => {
+    setGroupEditorID(null);
+    setGroupEditorName('');
+    setGroupEditorDescription('');
+    setGroupEditorTemplate('');
+    setGroupEditorPermissions([]);
+    setGroupEditorOpen(true);
+  };
+
+  const openEditGroupDialog = (g: PermissionGroupView) => {
+    setGroupEditorID(g.group.id);
+    setGroupEditorName(g.group.name || '');
+    setGroupEditorDescription(g.group.description || '');
+    setGroupEditorTemplate(g.group.template || '');
+    setGroupEditorPermissions([...(g.permissions || [])]);
+    setGroupEditorOpen(true);
+  };
+
+  const closeGroupDialog = () => {
+    setGroupEditorOpen(false);
+    setGroupEditorID(null);
+  };
+
+  const toggleGroupEditorPermission = (perm: string) => {
+    const key = String(perm || '').trim().toLowerCase();
+    if (!key) return;
+    setGroupEditorPermissions((prev) => (prev.includes(key) ? prev.filter((p) => p !== key) : [...prev, key]));
+  };
+
+  const applyGroupTemplate = (template: string) => {
+    const pick = identityGroups.find((g) => String(g.group.template || '').toLowerCase() === String(template || '').toLowerCase());
+    if (!pick) return;
+    setGroupEditorTemplate(pick.group.template || '');
+    setGroupEditorPermissions([...(pick.permissions || [])]);
+  };
+
+  const saveGroupEditor = async () => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    if (!groupEditorName.trim()) {
+      setError('Group name is required.');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    try {
+      const body = JSON.stringify({
+        name: groupEditorName.trim(),
+        description: groupEditorDescription.trim(),
+        template: groupEditorTemplate.trim(),
+        permissions: [...new Set(groupEditorPermissions.map((p) => p.toLowerCase().trim()).filter((p) => !!p))],
+      });
+      if (groupEditorID) {
+        await api(`/api/v1/identity/groups/${groupEditorID}`, {
+          method: 'PUT',
+          headers: { 'X-CSRF-Token': csrf },
+          body,
+        });
+      } else {
+        await api('/api/v1/identity/groups', {
+          method: 'POST',
+          headers: { 'X-CSRF-Token': csrf },
+          body,
+        });
+      }
+      closeGroupDialog();
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const deleteIdentityGroup = async (id: number) => {
+    if (isReadOnlyRole || identity?.role !== 'admin') return;
+    const ok = window.confirm('Delete this custom group?');
+    if (!ok) return;
+    setLoading(true);
+    setError('');
+    try {
+      await api(`/api/v1/identity/groups/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-CSRF-Token': csrf },
+      });
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const openEditUserDialog = (u: ManagedUser) => {
     setEditUserID(u.id);
     setEditUserRole((u.role as 'admin' | 'domain-admin' | 'read-only') || 'read-only');
     setEditUserDomainIDs([...(u.domainIds || [])]);
+    const membership = [...(u.groupMemberships || [])].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+    setEditUserGroupIDs(membership.map((m) => m.groupId));
     setEditUserPassword('');
     setEditUserAllowedCIDRs((u.allowedCidrs || '').trim());
     setEditUserIPCheckDisabled(!!u.ipCheckDisabled && !!u.mfaEnabled);
@@ -3312,6 +3558,7 @@ function App() {
     setEditUserID(null);
     setEditUserPassword('');
     setEditUserDomainIDs([]);
+    setEditUserGroupIDs([]);
     setEditUserAllowedCIDRs('');
     setEditUserIPCheckDisabled(false);
   };
@@ -3344,7 +3591,7 @@ function App() {
     setDetailHABackends((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  const saveThreatIntelConfig = async () => {
+  const saveThreatIntelAll = async () => {
     if (isReadOnlyRole || identity?.role !== 'admin') return;
     setLoading(true);
     setError('');
@@ -3353,6 +3600,15 @@ function App() {
         method: 'POST',
         headers: { 'X-CSRF-Token': csrf },
         body: JSON.stringify(tiConfig),
+      });
+      await api('/api/v1/threat-intel/signatures/config', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrf },
+        body: JSON.stringify({
+          enabled: !!tiSigConfig.enabled,
+          autoUpdate: !!tiSigConfig.autoUpdate,
+          sourceUrl: (tiSigConfig.sourceUrl || '').trim(),
+        }),
       });
       setTiConfigSavedAt(new Date().toISOString());
       await loadThreatIntel();
@@ -3571,7 +3827,7 @@ function App() {
     }
   };
 
-  const tiTotalCurrent = tiView === 'events' ? tiTotalMatches : tiTotalOffenders;
+  const tiTotalCurrent = tiView === 'events' ? tiTotalMatches : tiView === 'offenders' ? tiTotalOffenders : 0;
   const tiPageCount = Math.max(1, Math.ceil(Math.max(0, tiTotalCurrent) / Math.max(1, tiPageSize)));
   const tabTitle: Record<Tab, string> = {
     dashboard: 'Dashboard',
@@ -3583,7 +3839,7 @@ function App() {
     ssh: 'SSH Bastion',
     backup: 'Backup Center',
     settings: 'Settings',
-    users: 'Users',
+    users: 'Identity Management',
     api: 'API Management',
     account: 'My Account',
     accessControl: 'Access Control',
@@ -3620,7 +3876,7 @@ function App() {
             </div>
             <div className="menu-group">
               <div className="menu-title">Identity</div>
-              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Users</button> : null}
+              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Identity Management</button> : null}
               <button className={tab === 'account' ? 'active' : ''} onClick={() => setTab('account')}>My Account</button>
             </div>
             <div className="menu-group">
@@ -3974,6 +4230,7 @@ function App() {
                   </div>
                   <div className="row">
                     <div className="wizard-steps" style={{ marginBottom: 0 }}>
+                      <button className={tiView === 'meta' ? 'wiz active' : 'wiz'} onClick={() => setTiView('meta')}>Meta Dashboard</button>
                       <button className={tiView === 'events' ? 'wiz active' : 'wiz'} onClick={() => setTiView('events')}>Events</button>
                       <button className={tiView === 'offenders' ? 'wiz active' : 'wiz'} onClick={() => setTiView('offenders')}>Offenders</button>
                     </div>
@@ -3983,12 +4240,14 @@ function App() {
                       <option value="24">Last 24h</option>
                       <option value="168">Last 7d</option>
                     </select>
-                    <select value={String(tiPageSize)} onChange={(e) => setTiPageSize(Math.max(25, Number(e.target.value) || 100))}>
-                      <option value="50">50 / page</option>
-                      <option value="100">100 / page</option>
-                      <option value="250">250 / page</option>
-                      <option value="500">500 / page</option>
-                    </select>
+                    {tiView !== 'meta' ? (
+                      <select value={String(tiPageSize)} onChange={(e) => setTiPageSize(Math.max(25, Number(e.target.value) || 100))}>
+                        <option value="50">50 / page</option>
+                        <option value="100">100 / page</option>
+                        <option value="250">250 / page</option>
+                        <option value="500">500 / page</option>
+                      </select>
+                    ) : null}
                     {tiView === 'events' ? (
                       <select value={tiDecision} onChange={(e) => setTiDecision(e.target.value)}>
                         <option value="all">All decisions</option>
@@ -4002,10 +4261,24 @@ function App() {
                     <input value={tiQuery} onChange={(e) => setTiQuery(e.target.value)} placeholder="Search ip/host/path/feed/country" />
                   </div>
                   <div className="muted" style={{ marginBottom: '.55rem' }}>
-                    Showing page {tiPage} / {tiPageCount} · total records: {tiTotalCurrent} · Events: repeated IPs only (hits {'>='} {tiConfig.eventMinHits || 2}, {'<'} {tiConfig.offenderMinHits || 10}) · Offenders: burst offenders (hits {'>='} {tiConfig.offenderMinHits || 10}) · Tiering: XP + Level + State
+                    {tiView === 'meta'
+                      ? 'Meta Dashboard summarizes block lifecycle quality and rehabilitation behavior.'
+                      : `Showing page ${tiPage} / ${tiPageCount} · total records: ${tiTotalCurrent} · Events: repeated IPs only (hits >= ${tiConfig.eventMinHits || 2}, < ${tiConfig.offenderMinHits || 10}) · Offenders: burst offenders (hits >= ${tiConfig.offenderMinHits || 10}) · Tiering: XP + Level + State`}
                   </div>
                   <div className="log-table-wrap">
-                    {tiView === 'events' ? (
+                    {tiView === 'meta' ? (
+                      <div className="metric-grid" style={{ padding: '.55rem' }}>
+                        <MetricTile label="Total Banned IPs" value={String(tiMeta?.totalBannedIps || 0)} hint="Current blocked table size" />
+                        <MetricTile label="Soft Bans" value={String(tiMeta?.softBanCount || 0)} hint="Auto soft-ban lifecycle" />
+                        <MetricTile label="Hard Bans" value={String(tiMeta?.hardBanCount || 0)} hint="Manual + level-hard bans" />
+                        <MetricTile label="Avg Escalation Time" value={formatDurationShort(tiMeta?.averageEscalationSeconds || 0)} hint="First seen -> banned" />
+                        <MetricTile label="Avg Cumulative XP Before Ban" value={(tiMeta?.averageXpBeforeBan || 0).toFixed(1)} hint="Across ban history" />
+                        <MetricTile label="Avg Duration Until Rehab" value={formatDurationShort(tiMeta?.averageRehabSeconds || 0)} hint="Banned -> rehabilitated" />
+                        <MetricTile label="Soft Ban Avg Decay" value={formatDurationShort(tiMeta?.softBanAvgDecaySeconds || 0)} hint="Soft-ban -> rehab" />
+                        <MetricTile label="Hard Ban Avg Decay" value={formatDurationShort(tiMeta?.hardBanAvgDecaySeconds || 0)} hint="Hard-ban -> rehab" />
+                        <MetricTile label="False-Positive Rehabilitated Share" value={`${(tiMeta?.falsePositiveRehabSharePct || 0).toFixed(1)}%`} hint={`${tiMeta?.falsePositiveRehabCount || 0} of ${tiMeta?.rehabCount || 0} rehab cases`} />
+                      </div>
+                    ) : tiView === 'events' ? (
                       <table className="log-table">
                         <thead>
                           <tr>
@@ -4092,8 +4365,12 @@ function App() {
                     )}
                   </div>
                   <div className="row" style={{ marginTop: '.6rem', marginBottom: 0 }}>
-                    <button className="btn" onClick={() => setTiPage((p) => Math.max(1, p - 1))} disabled={tiPage <= 1}>Prev</button>
-                    <button className="btn" onClick={() => setTiPage((p) => Math.min(tiPageCount, p + 1))} disabled={tiPage >= tiPageCount}>Next</button>
+                    {tiView !== 'meta' ? (
+                      <>
+                        <button className="btn" onClick={() => setTiPage((p) => Math.max(1, p - 1))} disabled={tiPage <= 1}>Prev</button>
+                        <button className="btn" onClick={() => setTiPage((p) => Math.min(tiPageCount, p + 1))} disabled={tiPage >= tiPageCount}>Next</button>
+                      </>
+                    ) : null}
                     <button className="btn" onClick={loadThreatIntel} disabled={loading}>Refresh</button>
                   </div>
                 </section>
@@ -4645,11 +4922,12 @@ function App() {
           {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'settings' ? (
             <section className="entity-page">
               <div className="entity-main">
-                <section className="card">
+                <section className="card settings-runtime-card">
                   <div className="card-head"><h3>Runtime Settings</h3></div>
-                  <div className="wizard-steps" style={{ marginBottom: '.75rem' }}>
+                  <div className="settings-tabbar">
                     <button className={settingsTab === 'general' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('general')}>General</button>
                     <button className={settingsTab === 'security' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('security')}>Security &amp; Time</button>
+                    <button className={settingsTab === 'threatintel' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('threatintel')}>Threat Intel</button>
                     <button className={settingsTab === 'idp' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('idp')}>Identity Providers</button>
                     <button className={settingsTab === 'mfa' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('mfa')}>MFA</button>
                     <button className={settingsTab === 'logservers' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('logservers')}>Logservers</button>
@@ -4657,6 +4935,7 @@ function App() {
                     <button className={settingsTab === 'appearance' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('appearance')}>Appearance</button>
                     <button className={settingsTab === 'advanced' ? 'wiz active' : 'wiz'} onClick={() => setSettingsTab('advanced')}>Advanced</button>
                   </div>
+                  <div className="settings-tab-content">
                   {settingsTab === 'general' ? (
                     <>
                       <div className="row">
@@ -4707,8 +4986,12 @@ function App() {
                           <div className="muted">Comma or newline separated list.</div>
                         </div>
                       ) : null}
+                    </>
+                  ) : null}
+                  {settingsTab === 'threatintel' ? (
+                    <>
                       <div className="card" style={{ marginBottom: '.6rem' }}>
-                        <div className="card-head"><h3>Threat Intel Tuning</h3></div>
+                        <div className="card-head"><h3>Threat Intel Policy</h3></div>
                         <div className="field-grid">
                           <div className="field">
                             <label>Threat Intel Enabled</label>
@@ -4765,128 +5048,174 @@ function App() {
                             <input type="number" min={1} max={1440} value={String(tiConfig.softBlockMinutes || 15)} onChange={(e) => setTiConfig((p) => ({ ...p, softBlockMinutes: Number(e.target.value) || 15 }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} />
                           </div>
                         </div>
-                        <div className="row" style={{ marginBottom: 0 }}>
-                          <button className="btn" onClick={syncThreatIntelNow} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Sync Now</button>
-                          <button className="btn" onClick={() => setTiFeedsOpen(true)} disabled={isReadOnlyRole || identity?.role !== 'admin'}>Manage Feeds</button>
-                          <button className="btn" onClick={saveThreatIntelConfig} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Save Threat Intel Policy</button>
-                        </div>
-                        {tiConfigSavedAt ? <div className="muted" style={{ marginTop: '.5rem' }}>Policy saved: {new Date(tiConfigSavedAt).toLocaleString()}</div> : null}
                       </div>
+                      <div className="card" style={{ marginBottom: '.6rem' }}>
+                        <div className="card-head"><h3>Pattern Signatures (Opt-In)</h3></div>
+                        <div className="field-grid">
+                          <div className="field">
+                            <label>Enable Signature Scanner</label>
+                            <label className="check"><input type="checkbox" checked={!!tiSigConfig.enabled} onChange={(e) => setTiSigConfig((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> Opt-in required (default off)</label>
+                          </div>
+                          <div className="field">
+                            <label>Auto Update Signatures</label>
+                            <label className="check"><input type="checkbox" checked={!!tiSigConfig.autoUpdate} onChange={(e) => setTiSigConfig((p) => ({ ...p, autoUpdate: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin' || !tiSigConfig.enabled} /> Pull updates from remote source</label>
+                          </div>
+                          <div className="field">
+                            <label>Signature Source URL</label>
+                            <input value={tiSigConfig.sourceUrl || ''} onChange={(e) => setTiSigConfig((p) => ({ ...p, sourceUrl: e.target.value }))} placeholder="https://raw.githubusercontent.com/.../threat-signatures.json" disabled={isReadOnlyRole || identity?.role !== 'admin'} />
+                          </div>
+                        </div>
+                        <div className="muted">
+                          Active rules: <strong>{tiSigConfig.ruleCount || 0}</strong>
+                          {tiSigConfig.lastSyncAt ? <> · Last sync: <strong>{new Date(tiSigConfig.lastSyncAt).toLocaleString()}</strong></> : null}
+                          {tiSigConfig.lastHash ? <> · Hash: <code>{(tiSigConfig.lastHash || '').slice(0, 16)}...</code></> : null}
+                        </div>
+                      </div>
+                      <div className="settings-actions settings-actions-tight">
+                        <button className="btn" onClick={saveThreatIntelAll} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Save Threat Intel</button>
+                        <button className="btn" onClick={syncThreatIntelNow} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Sync Now</button>
+                        <button className="btn" onClick={() => setTiFeedsOpen(true)} disabled={isReadOnlyRole || identity?.role !== 'admin'}>Manage Feeds</button>
+                      </div>
+                      {tiConfigSavedAt ? <div className="muted" style={{ marginTop: '.45rem' }}>Threat Intel saved: {new Date(tiConfigSavedAt).toLocaleString()}</div> : null}
                     </>
                   ) : null}
                   {settingsTab === 'idp' ? (
                     <>
                       <div className="card" style={{ marginBottom: '.6rem' }}>
-                        <div className="card-head"><h3>LDAP / Active Directory</h3></div>
-                        <div className="field-grid">
-                          <div className="field">
-                            <label>Enable LDAP</label>
-                            <label className="check"><input type="checkbox" checked={!!settingsLDAP.enabled} onChange={(e) => setSettingsLDAP((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> Enable external LDAP authentication</label>
-                          </div>
-                          <div className="field">
-                            <label>LDAP URL</label>
-                            <input value={settingsLDAP.url} onChange={(e) => setSettingsLDAP((p) => ({ ...p, url: e.target.value }))} placeholder="ldaps://mylab.intern:636" />
-                          </div>
-                          <div className="field">
-                            <label>User Attribute</label>
-                            <input value={settingsLDAP.userAttr || 'uid'} onChange={(e) => setSettingsLDAP((p) => ({ ...p, userAttr: e.target.value }))} placeholder="uid" />
-                          </div>
-                          <div className="field">
-                            <label>StartTLS (ldap:// only)</label>
-                            <label className="check"><input type="checkbox" checked={!!settingsLDAP.startTls} onChange={(e) => setSettingsLDAP((p) => ({ ...p, startTls: e.target.checked }))} /> Upgrade LDAP 389 via StartTLS</label>
-                          </div>
-                          <div className="field">
-                            <label>Insecure TLS Verify (test only)</label>
-                            <label className="check"><input type="checkbox" checked={!!settingsLDAP.insecureSkipVerify} onChange={(e) => setSettingsLDAP((p) => ({ ...p, insecureSkipVerify: e.target.checked }))} /> Accept self-signed/invalid certs</label>
-                          </div>
-                          <div className="field">
-                            <label>Bind DN</label>
-                            <input value={settingsLDAP.bindDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, bindDn: e.target.value }))} placeholder="cn=admin,dc=mylab,dc=intern" />
-                          </div>
-                          <div className="field">
-                            <label>Bind Password</label>
-                            <input type="password" value={settingsLDAPBindPassword} onChange={(e) => setSettingsLDAPBindPassword(e.target.value)} placeholder={settings?.hasLdapBindPassword ? 'Stored. Enter only to rotate' : 'LDAP bind password'} />
-                          </div>
-                          <div className="field">
-                            <label>User Base DN</label>
-                            <input value={settingsLDAP.userBaseDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, userBaseDn: e.target.value }))} placeholder="ou=people,dc=mylab,dc=intern" />
-                          </div>
-                          <div className="field">
-                            <label>Group Base DN</label>
-                            <input value={settingsLDAP.groupBaseDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, groupBaseDn: e.target.value }))} placeholder="ou=group,dc=mylab,dc=intern" />
-                          </div>
-                          <div className="field">
-                            <label>Admin Group</label>
-                            <input value={settingsLDAP.adminGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, adminGroup: e.target.value }))} placeholder="DomNexAdmin" />
-                          </div>
-                          <div className="field">
-                            <label>Domain Admin Group</label>
-                            <input value={settingsLDAP.domainAdminGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, domainAdminGroup: e.target.value }))} placeholder="DomNexSubAdmin" />
-                          </div>
-                          <div className="field">
-                            <label>Read-Only Group</label>
-                            <input value={settingsLDAP.readOnlyGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, readOnlyGroup: e.target.value }))} placeholder="DomNexReadOnly" />
-                          </div>
-                          <div className="field">
-                            <label>Domain IDs for Domain Admin (optional)</label>
-                            <input value={(settingsLDAP.domainAdminDomainIds || []).join(',')} onChange={(e) => setSettingsLDAP((p) => ({ ...p, domainAdminDomainIds: (e.target.value || '').split(',').map((x) => Number((x || '').trim())).filter((n) => Number.isFinite(n) && n > 0) }))} placeholder="1,2,3 (blank => all domains)" />
+                        <div className="card-head">
+                          <h3>LDAP / Active Directory</h3>
+                          <div className="row" style={{ marginBottom: 0 }}>
+                            <span className={`badge ${settingsLDAP.enabled ? 'ok' : 'warn'}`}>{settingsLDAP.enabled ? 'enabled' : 'disabled'}</span>
+                            <button className="btn ghost tiny-btn" onClick={() => setIdpLDAPExpanded((v) => !v)}>{idpLDAPExpanded ? 'Collapse' : 'Expand'}</button>
                           </div>
                         </div>
-                        <div className="muted">LDAP users are provisioned as external users in DomNex on first successful login. Local break-glass admin remains available.</div>
+                        {idpLDAPExpanded ? (
+                          <>
+                            <div className="field-grid">
+                              <div className="field">
+                                <label>Enable LDAP</label>
+                                <label className="check"><input type="checkbox" checked={!!settingsLDAP.enabled} onChange={(e) => { const checked = e.target.checked; setSettingsLDAP((p) => ({ ...p, enabled: checked })); if (checked) setIdpLDAPExpanded(true); }} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> Enable external LDAP authentication</label>
+                              </div>
+                              <div className="field">
+                                <label>LDAP URL</label>
+                                <input value={settingsLDAP.url} onChange={(e) => setSettingsLDAP((p) => ({ ...p, url: e.target.value }))} placeholder="ldaps://mylab.intern:636" />
+                              </div>
+                              <div className="field">
+                                <label>User Attribute</label>
+                                <input value={settingsLDAP.userAttr || 'uid'} onChange={(e) => setSettingsLDAP((p) => ({ ...p, userAttr: e.target.value }))} placeholder="uid" />
+                              </div>
+                              <div className="field">
+                                <label>StartTLS (ldap:// only)</label>
+                                <label className="check"><input type="checkbox" checked={!!settingsLDAP.startTls} onChange={(e) => setSettingsLDAP((p) => ({ ...p, startTls: e.target.checked }))} /> Upgrade LDAP 389 via StartTLS</label>
+                              </div>
+                              <div className="field">
+                                <label>Insecure TLS Verify (test only)</label>
+                                <label className="check"><input type="checkbox" checked={!!settingsLDAP.insecureSkipVerify} onChange={(e) => setSettingsLDAP((p) => ({ ...p, insecureSkipVerify: e.target.checked }))} /> Accept self-signed/invalid certs</label>
+                              </div>
+                              <div className="field">
+                                <label>Bind DN</label>
+                                <input value={settingsLDAP.bindDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, bindDn: e.target.value }))} placeholder="cn=admin,dc=mylab,dc=intern" />
+                              </div>
+                              <div className="field">
+                                <label>Bind Password</label>
+                                <input type="password" value={settingsLDAPBindPassword} onChange={(e) => setSettingsLDAPBindPassword(e.target.value)} placeholder={settings?.hasLdapBindPassword ? 'Stored. Enter only to rotate' : 'LDAP bind password'} />
+                              </div>
+                              <div className="field">
+                                <label>User Base DN</label>
+                                <input value={settingsLDAP.userBaseDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, userBaseDn: e.target.value }))} placeholder="ou=people,dc=mylab,dc=intern" />
+                              </div>
+                              <div className="field">
+                                <label>Group Base DN</label>
+                                <input value={settingsLDAP.groupBaseDn} onChange={(e) => setSettingsLDAP((p) => ({ ...p, groupBaseDn: e.target.value }))} placeholder="ou=group,dc=mylab,dc=intern" />
+                              </div>
+                              <div className="field">
+                                <label>Admin Group</label>
+                                <input value={settingsLDAP.adminGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, adminGroup: e.target.value }))} placeholder="DomNexAdmin" />
+                              </div>
+                              <div className="field">
+                                <label>Domain Admin Group</label>
+                                <input value={settingsLDAP.domainAdminGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, domainAdminGroup: e.target.value }))} placeholder="DomNexSubAdmin" />
+                              </div>
+                              <div className="field">
+                                <label>Read-Only Group</label>
+                                <input value={settingsLDAP.readOnlyGroup} onChange={(e) => setSettingsLDAP((p) => ({ ...p, readOnlyGroup: e.target.value }))} placeholder="DomNexReadOnly" />
+                              </div>
+                              <div className="field">
+                                <label>Domain IDs for Domain Admin (optional)</label>
+                                <input value={(settingsLDAP.domainAdminDomainIds || []).join(',')} onChange={(e) => setSettingsLDAP((p) => ({ ...p, domainAdminDomainIds: (e.target.value || '').split(',').map((x) => Number((x || '').trim())).filter((n) => Number.isFinite(n) && n > 0) }))} placeholder="1,2,3 (blank => all domains)" />
+                              </div>
+                            </div>
+                            <div className="muted">LDAP users are provisioned as external users in DomNex on first successful login. Local break-glass admin remains available.</div>
+                          </>
+                        ) : (
+                          <div className="muted">Collapsed. Expand to review or edit LDAP mapping and connection details.</div>
+                        )}
                       </div>
                       <div className="card" style={{ marginBottom: '.6rem' }}>
-                        <div className="card-head"><h3>OIDC / OAuth2</h3></div>
-                        <div className="field-grid">
-                          <div className="field">
-                            <label>Enable OIDC</label>
-                            <label className="check"><input type="checkbox" checked={!!settingsOIDC.enabled} onChange={(e) => setSettingsOIDC((p) => ({ ...p, enabled: e.target.checked }))} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> Enable external OIDC authentication</label>
-                          </div>
-                          <div className="field">
-                            <label>Issuer URL</label>
-                            <input value={settingsOIDC.issuerUrl} onChange={(e) => setSettingsOIDC((p) => ({ ...p, issuerUrl: e.target.value }))} placeholder="https://idp.example.com/realms/main" />
-                          </div>
-                          <div className="field">
-                            <label>Client ID</label>
-                            <input value={settingsOIDC.clientId} onChange={(e) => setSettingsOIDC((p) => ({ ...p, clientId: e.target.value }))} placeholder="domnexdomain" />
-                          </div>
-                          <div className="field">
-                            <label>Client Secret</label>
-                            <input type="password" value={settingsOIDCClientSecret} onChange={(e) => setSettingsOIDCClientSecret(e.target.value)} placeholder={settings?.hasOidcClientSecret ? 'Stored. Enter only to rotate' : 'OIDC client secret'} />
-                          </div>
-                          <div className="field">
-                            <label>Redirect URL</label>
-                            <input value={settingsOIDC.redirectUrl} onChange={(e) => setSettingsOIDC((p) => ({ ...p, redirectUrl: e.target.value }))} placeholder="https://admin.example.com/api/v1/login/oidc/callback" />
-                          </div>
-                          <div className="field">
-                            <label>Scopes (space/comma separated)</label>
-                            <input value={settingsOIDC.scopes} onChange={(e) => setSettingsOIDC((p) => ({ ...p, scopes: e.target.value }))} placeholder="openid profile email groups" />
-                          </div>
-                          <div className="field">
-                            <label>Username Claim</label>
-                            <input value={settingsOIDC.usernameClaim} onChange={(e) => setSettingsOIDC((p) => ({ ...p, usernameClaim: e.target.value }))} placeholder="preferred_username" />
-                          </div>
-                          <div className="field">
-                            <label>Groups Claim</label>
-                            <input value={settingsOIDC.groupsClaim} onChange={(e) => setSettingsOIDC((p) => ({ ...p, groupsClaim: e.target.value }))} placeholder="groups" />
-                          </div>
-                          <div className="field">
-                            <label>Admin Group</label>
-                            <input value={settingsOIDC.adminGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, adminGroup: e.target.value }))} placeholder="DomNexAdmin" />
-                          </div>
-                          <div className="field">
-                            <label>Domain Admin Group</label>
-                            <input value={settingsOIDC.domainAdminGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, domainAdminGroup: e.target.value }))} placeholder="DomNexSubAdmin" />
-                          </div>
-                          <div className="field">
-                            <label>Read-Only Group</label>
-                            <input value={settingsOIDC.readOnlyGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, readOnlyGroup: e.target.value }))} placeholder="DomNexReadOnly" />
-                          </div>
-                          <div className="field">
-                            <label>Domain IDs for Domain Admin (optional)</label>
-                            <input value={(settingsOIDC.domainAdminDomainIds || []).join(',')} onChange={(e) => setSettingsOIDC((p) => ({ ...p, domainAdminDomainIds: (e.target.value || '').split(',').map((x) => Number((x || '').trim())).filter((n) => Number.isFinite(n) && n > 0) }))} placeholder="1,2,3 (blank => all domains)" />
+                        <div className="card-head">
+                          <h3>OIDC / OAuth2</h3>
+                          <div className="row" style={{ marginBottom: 0 }}>
+                            <span className={`badge ${settingsOIDC.enabled ? 'ok' : 'warn'}`}>{settingsOIDC.enabled ? 'enabled' : 'disabled'}</span>
+                            <button className="btn ghost tiny-btn" onClick={() => setIdpOIDCExpanded((v) => !v)}>{idpOIDCExpanded ? 'Collapse' : 'Expand'}</button>
                           </div>
                         </div>
-                        <div className="muted">OIDC login creates/updates external users and maps roles by configured IdP groups.</div>
+                        {idpOIDCExpanded ? (
+                          <>
+                            <div className="field-grid">
+                              <div className="field">
+                                <label>Enable OIDC</label>
+                                <label className="check"><input type="checkbox" checked={!!settingsOIDC.enabled} onChange={(e) => { const checked = e.target.checked; setSettingsOIDC((p) => ({ ...p, enabled: checked })); if (checked) setIdpOIDCExpanded(true); }} disabled={isReadOnlyRole || identity?.role !== 'admin'} /> Enable external OIDC authentication</label>
+                              </div>
+                              <div className="field">
+                                <label>Issuer URL</label>
+                                <input value={settingsOIDC.issuerUrl} onChange={(e) => setSettingsOIDC((p) => ({ ...p, issuerUrl: e.target.value }))} placeholder="https://idp.example.com/realms/main" />
+                              </div>
+                              <div className="field">
+                                <label>Client ID</label>
+                                <input value={settingsOIDC.clientId} onChange={(e) => setSettingsOIDC((p) => ({ ...p, clientId: e.target.value }))} placeholder="domnexdomain" />
+                              </div>
+                              <div className="field">
+                                <label>Client Secret</label>
+                                <input type="password" value={settingsOIDCClientSecret} onChange={(e) => setSettingsOIDCClientSecret(e.target.value)} placeholder={settings?.hasOidcClientSecret ? 'Stored. Enter only to rotate' : 'OIDC client secret'} />
+                              </div>
+                              <div className="field">
+                                <label>Redirect URL</label>
+                                <input value={settingsOIDC.redirectUrl} onChange={(e) => setSettingsOIDC((p) => ({ ...p, redirectUrl: e.target.value }))} placeholder="https://admin.example.com/api/v1/login/oidc/callback" />
+                              </div>
+                              <div className="field">
+                                <label>Scopes (space/comma separated)</label>
+                                <input value={settingsOIDC.scopes} onChange={(e) => setSettingsOIDC((p) => ({ ...p, scopes: e.target.value }))} placeholder="openid profile email groups" />
+                              </div>
+                              <div className="field">
+                                <label>Username Claim</label>
+                                <input value={settingsOIDC.usernameClaim} onChange={(e) => setSettingsOIDC((p) => ({ ...p, usernameClaim: e.target.value }))} placeholder="preferred_username" />
+                              </div>
+                              <div className="field">
+                                <label>Groups Claim</label>
+                                <input value={settingsOIDC.groupsClaim} onChange={(e) => setSettingsOIDC((p) => ({ ...p, groupsClaim: e.target.value }))} placeholder="groups" />
+                              </div>
+                              <div className="field">
+                                <label>Admin Group</label>
+                                <input value={settingsOIDC.adminGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, adminGroup: e.target.value }))} placeholder="DomNexAdmin" />
+                              </div>
+                              <div className="field">
+                                <label>Domain Admin Group</label>
+                                <input value={settingsOIDC.domainAdminGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, domainAdminGroup: e.target.value }))} placeholder="DomNexSubAdmin" />
+                              </div>
+                              <div className="field">
+                                <label>Read-Only Group</label>
+                                <input value={settingsOIDC.readOnlyGroup} onChange={(e) => setSettingsOIDC((p) => ({ ...p, readOnlyGroup: e.target.value }))} placeholder="DomNexReadOnly" />
+                              </div>
+                              <div className="field">
+                                <label>Domain IDs for Domain Admin (optional)</label>
+                                <input value={(settingsOIDC.domainAdminDomainIds || []).join(',')} onChange={(e) => setSettingsOIDC((p) => ({ ...p, domainAdminDomainIds: (e.target.value || '').split(',').map((x) => Number((x || '').trim())).filter((n) => Number.isFinite(n) && n > 0) }))} placeholder="1,2,3 (blank => all domains)" />
+                              </div>
+                            </div>
+                            <div className="muted">OIDC login creates/updates external users and maps roles by configured IdP groups.</div>
+                          </>
+                        ) : (
+                          <div className="muted">Collapsed. Expand to review or edit OIDC issuer, claims and role mappings.</div>
+                        )}
                       </div>
                     </>
                   ) : null}
@@ -4959,96 +5288,126 @@ function App() {
                   {settingsTab === 'logservers' ? (
                     <>
                       <div className="card" style={{ marginBottom: '.6rem' }}>
-                        <div className="card-head"><h3>Syslog Delivery</h3></div>
-                        <div className="field-grid">
-                          <div className="field">
-                            <label>Enabled</label>
-                            <label className="check"><input type="checkbox" checked={!!settingsLogServers.syslog.enabled} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, enabled: e.target.checked } }))} /> Forward to Syslog</label>
-                          </div>
-                          <div className="field">
-                            <label>Protocol</label>
-                            <select value={settingsLogServers.syslog.protocol} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, protocol: e.target.value as 'udp' | 'tcp' } }))}>
-                              <option value="udp">UDP</option>
-                              <option value="tcp">TCP</option>
-                            </select>
-                          </div>
-                          <div className="field">
-                            <label>Address (host:port)</label>
-                            <input value={settingsLogServers.syslog.address} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, address: e.target.value } }))} placeholder="192.168.1.224:514" />
-                          </div>
-                          <div className="field">
-                            <label>Minimum Level</label>
-                            <select value={settingsLogServers.syslog.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
-                              <option value="info">info</option>
-                              <option value="warn">warn</option>
-                              <option value="error">error</option>
-                            </select>
-                          </div>
-                          <div className="field">
-                            <label>App Name</label>
-                            <input value={settingsLogServers.syslog.appName} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, appName: e.target.value } }))} placeholder="DomNexDomain" />
+                        <div className="card-head">
+                          <h3>Syslog Delivery</h3>
+                          <div className="row" style={{ marginBottom: 0 }}>
+                            <span className={`badge ${settingsLogServers.syslog.enabled ? 'ok' : 'warn'}`}>{settingsLogServers.syslog.enabled ? 'enabled' : 'disabled'}</span>
+                            <button className="btn ghost tiny-btn" onClick={() => setLogSyslogExpanded((v) => !v)}>{logSyslogExpanded ? 'Collapse' : 'Expand'}</button>
                           </div>
                         </div>
+                        {logSyslogExpanded ? (
+                          <div className="field-grid">
+                            <div className="field">
+                              <label>Enabled</label>
+                              <label className="check"><input type="checkbox" checked={!!settingsLogServers.syslog.enabled} onChange={(e) => { const checked = e.target.checked; setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, enabled: checked } })); if (checked) setLogSyslogExpanded(true); }} /> Forward to Syslog</label>
+                            </div>
+                            <div className="field">
+                              <label>Protocol</label>
+                              <select value={settingsLogServers.syslog.protocol} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, protocol: e.target.value as 'udp' | 'tcp' } }))}>
+                                <option value="udp">UDP</option>
+                                <option value="tcp">TCP</option>
+                              </select>
+                            </div>
+                            <div className="field">
+                              <label>Address (host:port)</label>
+                              <input value={settingsLogServers.syslog.address} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, address: e.target.value } }))} placeholder="192.168.1.224:514" />
+                            </div>
+                            <div className="field">
+                              <label>Minimum Level</label>
+                              <select value={settingsLogServers.syslog.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
+                                <option value="info">info</option>
+                                <option value="warn">warn</option>
+                                <option value="error">error</option>
+                              </select>
+                            </div>
+                            <div className="field">
+                              <label>App Name</label>
+                              <input value={settingsLogServers.syslog.appName} onChange={(e) => setSettingsLogServers((p) => ({ ...p, syslog: { ...p.syslog, appName: e.target.value } }))} placeholder="DomNexDomain" />
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="muted">Collapsed. Expand to configure Syslog forwarding.</div>
+                        )}
                       </div>
 
                       <div className="card" style={{ marginBottom: '.6rem' }}>
-                        <div className="card-head"><h3>HTTP JSON Delivery</h3></div>
-                        <div className="field-grid">
-                          <div className="field">
-                            <label>Enabled</label>
-                            <label className="check"><input type="checkbox" checked={!!settingsLogServers.http.enabled} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, enabled: e.target.checked } }))} /> Forward via HTTP POST</label>
-                          </div>
-                          <div className="field">
-                            <label>Endpoint URL</label>
-                            <input value={settingsLogServers.http.url} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, url: e.target.value } }))} placeholder="https://siem.local/ingest/domnex" />
-                          </div>
-                          <div className="field">
-                            <label>Timeout (seconds)</label>
-                            <input type="number" min={1} max={30} value={String(settingsLogServers.http.timeoutSec || 4)} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, timeoutSec: Number(e.target.value) || 4 } }))} />
-                          </div>
-                          <div className="field">
-                            <label>Minimum Level</label>
-                            <select value={settingsLogServers.http.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
-                              <option value="info">info</option>
-                              <option value="warn">warn</option>
-                              <option value="error">error</option>
-                            </select>
-                          </div>
-                          <div className="field">
-                            <label>TLS Verify</label>
-                            <label className="check"><input type="checkbox" checked={!settingsLogServers.http.insecure} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, insecure: !e.target.checked } }))} /> Verify remote TLS certificate</label>
-                          </div>
-                          <div className="field">
-                            <label>Bearer Token (optional)</label>
-                            <input value={settingsLogHTTPBearer} onChange={(e) => setSettingsLogHTTPBearer(e.target.value)} placeholder={settings?.hasLogHTTPBearer ? 'Stored. Enter only to rotate token' : 'Bearer token'} />
+                        <div className="card-head">
+                          <h3>HTTP JSON Delivery</h3>
+                          <div className="row" style={{ marginBottom: 0 }}>
+                            <span className={`badge ${settingsLogServers.http.enabled ? 'ok' : 'warn'}`}>{settingsLogServers.http.enabled ? 'enabled' : 'disabled'}</span>
+                            <button className="btn ghost tiny-btn" onClick={() => setLogHTTPExpanded((v) => !v)}>{logHTTPExpanded ? 'Collapse' : 'Expand'}</button>
                           </div>
                         </div>
+                        {logHTTPExpanded ? (
+                          <div className="field-grid">
+                            <div className="field">
+                              <label>Enabled</label>
+                              <label className="check"><input type="checkbox" checked={!!settingsLogServers.http.enabled} onChange={(e) => { const checked = e.target.checked; setSettingsLogServers((p) => ({ ...p, http: { ...p.http, enabled: checked } })); if (checked) setLogHTTPExpanded(true); }} /> Forward via HTTP POST</label>
+                            </div>
+                            <div className="field">
+                              <label>Endpoint URL</label>
+                              <input value={settingsLogServers.http.url} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, url: e.target.value } }))} placeholder="https://siem.local/ingest/domnex" />
+                            </div>
+                            <div className="field">
+                              <label>Timeout (seconds)</label>
+                              <input type="number" min={1} max={30} value={String(settingsLogServers.http.timeoutSec || 4)} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, timeoutSec: Number(e.target.value) || 4 } }))} />
+                            </div>
+                            <div className="field">
+                              <label>Minimum Level</label>
+                              <select value={settingsLogServers.http.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
+                                <option value="info">info</option>
+                                <option value="warn">warn</option>
+                                <option value="error">error</option>
+                              </select>
+                            </div>
+                            <div className="field">
+                              <label>TLS Verify</label>
+                              <label className="check"><input type="checkbox" checked={!settingsLogServers.http.insecure} onChange={(e) => setSettingsLogServers((p) => ({ ...p, http: { ...p.http, insecure: !e.target.checked } }))} /> Verify remote TLS certificate</label>
+                            </div>
+                            <div className="field">
+                              <label>Bearer Token (optional)</label>
+                              <input value={settingsLogHTTPBearer} onChange={(e) => setSettingsLogHTTPBearer(e.target.value)} placeholder={settings?.hasLogHTTPBearer ? 'Stored. Enter only to rotate token' : 'Bearer token'} />
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="muted">Collapsed. Expand to configure HTTP JSON forwarding.</div>
+                        )}
                       </div>
 
                       <div className="card" style={{ marginBottom: '.6rem' }}>
-                        <div className="card-head"><h3>TCP JSON Delivery</h3></div>
-                        <div className="field-grid">
-                          <div className="field">
-                            <label>Enabled</label>
-                            <label className="check"><input type="checkbox" checked={!!settingsLogServers.tcpJson.enabled} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, enabled: e.target.checked } }))} /> Forward NDJSON over TCP</label>
-                          </div>
-                          <div className="field">
-                            <label>Address (host:port)</label>
-                            <input value={settingsLogServers.tcpJson.address} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, address: e.target.value } }))} placeholder="192.168.1.224:5514" />
-                          </div>
-                          <div className="field">
-                            <label>Timeout (seconds)</label>
-                            <input type="number" min={1} max={30} value={String(settingsLogServers.tcpJson.timeoutSec || 3)} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, timeoutSec: Number(e.target.value) || 3 } }))} />
-                          </div>
-                          <div className="field">
-                            <label>Minimum Level</label>
-                            <select value={settingsLogServers.tcpJson.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
-                              <option value="info">info</option>
-                              <option value="warn">warn</option>
-                              <option value="error">error</option>
-                            </select>
+                        <div className="card-head">
+                          <h3>TCP JSON Delivery</h3>
+                          <div className="row" style={{ marginBottom: 0 }}>
+                            <span className={`badge ${settingsLogServers.tcpJson.enabled ? 'ok' : 'warn'}`}>{settingsLogServers.tcpJson.enabled ? 'enabled' : 'disabled'}</span>
+                            <button className="btn ghost tiny-btn" onClick={() => setLogTCPExpanded((v) => !v)}>{logTCPExpanded ? 'Collapse' : 'Expand'}</button>
                           </div>
                         </div>
+                        {logTCPExpanded ? (
+                          <div className="field-grid">
+                            <div className="field">
+                              <label>Enabled</label>
+                              <label className="check"><input type="checkbox" checked={!!settingsLogServers.tcpJson.enabled} onChange={(e) => { const checked = e.target.checked; setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, enabled: checked } })); if (checked) setLogTCPExpanded(true); }} /> Forward NDJSON over TCP</label>
+                            </div>
+                            <div className="field">
+                              <label>Address (host:port)</label>
+                              <input value={settingsLogServers.tcpJson.address} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, address: e.target.value } }))} placeholder="192.168.1.224:5514" />
+                            </div>
+                            <div className="field">
+                              <label>Timeout (seconds)</label>
+                              <input type="number" min={1} max={30} value={String(settingsLogServers.tcpJson.timeoutSec || 3)} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, timeoutSec: Number(e.target.value) || 3 } }))} />
+                            </div>
+                            <div className="field">
+                              <label>Minimum Level</label>
+                              <select value={settingsLogServers.tcpJson.minLevel} onChange={(e) => setSettingsLogServers((p) => ({ ...p, tcpJson: { ...p.tcpJson, minLevel: e.target.value as 'info' | 'warn' | 'error' } }))}>
+                                <option value="info">info</option>
+                                <option value="warn">warn</option>
+                                <option value="error">error</option>
+                              </select>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="muted">Collapsed. Expand to configure TCP JSON forwarding.</div>
+                        )}
                       </div>
                     </>
                   ) : null}
@@ -5165,11 +5524,14 @@ function App() {
                       </div>
                     </>
                   ) : null}
-                  <div className="row">
-                    <button className="btn" onClick={saveSettings} disabled={loading || isReadOnlyRole}>Save Settings</button>
-                    <button className="btn" onClick={reloadService} disabled={loading || isReadOnlyRole}>Reload Service</button>
-                    <button className="btn" onClick={loadTimeSyncStatus} disabled={loading}>Check Time Sync</button>
                   </div>
+                  {settingsTab !== 'threatintel' ? (
+                    <div className="settings-actions">
+                      <button className="btn" onClick={saveSettings} disabled={loading || isReadOnlyRole}>Save Settings</button>
+                      <button className="btn" onClick={reloadService} disabled={loading || isReadOnlyRole}>Reload Service</button>
+                      {settingsTab === 'security' ? <button className="btn" onClick={loadTimeSyncStatus} disabled={loading}>Check Time Sync</button> : null}
+                    </div>
+                  ) : null}
                   {settingsMessage ? <div className="muted">{settingsMessage}</div> : null}
                 </section>
               </div>
@@ -5409,103 +5771,203 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
             <section className="entity-page users-page">
               <div className="entity-main">
                 <section className="card">
-                  <div className="card-head"><h3>User Operations</h3></div>
-                  <div className="log-filter-grid user-ops-filters">
-                    <select value={usersRoleFilter} onChange={(e) => setUsersRoleFilter(e.target.value as 'all' | 'admin' | 'domain-admin' | 'read-only')}>
-                      <option value="all">All roles</option>
-                      <option value="admin">Global Admin</option>
-                      <option value="domain-admin">Domain Admin</option>
-                      <option value="read-only">Read Only</option>
-                    </select>
-                    <select value={usersProviderFilter} onChange={(e) => setUsersProviderFilter(e.target.value as 'all' | 'local' | 'ldap' | 'oidc')}>
-                      <option value="all">All providers</option>
-                      <option value="local">Local</option>
-                      <option value="ldap">LDAP</option>
-                      <option value="oidc">OIDC</option>
-                    </select>
-                    <input value={usersQuery} onChange={(e) => setUsersQuery(e.target.value)} placeholder="Search username, role, provider, id..." />
-                    <div className="row" style={{ marginBottom: 0 }}>
-                      <button className="btn" onClick={() => {
-                        setNewUserName('');
-                        setNewUserPassword('');
-                        setNewUserRole('domain-admin');
-                        setNewUserDomainIDs([]);
-                        setNewUserAllowedCIDRs('');
-                        setNewUserIPCheckDisabled(false);
-                        setShowCreateUserDialog(true);
-                      }} disabled={loading || isReadOnlyRole}>Create User</button>
-                      <button className="btn ghost" onClick={refresh} disabled={loading}>Refresh</button>
-                    </div>
+                  <div className="card-head"><h3>Identity Management</h3></div>
+                  <div className="wizard-nav" style={{ marginBottom: '.8rem' }}>
+                    <button className={identityTab === 'users' ? 'wiz active' : 'wiz'} onClick={() => setIdentityTab('users')}>Users</button>
+                    <button className={identityTab === 'groups' ? 'wiz active' : 'wiz'} onClick={() => setIdentityTab('groups')}>Groups</button>
+                    <button className={identityTab === 'matrix' ? 'wiz active' : 'wiz'} onClick={() => setIdentityTab('matrix')}>Permission Matrix</button>
                   </div>
-                  <div className="muted" style={{ marginBottom: '.6rem' }}>
-                    Showing {filteredUsers.length} of {users.length} users.
-                  </div>
-                  <div className="log-table-wrap" style={{ maxHeight: '62vh' }}>
-                    <table className="log-table user-table-compact">
-                      <thead>
-                        <tr>
-                          <th>User</th>
-                          <th>Role</th>
-                          <th>Domain Scope</th>
-                          <th>IP Policy</th>
-                          <th>Updated</th>
-                          <th>Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {filteredUsers.length === 0 ? (
+
+                  {identityTab === 'users' ? (
+                    <>
+                      <div className="log-filter-grid user-ops-filters">
+                        <select value={usersRoleFilter} onChange={(e) => setUsersRoleFilter(e.target.value as 'all' | 'admin' | 'domain-admin' | 'read-only')}>
+                          <option value="all">All roles</option>
+                          <option value="admin">Global Admin</option>
+                          <option value="domain-admin">Domain Admin</option>
+                          <option value="read-only">Read Only</option>
+                        </select>
+                        <select value={usersProviderFilter} onChange={(e) => setUsersProviderFilter(e.target.value as 'all' | 'local' | 'ldap' | 'oidc')}>
+                          <option value="all">All providers</option>
+                          <option value="local">Local</option>
+                          <option value="ldap">LDAP</option>
+                          <option value="oidc">OIDC</option>
+                        </select>
+                        <input value={usersQuery} onChange={(e) => setUsersQuery(e.target.value)} placeholder="Search username, role, provider, id..." />
+                        <div className="row" style={{ marginBottom: 0 }}>
+                          <button className="btn" onClick={() => {
+                            setNewUserName('');
+                            setNewUserPassword('');
+                            setNewUserRole('domain-admin');
+                            setNewUserDomainIDs([]);
+                            setNewUserGroupIDs([]);
+                            setNewUserAllowedCIDRs('');
+                            setNewUserIPCheckDisabled(false);
+                            setShowCreateUserDialog(true);
+                          }} disabled={loading || isReadOnlyRole}>Create User</button>
+                          <button className="btn ghost" onClick={refresh} disabled={loading}>Refresh</button>
+                        </div>
+                      </div>
+                      <div className="muted" style={{ marginBottom: '.6rem' }}>
+                        Showing {filteredUsers.length} of {users.length} users.
+                      </div>
+                      <div className="log-table-wrap" style={{ maxHeight: '62vh' }}>
+                        <table className="log-table user-table-compact">
+                          <thead>
+                            <tr>
+                              <th>User</th>
+                              <th>Role</th>
+                              <th>Groups</th>
+                              <th>Domain Scope</th>
+                              <th>IP Policy</th>
+                              <th>Updated</th>
+                              <th>Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filteredUsers.length === 0 ? (
+                              <tr>
+                                <td colSpan={7} className="muted" style={{ padding: '.9rem' }}>No users match the current filter.</td>
+                              </tr>
+                            ) : filteredUsers.map((u) => {
+                              const scopeNames = domains
+                                .filter((d) => (u.domainIds || []).includes(d.id))
+                                .map((d) => d.name);
+                              const isCurrentUser = identity?.type === 'session' && u.id === identity.userId;
+                              const membership = [...(u.groupMemberships || [])].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+                              return (
+                                <tr key={u.id}>
+                                  <td>
+                                    <div><strong>{u.username}</strong></div>
+                                    <div className="diag" style={{ marginTop: '.2rem' }}>
+                                      <span className={`badge ${(String(u.authProvider || 'local').toLowerCase() === 'local') ? 'ok' : 'warn'}`}>{(() => {
+                                        const p = String(u.authProvider || 'local').toLowerCase();
+                                        if (p === 'ldap') return 'LDAP';
+                                        if (p === 'oidc') return 'OIDC';
+                                        return 'Local';
+                                      })()}</span>
+                                      <span className="muted">ID {u.id}</span>
+                                    </div>
+                                  </td>
+                                  <td><span className="badge warn">{u.role}</span></td>
+                                  <td>
+                                    {membership.length === 0
+                                      ? <span className="muted">none</span>
+                                      : membership.map((m) => <span key={`ug-${u.id}-${m.groupId}`} className="badge" style={{ marginRight: '.25rem', marginBottom: '.2rem' }}>{m.priority}. {m.groupName || `Group ${m.groupId}`}</span>)}
+                                  </td>
+                                  <td>
+                                    {u.role === 'domain-admin'
+                                      ? (scopeNames.length > 0 ? scopeNames.join(', ') : 'none')
+                                      : 'global'}
+                                  </td>
+                                  <td>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '.25rem' }}>
+                                      {u.ipCheckDisabled ? (
+                                        <span className="badge warn">IP check disabled</span>
+                                      ) : (
+                                        <span className="muted">{(u.allowedCidrs || '').trim() || 'default CIDR policy'}</span>
+                                      )}
+                                      <span className={`badge ${u.mfaEnabled ? 'ok' : 'warn'}`}>{u.mfaEnabled ? 'MFA enabled' : 'MFA disabled'}</span>
+                                    </div>
+                                  </td>
+                                  <td>{formatDateTime(u.updatedAt)}</td>
+                                  <td>
+                                    <div className="row" style={{ marginBottom: 0 }}>
+                                      <button className="btn ghost" onClick={() => openEditUserDialog(u)} disabled={loading || isCurrentUser || isReadOnlyRole}>Edit</button>
+                                      <button className="btn ghost" onClick={() => adminResetUserMFA(u.id)} disabled={loading || isCurrentUser || isReadOnlyRole || !u.mfaEnabled}>Reset MFA</button>
+                                      <button className="btn danger" onClick={() => deleteUser(u.id)} disabled={loading || isCurrentUser || isReadOnlyRole}>Delete</button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  ) : null}
+
+                  {identityTab === 'groups' ? (
+                    <>
+                      <div className="row" style={{ marginBottom: '.6rem' }}>
+                        <button className="btn" onClick={openCreateGroupDialog} disabled={loading || isReadOnlyRole}>Create Group</button>
+                        <button className="btn ghost" onClick={refresh} disabled={loading}>Refresh</button>
+                      </div>
+                      <div className="log-table-wrap" style={{ maxHeight: '62vh' }}>
+                        <table className="log-table user-table-compact">
+                          <thead>
+                            <tr>
+                              <th>Group</th>
+                              <th>Template</th>
+                              <th>Permissions</th>
+                              <th>Members</th>
+                              <th>Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {identityGroups.length === 0 ? (
+                              <tr><td colSpan={5} className="muted" style={{ padding: '.9rem' }}>No groups found.</td></tr>
+                            ) : identityGroups.map((g) => (
+                              <tr key={g.group.id}>
+                                <td>
+                                  <div><strong>{g.group.name}</strong></div>
+                                  <div className="muted">{g.group.description || '-'}</div>
+                                </td>
+                                <td>
+                                  {g.group.system ? <span className="badge ok">Template</span> : <span className="badge">{g.group.template || 'custom'}</span>}
+                                </td>
+                                <td>{g.permissions.length}</td>
+                                <td>{g.userCount}</td>
+                                <td>
+                                  <div className="row" style={{ marginBottom: 0 }}>
+                                    <button className="btn ghost" onClick={() => openEditGroupDialog(g)} disabled={loading || isReadOnlyRole || g.group.system}>Edit</button>
+                                    <button className="btn danger" onClick={() => deleteIdentityGroup(g.group.id)} disabled={loading || isReadOnlyRole || g.group.system}>Delete</button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  ) : null}
+
+                  {identityTab === 'matrix' ? (
+                    <div className="log-table-wrap" style={{ maxHeight: '62vh' }}>
+                      <table className="log-table user-table-compact">
+                        <thead>
                           <tr>
-                            <td colSpan={6} className="muted" style={{ padding: '.9rem' }}>No users match the current filter.</td>
+                            <th>Permission</th>
+                            <th>Category</th>
+                            <th>Critical</th>
+                            <th>Groups</th>
+                            <th>Users</th>
+                            <th>Assigned To</th>
                           </tr>
-                        ) : filteredUsers.map((u) => {
-                          const scopeNames = domains
-                            .filter((d) => (u.domainIds || []).includes(d.id))
-                            .map((d) => d.name);
-                          const isCurrentUser = identity?.type === 'session' && u.id === identity.userId;
-                          return (
-                            <tr key={u.id}>
+                        </thead>
+                        <tbody>
+                          {identityMatrix.length === 0 ? (
+                            <tr><td colSpan={6} className="muted" style={{ padding: '.9rem' }}>No permission matrix data available.</td></tr>
+                          ) : identityMatrix.map((r) => (
+                            <tr key={r.permission}>
                               <td>
-                                <div><strong>{u.username}</strong></div>
-                                <div className="diag" style={{ marginTop: '.2rem' }}>
-                                  <span className={`badge ${(String(u.authProvider || 'local').toLowerCase() === 'local') ? 'ok' : 'warn'}`}>{(() => {
-                                    const p = String(u.authProvider || 'local').toLowerCase();
-                                    if (p === 'ldap') return 'LDAP';
-                                    if (p === 'oidc') return 'OIDC';
-                                    return 'Local';
-                                  })()}</span>
-                                  <span className="muted">ID {u.id}</span>
-                                </div>
+                                <div><strong>{r.label || r.permission}</strong></div>
+                                <div className="muted">{r.permission}</div>
                               </td>
-                              <td><span className="badge warn">{u.role}</span></td>
+                              <td>{r.category}</td>
+                              <td>{r.critical ? <span className="badge danger">high</span> : <span className="badge ok">normal</span>}</td>
+                              <td>{r.groupCount}</td>
+                              <td>{r.userCount}</td>
                               <td>
-                                {u.role === 'domain-admin'
-                                  ? (scopeNames.length > 0 ? scopeNames.join(', ') : 'none')
-                                  : 'global'}
-                              </td>
-                              <td>
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '.25rem' }}>
-                                  {u.ipCheckDisabled ? (
-                                    <span className="badge warn">IP check disabled</span>
-                                  ) : (
-                                    <span className="muted">{(u.allowedCidrs || '').trim() || 'default CIDR policy'}</span>
-                                  )}
-                                  <span className={`badge ${u.mfaEnabled ? 'ok' : 'warn'}`}>{u.mfaEnabled ? 'MFA enabled' : 'MFA disabled'}</span>
-                                </div>
-                              </td>
-                              <td>{formatDateTime(u.updatedAt)}</td>
-                              <td>
-                                <div className="row" style={{ marginBottom: 0 }}>
-                                  <button className="btn ghost" onClick={() => openEditUserDialog(u)} disabled={loading || isCurrentUser || isReadOnlyRole}>Edit</button>
-                                  <button className="btn ghost" onClick={() => adminResetUserMFA(u.id)} disabled={loading || isCurrentUser || isReadOnlyRole || !u.mfaEnabled}>Reset MFA</button>
-                                  <button className="btn danger" onClick={() => deleteUser(u.id)} disabled={loading || isCurrentUser || isReadOnlyRole}>Delete</button>
-                                </div>
+                                {(r.groups || []).slice(0, 3).join(', ')}
+                                {(r.groups || []).length > 3 ? ` +${(r.groups || []).length - 3}` : ''}
                               </td>
                             </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : null}
                 </section>
               </div>
             </section>
@@ -6165,6 +6627,49 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
                 </div>
               </div>
             ) : null}
+            <div className="field">
+              <label>Group Memberships (priority top to bottom)</label>
+              <div className="dual-transfer">
+                <div className="dual-list">
+                  <div className="muted" style={{ marginBottom: '.3rem' }}>Available</div>
+                  {(identityGroups || []).filter((g) => !newUserGroupIDs.includes(g.group.id)).map((g) => (
+                    <button
+                      key={`new-user-g-av-${g.group.id}`}
+                      className="group-item-row"
+                      onClick={() => addUserGroup(setNewUserGroupIDs, g.group.id)}
+                      type="button"
+                      title={g.group.name}
+                    >
+                      {g.group.name}
+                    </button>
+                  ))}
+                </div>
+                <div className="dual-controls">
+                  <button className="btn ghost tiny-btn" type="button" onClick={() => {
+                    const first = (identityGroups || []).find((g) => !newUserGroupIDs.includes(g.group.id));
+                    if (first) addUserGroup(setNewUserGroupIDs, first.group.id);
+                  }}>&gt;</button>
+                  <button className="btn ghost tiny-btn" type="button" onClick={() => {
+                    const last = newUserGroupIDs[newUserGroupIDs.length - 1];
+                    if (last) removeUserGroup(setNewUserGroupIDs, last);
+                  }}>&lt;</button>
+                </div>
+                <div className="dual-list">
+                  <div className="muted" style={{ marginBottom: '.3rem' }}>Assigned</div>
+                  {newUserGroupIDs.map((gid, idx) => {
+                    const g = identityGroups.find((it) => it.group.id === gid);
+                    return (
+                      <div key={`new-user-g-as-${gid}`} className="group-assigned-row">
+                        <span className="group-priority">{idx + 1}</span>
+                        <button className="group-item-row" style={{ flex: 1 }} type="button" onClick={() => removeUserGroup(setNewUserGroupIDs, gid)} title={g?.group.name || `Group ${gid}`}>{g?.group.name || `Group ${gid}`}</button>
+                        <button className="btn ghost tiny-btn" type="button" onClick={() => moveUserGroup(setNewUserGroupIDs, gid, -1)}>↑</button>
+                        <button className="btn ghost tiny-btn" type="button" onClick={() => moveUserGroup(setNewUserGroupIDs, gid, 1)}>↓</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
             <div className="row" style={{ marginBottom: 0 }}>
               <button className="btn" onClick={createUser} disabled={loading || !newUserName || !newUserPassword || (newUserRole === 'domain-admin' && newUserDomainIDs.length === 0)}>Create User</button>
               <button className="btn danger" onClick={() => setShowCreateUserDialog(false)} disabled={loading}>Cancel</button>
@@ -6222,9 +6727,94 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
                 </div>
               </div>
             ) : null}
+            <div className="field">
+              <label>Group Memberships (priority top to bottom)</label>
+              <div className="dual-transfer">
+                <div className="dual-list">
+                  <div className="muted" style={{ marginBottom: '.3rem' }}>Available</div>
+                  {(identityGroups || []).filter((g) => !editUserGroupIDs.includes(g.group.id)).map((g) => (
+                    <button
+                      key={`edit-user-g-av-${g.group.id}`}
+                      className="group-item-row"
+                      onClick={() => addUserGroup(setEditUserGroupIDs, g.group.id)}
+                      type="button"
+                      title={g.group.name}
+                    >
+                      {g.group.name}
+                    </button>
+                  ))}
+                </div>
+                <div className="dual-controls">
+                  <button className="btn ghost tiny-btn" type="button" onClick={() => {
+                    const first = (identityGroups || []).find((g) => !editUserGroupIDs.includes(g.group.id));
+                    if (first) addUserGroup(setEditUserGroupIDs, first.group.id);
+                  }}>&gt;</button>
+                  <button className="btn ghost tiny-btn" type="button" onClick={() => {
+                    const last = editUserGroupIDs[editUserGroupIDs.length - 1];
+                    if (last) removeUserGroup(setEditUserGroupIDs, last);
+                  }}>&lt;</button>
+                </div>
+                <div className="dual-list">
+                  <div className="muted" style={{ marginBottom: '.3rem' }}>Assigned</div>
+                  {editUserGroupIDs.map((gid, idx) => {
+                    const g = identityGroups.find((it) => it.group.id === gid);
+                    return (
+                      <div key={`edit-user-g-as-${gid}`} className="group-assigned-row">
+                        <span className="group-priority">{idx + 1}</span>
+                        <button className="group-item-row" style={{ flex: 1 }} type="button" onClick={() => removeUserGroup(setEditUserGroupIDs, gid)} title={g?.group.name || `Group ${gid}`}>{g?.group.name || `Group ${gid}`}</button>
+                        <button className="btn ghost tiny-btn" type="button" onClick={() => moveUserGroup(setEditUserGroupIDs, gid, -1)}>↑</button>
+                        <button className="btn ghost tiny-btn" type="button" onClick={() => moveUserGroup(setEditUserGroupIDs, gid, 1)}>↓</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
             <div className="row" style={{ marginBottom: 0 }}>
               <button className="btn" onClick={saveUserEdit} disabled={loading || (editUserRole === 'domain-admin' && editUserDomainIDs.length === 0)}>Save Changes</button>
               <button className="btn danger" onClick={closeEditUserDialog} disabled={loading}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {identity && groupEditorOpen ? (
+        <div className="overlay">
+          <div className="login-card modal-card user-edit-modal" style={{ maxWidth: '980px', width: '95vw' }}>
+            <h3>{groupEditorID ? 'Edit Group' : 'Create Group'}</h3>
+            <div className="field-grid">
+              <div className="field">
+                <label>Name</label>
+                <input value={groupEditorName} onChange={(e) => setGroupEditorName(e.target.value)} placeholder="group name" />
+              </div>
+              <div className="field">
+                <label>Description</label>
+                <input value={groupEditorDescription} onChange={(e) => setGroupEditorDescription(e.target.value)} placeholder="short description" />
+              </div>
+              <div className="field">
+                <label>Template (optional)</label>
+                <select value={groupEditorTemplate} onChange={(e) => { setGroupEditorTemplate(e.target.value); if (e.target.value) applyGroupTemplate(e.target.value); }}>
+                  <option value="">custom</option>
+                  {identityGroups.filter((g) => g.group.system).map((g) => (
+                    <option key={`templ-${g.group.id}`} value={g.group.template}>{g.group.name}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="field">
+              <label>Permissions</label>
+              <div className="domain-pills" style={{ maxHeight: '48vh', overflow: 'auto' }}>
+                {identityPermCatalog.map((p) => (
+                  <label key={`perm-${p.key}`} className="pill">
+                    <input type="checkbox" checked={groupEditorPermissions.includes(p.key)} onChange={() => toggleGroupEditorPermission(p.key)} />
+                    {p.key}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="row" style={{ marginBottom: 0 }}>
+              <button className="btn" onClick={saveGroupEditor} disabled={loading || isReadOnlyRole}>Save Group</button>
+              <button className="btn danger" onClick={closeGroupDialog} disabled={loading}>Cancel</button>
             </div>
           </div>
         </div>
@@ -6639,11 +7229,79 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .user-table-compact { min-width:980px; font-size:.82rem; }
         .user-table-compact th, .user-table-compact td { padding:.4rem .5rem; }
         .user-edit-modal .domain-pills { max-height:170px; overflow:auto; padding-right:.2rem; }
+        .dual-transfer { display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:.55rem; align-items:start; }
+        .dual-list { border:1px solid var(--border); border-radius:10px; background:#101015; padding:.4rem; max-height:230px; overflow:auto; }
+        .dual-controls { display:flex; flex-direction:column; gap:.4rem; justify-content:center; }
+        .dual-controls .btn { min-width:2.1rem; }
+        .tiny-btn { padding:.28rem .42rem; border-radius:8px; font-size:.74rem; line-height:1; }
+        .group-item-row {
+          width:100%;
+          border:1px solid var(--border);
+          background:#121420;
+          color:var(--text);
+          border-radius:8px;
+          padding:.28rem .45rem;
+          text-align:left;
+          font-size:.78rem;
+          line-height:1.2;
+          white-space:nowrap;
+          overflow:hidden;
+          text-overflow:ellipsis;
+          cursor:pointer;
+        }
+        .group-item-row:hover { border-color:var(--accent); background:var(--accent-soft); }
+        .group-assigned-row { display:grid; grid-template-columns:2rem minmax(0,1fr) auto auto; gap:.3rem; align-items:center; margin-bottom:.25rem; }
+        .group-priority {
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          height:1.5rem;
+          border:1px solid var(--border);
+          border-radius:7px;
+          font-size:.72rem;
+          color:var(--text-dim);
+          background:#0f1118;
+        }
         input, select, textarea { background:var(--input-bg); border:1px solid var(--border); color:var(--text); border-radius:9px; padding:.6rem .75rem; }
         textarea { min-height:6rem; width:100%; }
         .wizard-steps { display:flex; gap:.5rem; margin-bottom:.8rem; flex-wrap:wrap; }
         .wiz { background:#111118; color:var(--text-dim); border:1px solid var(--border); border-radius:10px; padding:.5rem .75rem; cursor:pointer; }
         .wiz.active { color:var(--text); border-color:var(--accent); background:var(--accent-soft); }
+        .settings-tabbar {
+          display:grid;
+          gap:.45rem;
+          margin-bottom:.75rem;
+          grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+          align-items:stretch;
+        }
+        .settings-tabbar .wiz {
+          width:100%;
+          min-height:2.35rem;
+          white-space:nowrap;
+          overflow:hidden;
+          text-overflow:ellipsis;
+          font-size:.84rem;
+          padding:.5rem .65rem;
+        }
+        .settings-runtime-card {
+          min-height:72vh;
+          display:flex;
+          flex-direction:column;
+        }
+        .settings-tab-content {
+          flex:1 1 auto;
+          min-height:0;
+          overflow:auto;
+          padding-right:.1rem;
+        }
+        .settings-actions {
+          display:flex;
+          gap:.5rem;
+          flex-wrap:wrap;
+          margin-top:.15rem;
+          margin-bottom:.65rem;
+        }
+        .settings-actions-tight { margin-bottom:0; }
         .check { display:flex; align-items:center; gap:.5rem; margin-bottom:.5rem; color:var(--text-dim); }
         .domain-pills { display:flex; flex-wrap:wrap; gap:.45rem; margin:.4rem 0 .8rem; }
         .pill { display:flex; align-items:center; gap:.35rem; background:#111118; border:1px solid var(--border); border-radius:999px; padding:.3rem .6rem; color:var(--text-dim); }
@@ -6946,6 +7604,18 @@ function formatBytes(v: number): string {
     idx++;
   }
   return `${n >= 100 || idx === 0 ? n.toFixed(0) : n.toFixed(1)} ${units[idx]}`;
+}
+
+function formatDurationShort(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '-';
+  const total = Math.round(seconds);
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${total}s`;
 }
 
 const GEO_PRESETS: Record<string, string[]> = {
