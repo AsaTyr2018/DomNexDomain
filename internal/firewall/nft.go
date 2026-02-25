@@ -37,7 +37,9 @@ func (n *NftEnforcer) Ensure(ctx context.Context) error {
 	if err := n.run(ctx, "add", "set", "inet", n.table, n.set6, "{", "type", "ipv6_addr", ";", "}"); err != nil && !isAlreadyExists(err) {
 		return err
 	}
-	if err := n.run(ctx, "add", "chain", "inet", n.table, n.chain, "{", "type", "filter", "hook", "input", "priority", "0", ";", "policy", "accept", ";", "}"); err != nil && !isAlreadyExists(err) {
+	// Keep DomNex drop chain ahead of distro firewalls (UFW/iptables-nft) so blocked sources
+	// are dropped before generic allow rules can accept traffic to 80/443/2222.
+	if err := n.ensureInputChainPriority(ctx); err != nil {
 		return err
 	}
 	out, err := n.output(ctx, "list", "chain", "inet", n.table, n.chain)
@@ -55,6 +57,24 @@ func (n *NftEnforcer) Ensure(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (n *NftEnforcer) ensureInputChainPriority(ctx context.Context) error {
+	// Desired priority is -300 (raw-like), earlier than UFW filter(0).
+	const desired = "-300"
+	out, err := n.output(ctx, "list", "chain", "inet", n.table, n.chain)
+	if err != nil {
+		if isNotFound(err) {
+			return n.run(ctx, "add", "chain", "inet", n.table, n.chain, "{", "type", "filter", "hook", "input", "priority", desired, ";", "policy", "accept", ";", "}")
+		}
+		return err
+	}
+	if strings.Contains(out, "priority -300") || strings.Contains(out, "priority raw") {
+		return nil
+	}
+	_ = n.run(ctx, "flush", "chain", "inet", n.table, n.chain)
+	_ = n.run(ctx, "delete", "chain", "inet", n.table, n.chain)
+	return n.run(ctx, "add", "chain", "inet", n.table, n.chain, "{", "type", "filter", "hook", "input", "priority", desired, ";", "policy", "accept", ";", "}")
 }
 
 func (n *NftEnforcer) Disable(ctx context.Context) error {

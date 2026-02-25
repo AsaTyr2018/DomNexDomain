@@ -3915,6 +3915,13 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 		res.Decision = "hard_block_permanent"
 		_ = s.store.UpsertBlockedIP(ctx, in.IP, "threat_intel_auto:"+topSignal)
 		_ = s.store.EnsureThreatIntelBanHistoryForIP(ctx, in.IP, "threat_intel_auto:"+topSignal, "hard")
+		// Immediate host-level enforcement: do not wait for periodic firewall ticker.
+		if err := s.reconcileOSFirewall(ctx); err != nil {
+			s.log.Warn("threat intel os firewall reconcile failed", map[string]any{
+				"ip":  in.IP,
+				"err": err.Error(),
+			})
+		}
 	} else if !st.BanUntil.IsZero() && st.BanUntil.After(now) {
 		res.Blocked = true
 		res.Decision = "soft_block_active"
