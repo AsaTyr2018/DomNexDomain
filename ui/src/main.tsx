@@ -222,7 +222,8 @@ type GeoIPStats = {
   lastUploadFile?: string;
 };
 
-type Tab = 'dashboard' | 'metricCenter' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'ssh' | 'audit' | 'account' | 'accessControl' | 'integrations' | 'help';
+type Tab = 'dashboard' | 'strategicIntel' | 'threatIntel' | 'domains' | 'hosts' | 'backup' | 'users' | 'settings' | 'api' | 'ssh' | 'account' | 'accessControl' | 'integrations' | 'help';
+type StrategicIntelTab = 'overview' | 'events' | 'telemetry' | 'geo' | 'investigations' | 'notifications';
 type SettingsTab = 'general' | 'security' | 'threatintel' | 'idp' | 'mfa' | 'logservers' | 'geoip' | 'appearance' | 'advanced';
 type IdentityTab = 'users' | 'groups' | 'matrix';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
@@ -592,6 +593,7 @@ class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, {
 
 function App() {
   const [tab, setTab] = useState<Tab>('dashboard');
+  const [strategicIntelTab, setStrategicIntelTab] = useState<StrategicIntelTab>('overview');
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [dashboardLayout, setDashboardLayout] = useState<DashboardLayout>(defaultDashboardLayout());
   const [dashboardTabID, setDashboardTabID] = useState('minimal');
@@ -663,7 +665,6 @@ function App() {
   const [metricHours, setMetricHours] = useState(24);
   const [metricClass, setMetricClass] = useState<'all' | 'human' | 'crawler' | 'unknown'>('all');
   const [metricCountryFocus, setMetricCountryFocus] = useState('all');
-  const [metricMapOpen, setMetricMapOpen] = useState(false);
   const [metricMapMode, setMetricMapMode] = useState<'historical' | 'live' | 'threat'>('historical');
   const [metricLivePoints, setMetricLivePoints] = useState<LiveTracePoint[]>([]);
   const [metricLiveConnected, setMetricLiveConnected] = useState(false);
@@ -748,6 +749,7 @@ function App() {
   const [logActorFilter, setLogActorFilter] = useState('all');
   const [logIPFilter, setLogIPFilter] = useState('all');
   const [logScopeFilter, setLogScopeFilter] = useState<'all' | 'internal' | 'external'>('all');
+  const [logShowHardDrops, setLogShowHardDrops] = useState(false);
   const [logTargetQuery, setLogTargetQuery] = useState('');
   const [settings, setSettings] = useState<RuntimeSettings | null>(null);
   const [settingsAcmeEmail, setSettingsAcmeEmail] = useState('');
@@ -1269,16 +1271,18 @@ function App() {
   }, [selectedHostID]);
 
   useEffect(() => {
-    if (tab !== 'metricCenter') return;
+    if (tab !== 'strategicIntel') return;
+    if (!(strategicIntelTab === 'overview' || strategicIntelTab === 'telemetry' || strategicIntelTab === 'geo')) return;
     void loadMetricCenter();
-  }, [tab, metricHostFilter, metricHours, metricClass, hosts]);
+  }, [tab, strategicIntelTab, metricHostFilter, metricHours, metricClass, hosts]);
 
   useEffect(() => {
-    if (tab !== 'audit') return;
+    if (tab !== 'strategicIntel') return;
+    if (!(strategicIntelTab === 'overview' || strategicIntelTab === 'events' || strategicIntelTab === 'investigations')) return;
     void refreshAuditOnly();
     const t = window.setInterval(() => { void refreshAuditOnly(); }, 5000);
     return () => window.clearInterval(t);
-  }, [tab]);
+  }, [tab, strategicIntelTab]);
 
   useEffect(() => {
     if (tab !== 'threatIntel') return;
@@ -2030,7 +2034,8 @@ function App() {
   };
 
   useEffect(() => {
-    if (!identity || !metricMapOpen || metricMapMode !== 'live') {
+    const geoActive = tab === 'strategicIntel' && strategicIntelTab === 'geo';
+    if (!identity || !geoActive || metricMapMode !== 'live') {
       setMetricLiveConnected(false);
       return;
     }
@@ -2079,16 +2084,17 @@ function App() {
       setMetricLiveConnected(false);
       setMetricLivePoints([]);
     };
-  }, [identity, metricMapOpen, metricMapMode, metricHostFilter, metricClass, metricCountryFocus]);
+  }, [identity, tab, strategicIntelTab, metricMapMode, metricHostFilter, metricClass, metricCountryFocus]);
 
   useEffect(() => {
-    if (!identity || !metricMapOpen || metricMapMode !== 'threat') return;
+    const geoActive = tab === 'strategicIntel' && strategicIntelTab === 'geo';
+    if (!identity || !geoActive || metricMapMode !== 'threat') return;
     void loadThreatGeoMap();
     const timer = window.setInterval(() => {
       void loadThreatGeoMap();
     }, 10000);
     return () => window.clearInterval(timer);
-  }, [identity, metricMapOpen, metricMapMode]);
+  }, [identity, tab, strategicIntelTab, metricMapMode]);
 
   const activeHosts = hosts.filter((h) => h.state === 'active').length;
   const errorHosts = hosts.filter((h) => h.state === 'error').length;
@@ -2142,9 +2148,10 @@ function App() {
   const logNamespaces = Array.from(new Set(logsBaseByWindow.map((e) => actionNamespace(e.action)))).sort();
   const logActions = Array.from(new Set(logsBaseByWindow.map((e) => e.action))).sort();
   const logActors = Array.from(new Set(logsBaseByWindow.map((e) => e.actor))).sort();
-  const logIPs = Array.from(new Set(logsBaseByWindow.map((e) => extractSourceIP(e)).filter(Boolean))).sort();
+  const logIPs = Array.from(new Set(logsBaseByWindow.map((e) => extractSourceIP(e)).filter((ip) => !!ip && !isLoopbackIP(ip)))).sort();
   const publicIPv4Hint = (settings?.publicIpv4 || settingsPublicIPv4 || '').trim();
   const filteredAudit = logsBaseByWindow.filter((e) => {
+    if (!logShowHardDrops && (e.action || '').toLowerCase() === 'proxy.block.hard_drop') return false;
     const level = classifyAuditLevel(e.action, e.target);
     if (logLevelFilter !== 'all' && level !== logLevelFilter) return false;
     const namespace = actionNamespace(e.action);
@@ -2152,6 +2159,7 @@ function App() {
     if (logActionFilter !== 'all' && e.action !== logActionFilter) return false;
     if (logActorFilter !== 'all' && e.actor !== logActorFilter) return false;
     const src = extractSourceIP(e);
+    if (isLoopbackIP(src) && logScopeFilter !== 'internal') return false;
     if (logIPFilter !== 'all' && src !== logIPFilter) return false;
     if (logScopeFilter !== 'all') {
       if (!src) return false;
@@ -2364,12 +2372,20 @@ function App() {
   const metricSuccessRatePct = metricTotalRequests > 0 ? Math.round((metric2xx / metricTotalRequests) * 100) : 0;
   const topCountry = metricCountries[0];
   const topBlockedCountry = [...metricCountries].sort((a, b) => (b.blocked || 0) - (a.blocked || 0))[0];
+  const telemetryTopHosts = [...(trafficOverview?.hosts || [])]
+    .sort((a, b) => (b.requests || 0) - (a.requests || 0))
+    .slice(0, 25);
+  const telemetryTotalHostRequests = telemetryTopHosts.reduce((sum, h) => sum + (h.requests || 0), 0);
   const topUnknownSharePct = metricTotalRequests > 0 ? Math.round((metricUnknownTotal / metricTotalRequests) * 100) : 0;
   const trafficSpikeScore = (() => {
     const total = trafficOverview?.totalRequests || 0;
     const base = Math.max(1, hosts.length * 120);
     return Math.round((total / base) * 100);
   })();
+  const openStrategicIntel = (target: StrategicIntelTab) => {
+    setStrategicIntelTab(target);
+    setTab('strategicIntel');
+  };
   const metricProblems = [
     {
       id: 'p-5xx',
@@ -2377,7 +2393,7 @@ function App() {
       issue: 'Server errors (5xx)',
       value: `${metric5xxRatePct}%`,
       detail: `${metricError5xx} responses`,
-      action: () => setTab('audit'),
+      action: () => openStrategicIntel('events'),
       actionLabel: 'Open Logs',
     },
     {
@@ -2386,7 +2402,7 @@ function App() {
       issue: 'Client+server errors',
       value: `${metricErrRatePct}%`,
       detail: `${metricError4xx + metricError5xx} responses`,
-      action: () => setTab('audit'),
+      action: () => openStrategicIntel('events'),
       actionLabel: 'Investigate',
     },
     {
@@ -2413,7 +2429,7 @@ function App() {
       issue: 'Traffic spike score',
       value: `${trafficSpikeScore}%`,
       detail: 'vs baseline model',
-      action: () => setTab('metricCenter'),
+      action: () => openStrategicIntel('telemetry'),
       actionLabel: 'Review',
     },
     {
@@ -2566,8 +2582,8 @@ function App() {
         return (
           <div className="row" style={{ marginBottom: 0 }}>
             <button className="btn" onClick={refresh} disabled={loading}>Refresh Data</button>
-            <button className="btn" onClick={() => setTab('audit')}>Open Log Center</button>
-            <button className="btn" onClick={() => setTab('metricCenter')}>Open Metric Center</button>
+            <button className="btn" onClick={() => openStrategicIntel('events')}>Open Strategic Events</button>
+            <button className="btn" onClick={() => openStrategicIntel('telemetry')}>Open Strategic Telemetry</button>
             <button className="btn" onClick={runScheduledBackupNow} disabled={loading || isReadOnlyRole}>Backup now</button>
             <button className="btn" onClick={reloadService} disabled={loading || isReadOnlyRole}>Reload Service</button>
           </div>
@@ -3831,8 +3847,7 @@ function App() {
   const tiPageCount = Math.max(1, Math.ceil(Math.max(0, tiTotalCurrent) / Math.max(1, tiPageSize)));
   const tabTitle: Record<Tab, string> = {
     dashboard: 'Dashboard',
-    metricCenter: 'Metric Center',
-    audit: 'Log Center',
+    strategicIntel: 'Strategic Intel',
     domains: 'Domains',
     hosts: 'Subdomains',
     threatIntel: 'Threat Intel',
@@ -3859,8 +3874,7 @@ function App() {
             <div className="menu-group">
               <div className="menu-title">Overview</div>
               <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
-              <button className={tab === 'metricCenter' ? 'active' : ''} onClick={() => setTab('metricCenter')}>Metric Center</button>
-              <button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>Log Center</button>
+              <button className={tab === 'strategicIntel' ? 'active' : ''} onClick={() => openStrategicIntel('overview')}>Strategic Intel</button>
             </div>
             <div className="menu-group">
               <div className="menu-title">Edge Routing</div>
@@ -3911,6 +3925,23 @@ function App() {
           </header>
 
           {error ? <div className="error">{error}</div> : null}
+
+          {tab === 'strategicIntel' ? (
+            <section className="card" style={{ marginBottom: '.75rem' }}>
+              <div className="card-head"><h3>Strategic Intel</h3></div>
+              <div className="wizard-steps">
+                <button className={strategicIntelTab === 'overview' ? 'wiz active' : 'wiz'} onClick={() => setStrategicIntelTab('overview')}>Overview</button>
+                <button className={strategicIntelTab === 'events' ? 'wiz active' : 'wiz'} onClick={() => setStrategicIntelTab('events')}>Events</button>
+                <button className={strategicIntelTab === 'telemetry' ? 'wiz active' : 'wiz'} onClick={() => setStrategicIntelTab('telemetry')}>Telemetry</button>
+                <button className={strategicIntelTab === 'geo' ? 'wiz active' : 'wiz'} onClick={() => setStrategicIntelTab('geo')}>Geo</button>
+                <button className={strategicIntelTab === 'investigations' ? 'wiz active' : 'wiz'} onClick={() => setStrategicIntelTab('investigations')}>Investigations</button>
+                <button className={strategicIntelTab === 'notifications' ? 'wiz active' : 'wiz'} onClick={() => setStrategicIntelTab('notifications')}>Notifications</button>
+              </div>
+              <div className="muted">
+                Unified analytics plane: logs, telemetry, geo-intelligence and incident pivots.
+              </div>
+            </section>
+          ) : null}
 
           {tab === 'dashboard' ? (
             <section className="dashboard">
@@ -4035,12 +4066,243 @@ function App() {
             </section>
           ) : null}
 
-          {tab === 'metricCenter' ? (
+          {tab === 'strategicIntel' && strategicIntelTab === 'overview' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>Strategic Overview</h3></div>
+                  <div className="metric-grid">
+                    <MetricTile label="Events (window)" value={String(filteredAudit.length)} hint={`${logWindow} filtered events`} />
+                    <MetricTile label="Blocked IPs" value={String(blockedIPs.length)} hint="Current block table size" />
+                    <MetricTile label="Requests (window)" value={String(metricTotalRequests)} hint={`${metricHours}h telemetry`} />
+                    <MetricTile label="Error Rate" value={`${metricErrRatePct}%`} hint="4xx+5xx ratio" />
+                    <MetricTile label="5xx Rate" value={`${metric5xxRatePct}%`} hint="Server-side failure signal" />
+                    <MetricTile label="Threat Offenders" value={String(tiTotalOffenders)} hint="Burst offenders in current TI filter" />
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Quick Pivot</h3></div>
+                  <div className="row">
+                    <button className="btn" onClick={() => setStrategicIntelTab('events')}>Open Events</button>
+                    <button className="btn" onClick={() => setStrategicIntelTab('telemetry')}>Open Telemetry</button>
+                    <button className="btn" onClick={() => setStrategicIntelTab('geo')}>Open Geo Map</button>
+                    <button className="btn" onClick={() => setStrategicIntelTab('investigations')}>Open Investigations</button>
+                  </div>
+                </section>
+              </div>
+            </section>
+          ) : null}
+
+          {tab === 'strategicIntel' && strategicIntelTab === 'investigations' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>Investigations Pivot</h3></div>
+                  <div className="muted" style={{ marginBottom: '.55rem' }}>
+                    Pivot from one indicator across retained event data. Use source IP, trace id, actor, action, target or meta fragments.
+                  </div>
+                  <div className="row" style={{ marginBottom: '.5rem' }}>
+                    <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="Pivot value (IP / trace / actor / target / path)" />
+                    <button className="btn" onClick={() => setStrategicIntelTab('events')}>Run in Events</button>
+                  </div>
+                  <div className="muted">Result preview from current filter:</div>
+                  <div className="log-table-wrap" style={{ marginTop: '.4rem' }}>
+                    <table className="log-table">
+                      <thead>
+                        <tr>
+                          <th>Time</th>
+                          <th>Action</th>
+                          <th>Actor</th>
+                          <th>Target</th>
+                          <th>Source</th>
+                          <th>Trace</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredAudit.slice(0, 20).map((e) => (
+                          <tr key={`inv-${e.id}`}>
+                            <td>{new Date(e.createdAt).toLocaleString()}</td>
+                            <td><code>{e.action}</code></td>
+                            <td>{e.actor || '-'}</td>
+                            <td>{e.target || '-'}</td>
+                            <td>{extractSourceIP(e) || '-'}</td>
+                            <td><code>{extractTraceID(e) || '-'}</code></td>
+                          </tr>
+                        ))}
+                        {filteredAudit.length === 0 ? <tr><td colSpan={6} className="muted">No matching events.</td></tr> : null}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              </div>
+            </section>
+          ) : null}
+
+          {tab === 'strategicIntel' && strategicIntelTab === 'notifications' ? (
+            <section className="entity-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>Notifications (Design Placeholder)</h3></div>
+                  <div className="muted" style={{ marginBottom: '.6rem' }}>
+                    Delivery channels and rule-engine hooks are staged here. This is a UX placeholder for the upcoming notification backend.
+                  </div>
+                  <div className="field-grid">
+                    <div className="field">
+                      <label>Mail Notifications</label>
+                      <div className="muted">Coming soon: SMTP profile, recipients, severity routing.</div>
+                    </div>
+                    <div className="field">
+                      <label>Slack Notifications</label>
+                      <div className="muted">Coming soon: webhook/channel routing and event templates.</div>
+                    </div>
+                    <div className="field">
+                      <label>Generic Webhooks</label>
+                      <div className="muted">Coming soon: signed outbound payloads and retry policy.</div>
+                    </div>
+                    <div className="field">
+                      <label>Rule Builder</label>
+                      <div className="muted">Coming soon: if/then rules based on level, source, target and threat state.</div>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </section>
+          ) : null}
+
+          {tab === 'strategicIntel' && strategicIntelTab === 'telemetry' ? (
             <section className="entity-page metric-center-page">
               <div className="entity-main">
                 <section className="card">
-                  <div className="card-head"><h3>MetricCenter v2</h3></div>
+                  <div className="card-head"><h3>Telemetry</h3></div>
                   <div className="row">
+                    <select value={metricHostFilter} onChange={(e) => setMetricHostFilter(e.target.value)}>
+                      <option value="all">All Subdomains</option>
+                      {hosts.map((h) => (
+                        <option key={h.id} value={String(h.id)}>{h.fqdn}</option>
+                      ))}
+                    </select>
+                    <select value={String(metricHours)} onChange={(e) => setMetricHours(Number(e.target.value) || 24)}>
+                      <option value="1">Last 1h</option>
+                      <option value="6">Last 6h</option>
+                      <option value="24">Last 24h</option>
+                      <option value="168">Last 7d</option>
+                    </select>
+                    <select value={metricClass} onChange={(e) => setMetricClass(e.target.value as 'all' | 'human' | 'crawler' | 'unknown')}>
+                      <option value="all">All Traffic</option>
+                      <option value="human">Human</option>
+                      <option value="crawler">Crawler</option>
+                      <option value="unknown">Unknown UA</option>
+                    </select>
+                    <button className="btn" onClick={loadMetricCenter} disabled={loading}>Refresh</button>
+                  </div>
+                  <div className="ops-alert-strip">
+                    <AlertChip label="Error Rate" value={`${metricErrRatePct}%`} state={metricErrRatePct >= 12 ? 'critical' : metricErrRatePct >= 6 ? 'warn' : 'ok'} />
+                    <AlertChip label="5xx Rate" value={`${metric5xxRatePct}%`} state={metric5xxRatePct >= 5 ? 'critical' : metric5xxRatePct >= 2 ? 'warn' : 'ok'} />
+                    <AlertChip label="Block Rate" value={`${metricBlockRatePct}%`} state={metricBlockRatePct >= 25 ? 'critical' : metricBlockRatePct >= 10 ? 'warn' : 'ok'} />
+                    <AlertChip label="Spike Score" value={`${trafficSpikeScore}%`} state={trafficSpikeScore >= 220 ? 'critical' : trafficSpikeScore >= 140 ? 'warn' : 'ok'} />
+                    <AlertChip label="HA Degraded" value={String(haHostsDegraded)} state={haHostsDegraded > 0 ? 'critical' : 'ok'} />
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Top Subdomains By Request Volume</h3></div>
+                  <div className="log-table-wrap">
+                    <table className="log-table">
+                      <thead>
+                        <tr>
+                          <th>FQDN</th>
+                          <th>Requests</th>
+                          <th>Blocked</th>
+                          <th>Visitors</th>
+                          <th>2xx</th>
+                          <th>4xx</th>
+                          <th>5xx</th>
+                          <th>Traffic Out</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {telemetryTopHosts.length === 0 ? (
+                          <tr><td colSpan={8} className="muted">No telemetry data in selected window.</td></tr>
+                        ) : telemetryTopHosts.map((h) => (
+                          <tr key={`t-host-${h.hostId}`}>
+                            <td><strong>{h.fqdn}</strong></td>
+                            <td>{h.requests || 0}</td>
+                            <td>{h.blocked || 0}</td>
+                            <td>{h.uniqueVisitors || 0}</td>
+                            <td>{h.status2xx || 0}</td>
+                            <td>{h.status4xx || 0}</td>
+                            <td>{h.status5xx || 0}</td>
+                            <td>{formatBytes(h.bytesOut || 0)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="muted" style={{ marginTop: '.45rem' }}>
+                    Table coverage: {telemetryTopHosts.length} hosts · {telemetryTotalHostRequests} requests.
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Problems Now</h3></div>
+                  <div className="log-table-wrap metric-table-wrap">
+                    <table className="log-table metric-problem-table">
+                      <thead>
+                        <tr>
+                          <th>Severity</th>
+                          <th>Issue</th>
+                          <th>Signal</th>
+                          <th>Detail</th>
+                          <th>Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {metricProblemsSorted.map((p) => (
+                          <tr key={p.id}>
+                            <td><span className={`badge ${p.severity === 'critical' ? 'err' : p.severity === 'warn' ? 'warn' : 'ok'}`}>{p.severity.toUpperCase()}</span></td>
+                            <td>{p.issue}</td>
+                            <td><strong>{p.value}</strong></td>
+                            <td className="muted">{p.detail}</td>
+                            <td><button className="btn" onClick={p.action}>{p.actionLabel}</button></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              </div>
+              <aside className="entity-side">
+                <section className="card">
+                  <div className="card-head"><h3>Telemetry Snapshot</h3></div>
+                  <div className="metric-grid">
+                    <MetricTile label="Requests" value={String(metricTotalRequests)} hint="Within selected time window" />
+                    <MetricTile label="Blocked" value={String(metricTotalBlocked)} hint="Policy blocked requests" />
+                    <MetricTile label="Traffic Out" value={formatBytes(metricTotalBytesOut)} hint="Response bytes" />
+                    <MetricTile label="Success Rate" value={`${metricSuccessRatePct}%`} hint="2xx across selected scope" />
+                  </div>
+                </section>
+                <section className="card">
+                  <div className="card-head"><h3>Audit Snapshot</h3></div>
+                  <div className="metric-grid">
+                    <MetricTile label="Critical" value={String(auditCriticalTotal)} hint="Deletes, resets, revokes" />
+                    <MetricTile label="Warnings" value={String(auditWarningTotal)} hint="Updates, retries, proxy issues" />
+                    <MetricTile label="Info" value={String(auditInfoTotal)} hint="Read/list/login events" />
+                    <MetricTile label="Unique Actors" value={String(auditActorsTotal)} hint="Across retained audit data" />
+                  </div>
+                </section>
+              </aside>
+            </section>
+          ) : null}
+
+          {tab === 'strategicIntel' && strategicIntelTab === 'geo' ? (
+            <section className="entity-page geo-intel-page">
+              <div className="entity-main">
+                <section className="card">
+                  <div className="card-head"><h3>Geo Intelligence Map</h3></div>
+                  <div className="row">
+                    <select value={metricMapMode} onChange={(e) => setMetricMapMode(e.target.value === 'live' ? 'live' : e.target.value === 'threat' ? 'threat' : 'historical')}>
+                      <option value="historical">Historical</option>
+                      <option value="live">Live Trace</option>
+                      <option value="threat">Threat Intel Map</option>
+                    </select>
                     <select value={metricHostFilter} onChange={(e) => setMetricHostFilter(e.target.value)}>
                       <option value="all">All Subdomains</option>
                       {hosts.map((h) => (
@@ -4061,98 +4323,34 @@ function App() {
                     </select>
                     <select value={metricCountryFocus} onChange={(e) => setMetricCountryFocus(e.target.value)}>
                       <option value="all">All Countries</option>
-                      {metricCountries.slice(0, 50).map((c) => (
-                        <option key={`mcc-${c.country}`} value={(c.country || '').toUpperCase()}>{(c.country || 'ZZ').toUpperCase()}</option>
+                      {metricCountries.slice(0, 80).map((c) => (
+                        <option key={`geo-focus-${c.country}`} value={(c.country || '').toUpperCase()}>{(c.country || 'ZZ').toUpperCase()}</option>
                       ))}
                     </select>
-                    <button className="btn" onClick={() => setMetricMapOpen(true)}>Open Geo Map</button>
+                    <button className="btn" onClick={() => setMetricCountryFocus('all')}>Reset Country Filter</button>
+                    {metricMapMode === 'threat' ? <button className="btn" onClick={loadThreatGeoMap}>Refresh Threat Map</button> : null}
                     <button className="btn" onClick={loadMetricCenter} disabled={loading}>Refresh</button>
                   </div>
-                  <div className="ops-alert-strip">
-                    <AlertChip label="Error Rate" value={`${metricErrRatePct}%`} state={metricErrRatePct >= 12 ? 'critical' : metricErrRatePct >= 6 ? 'warn' : 'ok'} />
-                    <AlertChip label="5xx Rate" value={`${metric5xxRatePct}%`} state={metric5xxRatePct >= 5 ? 'critical' : metric5xxRatePct >= 2 ? 'warn' : 'ok'} />
-                    <AlertChip label="Block Rate" value={`${metricBlockRatePct}%`} state={metricBlockRatePct >= 25 ? 'critical' : metricBlockRatePct >= 10 ? 'warn' : 'ok'} />
-                    <AlertChip label="Spike Score" value={`${trafficSpikeScore}%`} state={trafficSpikeScore >= 220 ? 'critical' : trafficSpikeScore >= 140 ? 'warn' : 'ok'} />
-                    <AlertChip label="Top Country" value={(topCountry?.country || 'ZZ').toUpperCase()} state="ok" />
-                    <AlertChip label="HA Degraded" value={String(haHostsDegraded)} state={haHostsDegraded > 0 ? 'critical' : 'ok'} />
+                  <div className="muted" style={{ marginBottom: '.6rem' }}>
+                    {metricMapMode === 'live'
+                      ? `Live Trace ${metricLiveConnected ? 'connected' : 'disconnected'} · TTL 10s · Filter: ${metricCountryFocus.toUpperCase()}`
+                      : metricMapMode === 'threat'
+                        ? `Threat Intel snapshot ${metricThreatGeoAt ? new Date(metricThreatGeoAt).toLocaleTimeString() : 'loading'} · Filter: ${metricCountryFocus.toUpperCase()}`
+                        : `Historical request distribution · Filter: ${metricCountryFocus.toUpperCase()}`}
                   </div>
-                </section>
-
-                <section className="metric-v2-layout">
-                  <section className="card metric-v2-panel">
-                    <div className="card-head"><h3>Geo Intelligence Summary</h3></div>
-                    <div className="muted">Use `Open Geo Map` for full world view and country-click filtering.</div>
-                    <div className="metric-grid" style={{ marginTop: '.6rem' }}>
-                      <MetricTile label="Requests" value={String(metricTotalRequests)} hint="Within selected time window" />
-                      <MetricTile label="Blocked" value={String(metricTotalBlocked)} hint="Geo/Auth/Policy blocked requests" />
-                      <MetricTile label="Traffic Out" value={formatBytes(metricTotalBytesOut)} hint="Response bytes" />
-                      <MetricTile label="Success Rate" value={`${metricSuccessRatePct}%`} hint="2xx across selected scope" />
-                    </div>
-                  </section>
-
-                  <section className="card metric-v2-panel">
-                    <div className="card-head"><h3>Country Focus</h3></div>
-                    {metricFilteredCountries.length === 0 ? (
-                      <div className="muted">No traffic data for this filter yet.</div>
-                    ) : (
-                      <div className="event-list metric-scroll">
-                        {metricFilteredCountries.map((c) => {
-                          const pct = Math.max(1, Math.round(((c.requests || 0) / metricTopReq) * 100));
-                          return (
-                            <div key={c.country} className="event-item">
-                              <div className="event-top">
-                                <strong>{(c.country || 'ZZ').toUpperCase()}</strong>
-                                <span className="muted">{c.requests} req</span>
-                              </div>
-                              <div style={{ height: 8, borderRadius: 8, background: '#0f1117', border: '1px solid #2a2a35', overflow: 'hidden' }}>
-                                <div style={{ width: `${pct}%`, height: '100%', background: 'linear-gradient(90deg,#0ea5e9,#22c55e)' }} />
-                              </div>
-                              <div className="muted" style={{ marginTop: '.3rem' }}>
-                                2xx: {c.status2xx || 0} · 3xx: {c.status3xx || 0} · 4xx: {c.status4xx || 0} · 5xx: {c.status5xx || 0} · blocked: {c.blocked || 0}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </section>
-
-                  <section className="card metric-v2-panel">
-                    <div className="card-head"><h3>Problems Now</h3></div>
-                    <div className="log-table-wrap metric-table-wrap">
-                      <table className="log-table metric-problem-table">
-                        <thead>
-                          <tr>
-                            <th>Severity</th>
-                            <th>Issue</th>
-                            <th>Signal</th>
-                            <th>Detail</th>
-                            <th>Action</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {metricProblemsSorted.map((p) => (
-                            <tr key={p.id}>
-                              <td><span className={`badge ${p.severity === 'critical' ? 'err' : p.severity === 'warn' ? 'warn' : 'ok'}`}>{p.severity.toUpperCase()}</span></td>
-                              <td>{p.issue}</td>
-                              <td><strong>{p.value}</strong></td>
-                              <td className="muted">{p.detail}</td>
-                              <td><button className="btn" onClick={p.action}>{p.actionLabel}</button></td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                    <div className="muted" style={{ marginTop: '.45rem' }}>
-                      Top blocked country: {(topBlockedCountry?.country || 'ZZ').toUpperCase()} · {topBlockedCountry?.blocked || 0} blocked
-                    </div>
-                </section>
+                  {metricMapMode === 'live' ? (
+                    <GeoLiveTraceMap points={metricLivePoints} onSelectCountry={(code) => setMetricCountryFocus(code)} />
+                  ) : metricMapMode === 'threat' ? (
+                    <GeoThreatIntelMap points={metricThreatGeo} countryFocus={metricCountryFocus} onSelectCountry={(code) => setMetricCountryFocus(code)} />
+                  ) : (
+                    <GeoScatterMap countries={metricFilteredCountries} onSelectCountry={(code) => setMetricCountryFocus(code)} />
+                  )}
                 </section>
               </div>
               <aside className="entity-side">
                 <section className="card">
                   <div className="card-head"><h3>Top Countries</h3></div>
-                  {(metricCountries.slice(0, 8)).map((c) => (
+                  {(metricCountries.slice(0, 12)).map((c) => (
                     <div key={`top-${c.country}`} className="host">
                       <div>
                         <strong>{(c.country || 'ZZ').toUpperCase()}</strong>
@@ -4162,15 +4360,6 @@ function App() {
                     </div>
                   ))}
                   {metricCountries.length === 0 ? <div className="muted">No country data.</div> : null}
-                </section>
-                <section className="card">
-                  <div className="card-head"><h3>Audit Snapshot</h3></div>
-                  <div className="metric-grid">
-                    <MetricTile label="Critical" value={String(auditCriticalTotal)} hint="Deletes, resets, revokes" />
-                    <MetricTile label="Warnings" value={String(auditWarningTotal)} hint="Updates, retries, proxy issues" />
-                    <MetricTile label="Info" value={String(auditInfoTotal)} hint="Read/list/login events" />
-                    <MetricTile label="Unique Actors" value={String(auditActorsTotal)} hint="Across retained audit data" />
-                  </div>
                 </section>
                 {metricUnknownTotal > 0 ? (
                   <section className="card">
@@ -4191,26 +4380,6 @@ function App() {
                         </div>
                       ))
                     )}
-                  </section>
-                ) : null}
-                {identity?.role === 'admin' ? (
-                  <section className="card">
-                    <div className="card-head"><h3>Security Actions</h3></div>
-                    <div className="row">
-                      <input value={resetUser} onChange={(e) => setResetUser(e.target.value)} placeholder="username" />
-                      <input value={resetTTL} onChange={(e) => setResetTTL(e.target.value)} placeholder="30m" />
-                      <button className="btn" onClick={createResetToken} disabled={loading}>Create Reset Token</button>
-                    </div>
-                    {resetToken ? (
-                      <div className="card" style={{ marginBottom: 0 }}>
-                        <div className="muted">Password reset token (time-limited):</div>
-                        <pre>{resetToken}</pre>
-                        <div className="row" style={{ marginTop: '.55rem', marginBottom: 0 }}>
-                          <input value={resetNewPassword} onChange={(e) => setResetNewPassword(e.target.value)} placeholder="new password" />
-                          <button className="btn" onClick={consumeResetToken} disabled={!resetNewPassword || loading}>Consume Token</button>
-                        </div>
-                      </div>
-                    ) : null}
                   </section>
                 ) : null}
               </aside>
@@ -6300,10 +6469,10 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
             </section>
           ) : null}
 
-          {tab === 'audit' ? (
+          {tab === 'strategicIntel' && strategicIntelTab === 'events' ? (
             <section className="logs-page">
               <div className="card">
-                <div className="card-head"><h3>LogCenter</h3></div>
+                <div className="card-head"><h3>Strategic Events</h3></div>
                 <div className="log-filter-grid">
                   <select value={logWindow} onChange={(e) => setLogWindow(e.target.value as '15m' | '1h' | '6h' | '24h' | '7d' | 'all')}>
                     <option value="15m">Last 15 minutes</option>
@@ -6340,11 +6509,16 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                     <option value="internal">Internal (LAN/loopback)</option>
                     <option value="external">External (internet)</option>
                   </select>
+                  <label className="check" style={{ minHeight: 38, display: 'inline-flex', alignItems: 'center' }}>
+                    <input type="checkbox" checked={logShowHardDrops} onChange={(e) => setLogShowHardDrops(e.target.checked)} />
+                    Show hard drops
+                  </label>
                   <input value={logTargetQuery} onChange={(e) => setLogTargetQuery(e.target.value)} placeholder="Target contains..." />
                   <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="Search action/meta/trace/path..." />
                 </div>
                 <div className="muted" style={{ marginBottom: '.6rem' }}>
                   Showing {filteredAudit.length} of {logsBaseByWindow.length} events in window.
+                  {!logShowHardDrops ? ' Hard-drop events are hidden.' : ''}
                 </div>
                 <div className="log-table-wrap">
                   <table className="log-table">
@@ -6371,7 +6545,7 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                         const src = extractSourceIP(e);
                         const trace = extractTraceID(e);
                         const meta = e.meta || '';
-                        const canBlock = identity?.role === 'admin' && !!src && !blockedIPs.some((b) => b.ip === src);
+                        const canBlock = identity?.role === 'admin' && !!src && !isLoopbackIP(src) && !blockedIPs.some((b) => b.ip === src);
                         return (
                           <tr key={e.id}>
                             <td>{new Date(e.createdAt).toLocaleString()}</td>
@@ -7017,44 +7191,6 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         </div>
       ) : null}
 
-      {identity && metricMapOpen ? (
-        <div className="overlay modal-overlay">
-          <div className="login-card modal-card geo-modal-card" style={{ maxWidth: '1280px', width: '98vw' }}>
-            <div className="modal-head">
-              <h3>Global Geo Map</h3>
-            </div>
-            <div className="row modal-controls">
-              <div className="muted">
-                {metricMapMode === 'live'
-                  ? `Live Trace ${metricLiveConnected ? 'connected' : 'disconnected'} · TTL 10s · Current filter: ${metricCountryFocus.toUpperCase()}`
-                  : metricMapMode === 'threat'
-                    ? `Threat Intel Map · ${metricThreatGeoAt ? `snapshot ${new Date(metricThreatGeoAt).toLocaleTimeString()}` : 'loading'} · Current filter: ${metricCountryFocus.toUpperCase()}`
-                  : `Click country bubbles to focus. Current filter: ${metricCountryFocus.toUpperCase()}`}
-              </div>
-              <select value={metricMapMode} onChange={(e) => setMetricMapMode(e.target.value === 'live' ? 'live' : e.target.value === 'threat' ? 'threat' : 'historical')}>
-                <option value="historical">Historical</option>
-                <option value="live">Live Trace</option>
-                <option value="threat">Threat Intel Map</option>
-              </select>
-              <button className="btn" onClick={() => setMetricCountryFocus('all')}>Reset Country Filter</button>
-              {metricMapMode === 'threat' ? (
-                <button className="btn" onClick={loadThreatGeoMap}>Refresh Threat Map</button>
-              ) : null}
-              <button className="btn" onClick={() => setMetricMapOpen(false)}>Close</button>
-            </div>
-            <div className="modal-body geo-modal-body">
-              {metricMapMode === 'live' ? (
-                <GeoLiveTraceMap points={metricLivePoints} onSelectCountry={(code) => setMetricCountryFocus(code)} />
-              ) : metricMapMode === 'threat' ? (
-                <GeoThreatIntelMap points={metricThreatGeo} countryFocus={metricCountryFocus} onSelectCountry={(code) => setMetricCountryFocus(code)} />
-              ) : (
-                <GeoScatterMap countries={metricFilteredCountries} onSelectCountry={(code) => setMetricCountryFocus(code)} />
-              )}
-            </div>
-          </div>
-        </div>
-      ) : null}
-
       <style>{`
         :root { --bg:${activeTheme.bg}; --surface:${activeTheme.surface}; --panel:${activeTheme.panel}; --panel-hover:${activeTheme.panelHover}; --border:${activeTheme.border}; --text:${activeTheme.text}; --text-dim:${activeTheme.textDim}; --accent:${activeTheme.accent}; --accent-hover:${activeTheme.accentHover}; --accent-active:${activeTheme.accentActive}; --accent-soft:${activeTheme.accentSoft}; --green:${activeTheme.success}; --red:${activeTheme.danger}; --input-bg:${activeTheme.inputBg}; --hero-a:${activeTheme.heroA}; --hero-b:${activeTheme.heroB}; --radius:12px; }
         * { box-sizing: border-box; }
@@ -7173,6 +7309,25 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .metric-problem-table th, .metric-problem-table td { white-space:normal; word-break:break-word; }
         .metric-center-page { grid-template-columns:minmax(0,1fr); }
         .metric-center-page .entity-side { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .geo-intel-page { grid-template-columns:minmax(0,1.9fr) minmax(120px,.32fr); }
+        .geo-intel-page .geo-map-wrap {
+          max-height:62vh;
+          min-height:360px;
+          overflow:hidden;
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          padding:.45rem;
+        }
+        .geo-intel-page .geo-map-svg {
+          width:100%;
+          height:100%;
+          max-height:58vh;
+        }
+        .geo-intel-page .entity-side {
+          grid-template-columns:minmax(0,1fr);
+          align-content:start;
+        }
         .metric-tile { background:var(--panel); border:1px solid var(--border); border-radius:11px; padding:.75rem; min-width:0; }
         .metric-label { color:var(--text-dim); font-size:.78rem; margin-bottom:.35rem; }
         .metric-value { font-size:1.2rem; font-weight:700; line-height:1.2; margin-bottom:.25rem; overflow-wrap:anywhere; word-break:break-word; }
@@ -7496,6 +7651,11 @@ function extractTraceID(e: Audit): string {
   const trace = parts.find((p) => p.startsWith('trace='));
   if (!trace) return '';
   return trace.slice('trace='.length).trim();
+}
+
+function isLoopbackIP(ip: string): boolean {
+  const raw = (ip || '').trim();
+  return raw === '127.0.0.1' || raw === '::1';
 }
 
 function extractTraceNeedles(query: string): string[] {

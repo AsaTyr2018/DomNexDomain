@@ -4650,6 +4650,10 @@ func (s *Service) IsIPBlocked(ctx context.Context, ip string) (bool, error) {
 }
 
 func (s *Service) UpsertBlockedIP(ctx context.Context, ip, reason string) error {
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed != nil && parsed.IsLoopback() {
+		return fmt.Errorf("loopback addresses cannot be blocked")
+	}
 	if err := s.store.UpsertBlockedIP(ctx, ip, reason); err != nil {
 		return err
 	}

@@ -2233,6 +2233,10 @@ func (s *Server) handleAddBlockedIP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid ip")
 		return
 	}
+	if ip.IsLoopback() {
+		writeErr(w, http.StatusBadRequest, "loopback addresses cannot be blocked")
+		return
+	}
 	if err := s.app.UpsertBlockedIP(r.Context(), ip.String(), strings.TrimSpace(in.Reason)); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
