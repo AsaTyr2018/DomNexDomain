@@ -80,6 +80,9 @@ type Service struct {
 	setupRestore     *backupSnapshot
 	backupRunMu      sync.Mutex
 	nft              *firewall.NftEnforcer
+	maintMu          sync.Mutex
+	maintReach       map[string]bool
+	maintCFMismatch  map[string]bool
 }
 
 type tiWindow struct {
@@ -583,6 +586,8 @@ func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dn
 		},
 		tiWin: map[string]tiWindow{},
 		nft:   firewall.NewNftEnforcer(),
+		maintReach:      map[string]bool{},
+		maintCFMismatch: map[string]bool{},
 	}
 	if svc.hostName == "" {
 		svc.hostName = "domnexdomain"
@@ -2437,6 +2442,20 @@ func (s *Service) UpdatePublicIP(ctx context.Context, ip string) error {
 		if err := s.dns.UpsertARecord(ctx, zoneID, "*."+d.Name, s.publicIP, false); err != nil {
 			s.log.Warn("dynDNS wildcard update failed", map[string]any{"domain": d.Name, "err": err.Error()})
 		}
+		hosts, hErr := s.store.ListHostsByDomainID(ctx, d.ID)
+		if hErr != nil {
+			s.log.Warn("dynDNS host list failed", map[string]any{"domain": d.Name, "err": hErr.Error()})
+			continue
+		}
+		for _, h := range hosts {
+			fqdn := strings.ToLower(strings.TrimSpace(h.FQDN))
+			if fqdn == "" {
+				continue
+			}
+			if err := s.dns.UpsertARecord(ctx, zoneID, fqdn, s.publicIP, false); err != nil {
+				s.log.Warn("dynDNS host update failed", map[string]any{"domain": d.Name, "host": fqdn, "err": err.Error()})
+			}
+		}
 	}
 	return nil
 }
@@ -2753,30 +2772,170 @@ func (s *Service) ensurePublicIPv4(ctx context.Context) (string, error) {
 }
 
 func (s *Service) StartPublicIPSync(ctx context.Context) {
-	timer := time.NewTimer(untilNextFullHour(time.Now()))
-	defer timer.Stop()
+	const syncInterval = 10 * time.Minute
+	// Run one sync immediately on startup so changes are applied without waiting
+	// for the first ticker interval.
+	s.syncPublicIPOnce(ctx)
+	ticker := time.NewTicker(syncInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-timer.C:
+		case <-ticker.C:
 			s.syncPublicIPOnce(ctx)
-			timer.Reset(untilNextFullHour(time.Now()))
 		}
 	}
 }
 
-func untilNextFullHour(now time.Time) time.Duration {
-	next := now.Truncate(time.Hour).Add(time.Hour)
-	d := next.Sub(now)
-	if d <= 0 {
-		return time.Hour
+func (s *Service) StartDNSMaintenance(ctx context.Context) {
+	const interval = 1 * time.Minute
+	s.runDNSMaintenanceOnce(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.runDNSMaintenanceOnce(ctx)
+		}
 	}
-	return d
+}
+
+func (s *Service) runDNSMaintenanceOnce(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, 55*time.Second)
+	defer cancel()
+
+	expectedIP, err := s.currentPublicIPv4(ctx)
+	if err != nil {
+		s.log.Warn("dns maintenance skipped: public ip unavailable", map[string]any{"err": err.Error()})
+		return
+	}
+	domains, err := s.store.ListDomains(ctx)
+	if err != nil {
+		s.log.Warn("dns maintenance skipped: domains unavailable", map[string]any{"err": err.Error()})
+		return
+	}
+	for _, d := range domains {
+		apexReach, apexObserved := dnsPointsToIP(ctx, d.Name, expectedIP)
+		s.recordReachabilityTransition(ctx, "apex:"+d.Name, d.Name, apexReach, expectedIP, apexObserved)
+
+		hosts, hErr := s.store.ListHostsByDomainID(ctx, d.ID)
+		if hErr != nil {
+			s.log.Warn("dns maintenance host list failed", map[string]any{"domain": d.Name, "err": hErr.Error()})
+			continue
+		}
+		for _, h := range hosts {
+			if strings.TrimSpace(h.FQDN) == "" {
+				continue
+			}
+			hostReach, hostObserved := dnsPointsToIP(ctx, h.FQDN, expectedIP)
+			s.recordReachabilityTransition(ctx, "host:"+h.FQDN, h.FQDN, hostReach, expectedIP, hostObserved)
+		}
+
+		if strings.ToLower(strings.TrimSpace(d.DNSMode)) != "cloudflare" {
+			continue
+		}
+		cf, ok := s.dns.(*dns.Cloudflare)
+		if !ok || cf == nil {
+			continue
+		}
+		zoneID, zErr := s.ensureDomainZoneID(ctx, d)
+		if zErr != nil {
+			s.log.Warn("dns maintenance cloudflare zone failed", map[string]any{"domain": d.Name, "err": zErr.Error()})
+			continue
+		}
+		names := make([]string, 0, len(hosts)+3)
+		names = append(names, d.Name, "*."+d.Name, "admin."+d.Name)
+		for _, h := range hosts {
+			if fqdn := strings.ToLower(strings.TrimSpace(h.FQDN)); fqdn != "" {
+				names = append(names, fqdn)
+			}
+		}
+		seen := map[string]bool{}
+		mismatchItems := []string{}
+		for _, n := range names {
+			n = strings.ToLower(strings.TrimSpace(n))
+			if n == "" || seen[n] {
+				continue
+			}
+			seen[n] = true
+			ips, lErr := cf.LookupARecordContents(ctx, zoneID, n)
+			if lErr != nil {
+				mismatchItems = append(mismatchItems, n+"=lookup_error")
+				continue
+			}
+			if !containsString(ips, expectedIP) {
+				obs := "-"
+				if len(ips) > 0 {
+					obs = strings.Join(ips, ",")
+				}
+				mismatchItems = append(mismatchItems, n+"="+obs)
+			}
+		}
+		hasMismatch := len(mismatchItems) > 0
+		mismatchKey := "cf:" + d.Name
+		mismatchChanged, _, _ := s.setMaintenanceBoolState(s.maintCFMismatch, mismatchKey, hasMismatch)
+		if !hasMismatch {
+			continue
+		}
+		if err := s.UpdatePublicIP(ctx, expectedIP); err != nil {
+			if mismatchChanged {
+				_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
+					Actor:  "system",
+					Action: "maintenance.cloudflare.update_failed",
+					Target: d.Name,
+					Meta:   "expected=" + expectedIP + ";records=" + strings.Join(mismatchItems, "|") + ";err=" + err.Error(),
+				})
+			}
+			s.log.Warn("dns maintenance cloudflare reconcile failed", map[string]any{"domain": d.Name, "err": err.Error()})
+			continue
+		}
+		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
+			Actor:  "system",
+			Action: "maintenance.cloudflare.domain_updated",
+			Target: d.Name,
+			Meta:   "expected=" + expectedIP + ";records=" + strings.Join(mismatchItems, "|"),
+		})
+	}
+}
+
+func dnsPointsToIP(ctx context.Context, name, expectedIP string) (bool, string) {
+	ips, _, err := resolveIPv4ListRobust(ctx, name)
+	if err != nil || len(ips) == 0 {
+		return false, "-"
+	}
+	observed := strings.Join(ips, ",")
+	return containsString(ips, expectedIP), observed
+}
+
+func (s *Service) recordReachabilityTransition(ctx context.Context, key, target string, reachable bool, expectedIP, observedIPs string) {
+	changed, _, _ := s.setMaintenanceBoolState(s.maintReach, key, reachable)
+	if !changed {
+		return
+	}
+	_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
+		Actor:  "system",
+		Action: "maintenance.reachability.changed",
+		Target: target,
+		Meta:   "reachable=" + strconv.FormatBool(reachable) + ";expected=" + expectedIP + ";observed=" + observedIPs,
+	})
+}
+
+func (s *Service) setMaintenanceBoolState(state map[string]bool, key string, next bool) (changed bool, prev bool, had bool) {
+	s.maintMu.Lock()
+	defer s.maintMu.Unlock()
+	prev, had = state[key]
+	if had && prev == next {
+		return false, prev, had
+	}
+	state[key] = next
+	return true, prev, had
 }
 
 func (s *Service) syncPublicIPOnce(parent context.Context) {
-	ctx, cancel := context.WithTimeout(parent, 12*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
 
 	detected, err := detectPublicIPv4(ctx)
@@ -2790,6 +2949,11 @@ func (s *Service) syncPublicIPOnce(parent context.Context) {
 		current = ""
 	}
 	if strings.TrimSpace(current) == strings.TrimSpace(detected) {
+		// Reconcile Cloudflare DNS even when IP did not change, so previous
+		// transient API/network failures are eventually healed automatically.
+		if err := s.UpdatePublicIP(ctx, detected); err != nil {
+			s.log.Warn("public IP sync reconcile failed", map[string]any{"err": err.Error(), "ip": detected})
+		}
 		return
 	}
 	if err := s.store.SetSetting(ctx, settingPublicIPv4, detected); err != nil {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -175,6 +176,25 @@ func (c *Cloudflare) CheckZoneAccess(ctx context.Context, zoneID string) error {
 		return fmt.Errorf("cloudflare zone access status=%d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (c *Cloudflare) LookupARecordContents(ctx context.Context, zoneID, name string) ([]string, error) {
+	if c.token == "" || zoneID == "" {
+		return nil, fmt.Errorf("cloudflare not configured")
+	}
+	recs, err := c.lookupARecords(ctx, zoneID, name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(recs))
+	for _, r := range recs {
+		v := strings.TrimSpace(r.Content)
+		if v == "" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 func (c *Cloudflare) ResolveZoneIDByName(ctx context.Context, zoneName string) (string, error) {

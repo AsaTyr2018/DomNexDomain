@@ -230,6 +230,7 @@ func main() {
 	go appSvc.StartGeoIPCompiler(ctx)
 	go appSvc.StartRetentionWorker(ctx)
 	go appSvc.StartPublicIPSync(ctx)
+	go appSvc.StartDNSMaintenance(ctx)
 	go appSvc.StartBackupScheduler(ctx)
 	go appSvc.StartLDAPUserSync(ctx)
 
