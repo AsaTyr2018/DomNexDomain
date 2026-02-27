@@ -673,7 +673,7 @@ function App() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const [loginUser, setLoginUser] = useState('admin');
+  const [loginUser, setLoginUser] = useState('');
   const [loginPass, setLoginPass] = useState('');
   const [loginOTP, setLoginOTP] = useState('');
   const [loginStep, setLoginStep] = useState<LoginStep>('username');
@@ -682,7 +682,7 @@ function App() {
   const [setupMode, setSetupMode] = useState<'fresh' | 'restore'>('fresh');
   const [setupStep, setSetupStep] = useState(1);
   const [setupOTS, setSetupOTS] = useState('');
-  const [setupAdminUser, setSetupAdminUser] = useState('admin');
+  const [setupAdminUser, setSetupAdminUser] = useState('');
   const [setupAdminPass, setSetupAdminPass] = useState('');
   const [setupAdminPass2, setSetupAdminPass2] = useState('');
   const [setupDomainName, setSetupDomainName] = useState('');
@@ -737,7 +737,7 @@ function App() {
   const [newTokenDomainIDs, setNewTokenDomainIDs] = useState<number[]>([]);
   const [newTokenTTL, setNewTokenTTL] = useState('720h');
   const [createdToken, setCreatedToken] = useState('');
-  const [resetUser, setResetUser] = useState('admin');
+  const [resetUser, setResetUser] = useState('');
   const [resetTTL, setResetTTL] = useState('30m');
   const [resetToken, setResetToken] = useState('');
   const [resetNewPassword, setResetNewPassword] = useState('');
@@ -6634,7 +6634,7 @@ Users: ${setupBackupMeta.users}`}</pre>
                 <div className="field-grid">
                   <div className="field">
                     <label>Admin Username</label>
-                    <input value={setupAdminUser} onChange={(e) => setSetupAdminUser(e.target.value.toLowerCase())} placeholder="admin" />
+                    <input value={setupAdminUser} onChange={(e) => setSetupAdminUser(e.target.value.toLowerCase())} placeholder="username" />
                   </div>
                   <div className="field">
                     <label>Admin Password</label>
