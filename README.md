@@ -26,7 +26,8 @@ It assumes your edge is reachable from the internet on the intended entry points
 
 - **Integrated edge stack**: reverse proxy, DNS automation, ACME, authn/authz, threat controls, metrics, logs.
 - **Security-first flow**: Threat Intel + WAF baseline + geo policy + traceable edge error handling.
-- **Operational clarity**: LogCenter and MetricCenter for investigation, traffic distribution, and policy feedback.
+- **Operational clarity**: Strategic Intel unifies events, telemetry, geo, and investigations for fast operator workflows.
+- **Resilience after WAN drops**: automatic public-IP reconciliation and Cloudflare DNS self-heal.
 - **Linux-native runtime**: statically linked Go binary, systemd deployment, no Node.js requirement in production.
 - **Pragmatic persistence**: SQLite + encrypted secrets for v1 simplicity.
 
@@ -36,6 +37,8 @@ It assumes your edge is reachable from the internet on the intended entry points
 - Optional HA per subdomain (`failover` / `round-robin`)
 - SSH Bastion gateway mode
 - Automated DNS + certificate workflows (Cloudflare-first)
+- Automated WAN-IP drift handling with Cloudflare reconciliation
+- 1-minute DNS maintenance loop for apex + subdomain reachability transitions
 - In-house MFA/2FA (TOTP) with per-role enforcement and recovery flow
 - Login hardening with staged auth flow and anti-enumeration behavior
 - Smart branded edge error pages with trace ID correlation
@@ -47,6 +50,7 @@ It assumes your edge is reachable from the internet on the intended entry points
 - Scoped API tokens (global/domain/system)
 - Data retention controls + daily purge jobs
 - Encrypted backup/restore pipeline with scheduled jobs and post-restore checks
+- Audit events for resilience operations (`network.public_ip.changed.auto`, `maintenance.reachability.changed`, `maintenance.cloudflare.domain_updated`)
 - Setup Assistant with OTS unlock and restore-first onboarding
 - UI style profiles (`Monolith`, `CyberMonolith`, `Custom`)
 
