@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import QRCode from 'qrcode';
 
@@ -721,6 +721,7 @@ function App() {
   const [hostWizardStep, setHostWizardStep] = useState(1);
   const [hostPreflight, setHostPreflight] = useState<HostPreflight | null>(null);
   const [hostPreflightRunning, setHostPreflightRunning] = useState(false);
+  const hostPreflightReadyRef = useRef(false);
   const [selectedHostID, setSelectedHostID] = useState<number | null>(null);
   const [detailUpstream, setDetailUpstream] = useState('');
   const [detailInsecureTLS, setDetailInsecureTLS] = useState(false);
@@ -1273,9 +1274,17 @@ function App() {
   }, [tab, domainWizardStep, domainName, domainProvider, domainZoneID]);
 
   useEffect(() => {
+    hostPreflightReadyRef.current = false;
+  }, [hostWizardStep, hostDomain, hostSub, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends, hostSSHBastion]);
+
+  useEffect(() => {
     if (tab !== 'hosts' || hostWizardStep !== 2 || !hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)) return;
+    if (hostPreflightReadyRef.current) return;
     void checkHostPreflight();
-    const t = window.setInterval(() => { void checkHostPreflight(); }, 4000);
+    const t = window.setInterval(() => {
+      if (hostPreflightReadyRef.current) return;
+      void checkHostPreflight();
+    }, 4000);
     return () => window.clearInterval(t);
   }, [tab, hostWizardStep, hostDomain, hostSub, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends, hostSSHBastion]);
 
@@ -1896,9 +1905,11 @@ function App() {
 
   const checkHostPreflight = async () => {
     if (!hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)) {
+      hostPreflightReadyRef.current = false;
       setHostPreflight(null);
       return;
     }
+    if (hostPreflightReadyRef.current) return;
     try {
       setHostPreflightRunning(true);
       const out = await api<HostPreflight>('/api/v1/hosts/preflight', {
@@ -1915,7 +1926,9 @@ function App() {
         }),
       });
       setHostPreflight(out);
+      if (out.ready) hostPreflightReadyRef.current = true;
     } catch (e) {
+      hostPreflightReadyRef.current = false;
       setHostPreflight(null);
       setError((e as Error).message);
     } finally {
@@ -4633,6 +4646,11 @@ function App() {
                         ) : null}
                         <button className="btn" onClick={() => setDomainWizardStep(2)} disabled={isReadOnlyRole || !domainName}>Next</button>
                       </div>
+                      {domainProvider === 'manual' ? (
+                        <div className="muted warn-note">
+                          Please note: this mode has no automation. Manual handling is required.
+                        </div>
+                      ) : null}
                       <div className="muted">Admin endpoint will be: <strong>{adminPreview}</strong></div>
                     </div>
                   ) : null}
@@ -5006,7 +5024,7 @@ function App() {
                     {hostWizardStep === 2 ? (
                       <div className="card" style={{ marginBottom: '.8rem' }}>
                         <div className="muted" style={{ marginBottom: '.5rem' }}>
-                          Checks run automatically every 4 seconds. Continue only when all checks are green.
+                          Checks run automatically every 4 seconds until green, then stop automatically. Continue only when all checks are green.
                         </div>
                         <div className="muted" style={{ marginBottom: '.5rem' }}>
                           Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled (self-signed accepted)' : 'enabled (strict verify)'}</strong> · Routing: <strong>{hostHAEnabled ? `HA (${hostHAMode})` : hostSSHBastion ? 'SSH Bastion' : 'Single Upstream'}</strong>
@@ -7734,6 +7752,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .muted { color:var(--text-dim); }
         .errtxt { color:#fca5a5; }
         .error { margin-bottom:1rem; background:#3a1a1a; border:1px solid #7f1d1d; color:#fecaca; padding:.7rem .9rem; border-radius:10px; }
+        .warn-note { margin:0 0 .55rem; color:#ffd89a; }
         .overlay { position:fixed; inset:0; z-index:10000; background:rgba(0,0,0,.5); display:grid; place-items:center; padding:1rem; }
         .modal-overlay { display:flex; align-items:center; justify-content:center; overflow:auto; }
         .auth-overlay {
