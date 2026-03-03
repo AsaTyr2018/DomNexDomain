@@ -797,9 +797,16 @@ func (s *Store) ListAPITokens(ctx context.Context, limit int) ([]model.APIToken,
 	return out, nil
 }
 
-func (s *Store) RevokeAPIToken(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM api_tokens WHERE id=?`, id)
-	return err
+func (s *Store) RevokeAPIToken(ctx context.Context, id int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM api_tokens WHERE id=?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *Store) GetAPITokenDomainIDs(ctx context.Context, tokenID int64) ([]int64, error) {

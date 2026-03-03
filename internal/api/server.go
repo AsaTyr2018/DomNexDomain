@@ -28,6 +28,7 @@ import (
 
 	"github.com/domnexdomain/domnexdomain/internal/app"
 	"github.com/domnexdomain/domnexdomain/internal/auth"
+	domcrypto "github.com/domnexdomain/domnexdomain/internal/crypto"
 	"github.com/domnexdomain/domnexdomain/internal/logx"
 	"github.com/domnexdomain/domnexdomain/internal/metrics"
 	"github.com/domnexdomain/domnexdomain/internal/model"
@@ -155,7 +156,6 @@ func (s *Server) Router() http.Handler {
 		pr.Post("/api/v1/dyndns", s.handleDynDNSUpdate)
 		pr.Post("/api/v1/secrets/cloudflare", s.handleSetCloudflareToken)
 		pr.Post("/api/v1/tokens", s.handleCreateToken)
-		pr.Get("/api/v1/tokens", s.handleListTokens)
 		pr.Delete("/api/v1/tokens/{id}", s.handleRevokeToken)
 		pr.Post("/api/v1/password-reset/create", s.handleCreatePasswordReset)
 		pr.Post("/api/v1/settings", s.handleSetSettings)
@@ -1994,6 +1994,8 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		Role        string   `json:"role"`
 		Scopes      []string `json:"scopes"`
 		DomainIDs   []int64  `json:"domainIds"`
+		ConfirmUnlimited bool   `json:"confirmUnlimited"`
+		ConfirmPassword  string `json:"confirmPassword"`
 		Permissions struct {
 			GlobalRead  bool `json:"globalRead"`
 			GlobalWrite bool `json:"globalWrite"`
@@ -2012,9 +2014,41 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "name required")
 		return
 	}
-	dur, err := time.ParseDuration(in.ExpiresIn)
-	if err != nil || dur <= 0 {
-		dur = 30 * 24 * time.Hour
+	var dur time.Duration
+	if strings.EqualFold(strings.TrimSpace(in.ExpiresIn), "unlimited") {
+		if !in.ConfirmUnlimited {
+			writeErr(w, http.StatusBadRequest, "unlimited ttl requires explicit confirmation")
+			return
+		}
+		if strings.TrimSpace(in.ConfirmPassword) == "" {
+			writeErr(w, http.StatusBadRequest, "password confirmation required for unlimited ttl")
+			return
+		}
+		if id.Type != "session" || id.UserID <= 0 {
+			writeErr(w, http.StatusForbidden, "unlimited ttl requires admin session login")
+			return
+		}
+		me, uErr := s.app.Store().GetUserByID(r.Context(), id.UserID)
+		if uErr != nil {
+			writeErr(w, http.StatusForbidden, "unable to validate password")
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(me.AuthProvider), "local") || strings.TrimSpace(me.PasswordHash) == "" {
+			writeErr(w, http.StatusForbidden, "unlimited ttl requires local admin account")
+			return
+		}
+		if !domcrypto.VerifyPassword(in.ConfirmPassword, me.PasswordHash) {
+			writeErr(w, http.StatusForbidden, "password confirmation failed")
+			return
+		}
+		// "Unlimited" is implemented as a very long-lived credential.
+		dur = 100 * 365 * 24 * time.Hour
+	} else {
+		var err error
+		dur, err = time.ParseDuration(in.ExpiresIn)
+		if err != nil || dur <= 0 {
+			dur = 30 * 24 * time.Hour
+		}
 	}
 	role := model.Role(in.Role)
 	if role == "" {
@@ -2071,6 +2105,28 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		scopeSet["dns:write"] = true
 		scopeSet["cert:write"] = true
 	}
+	// Persist explicit permission intent markers for accurate UI rendering.
+	if in.Permissions.GlobalRead && in.Permissions.GlobalWrite {
+		scopeSet["global:rw"] = true
+	} else if in.Permissions.GlobalWrite {
+		scopeSet["global:w"] = true
+	} else if in.Permissions.GlobalRead {
+		scopeSet["global:r"] = true
+	}
+	if in.Permissions.DomainRead && in.Permissions.DomainWrite {
+		scopeSet["domain:rw"] = true
+	} else if in.Permissions.DomainWrite {
+		scopeSet["domain:w"] = true
+	} else if in.Permissions.DomainRead {
+		scopeSet["domain:r"] = true
+	}
+	if in.Permissions.SystemRead && in.Permissions.SystemWrite {
+		scopeSet["system:rw"] = true
+	} else if in.Permissions.SystemWrite {
+		scopeSet["system:w"] = true
+	} else if in.Permissions.SystemRead {
+		scopeSet["system:r"] = true
+	}
 	scopeList := make([]string, 0, len(scopeSet))
 	for sc := range scopeSet {
 		scopeList = append(scopeList, sc)
@@ -2114,8 +2170,17 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-	if err := s.app.RevokeAPIToken(r.Context(), id); err != nil {
+	if id <= 0 {
+		writeErr(w, http.StatusBadRequest, "invalid token id")
+		return
+	}
+	ok, err := s.app.RevokeAPIToken(r.Context(), id)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "token not found")
 		return
 	}
 	actor := identityFrom(r.Context()).Username

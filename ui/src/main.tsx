@@ -11,7 +11,17 @@ type HostLiveCheck = { fqdn: string; dnsOk: boolean; dnsPointsToServer: boolean;
 type DomainLiveCheck = { domain: string; dnsMode: string; provider: string; serverIpv4?: string; apexDnsOk: boolean; apexPointsToServer: boolean; cloudflareApiOk: boolean; cloudflareZoneId?: string; cloudflareError?: string; hosts: HostLiveCheck[]; warnings?: string[]; overallOk: boolean };
 type Audit = { id: number; actor: string; action: string; target: string; meta?: string; sourceIp?: string; createdAt: string };
 type BlockedIP = { ip: string; reason?: string; createdAt: string; updatedAt: string };
-type APIToken = { id: number; name: string; tokenPrefix: string; scopes: string; role: string; expiresAt: string; lastUsedAt?: string };
+type APIToken = {
+  id: number;
+  name: string;
+  tokenPrefix: string;
+  scopes: string;
+  role: string;
+  domainIds?: number[];
+  createdAt?: string;
+  expiresAt: string;
+  lastUsedAt?: string;
+};
 type LogServerSyslogSettings = { enabled: boolean; protocol: 'udp' | 'tcp'; address: string; minLevel: 'info' | 'warn' | 'error'; appName: string };
 type LogServerHTTPSettings = { enabled: boolean; url: string; timeoutSec: number; minLevel: 'info' | 'warn' | 'error'; insecure: boolean };
 type LogServerTCPJSONSettings = { enabled: boolean; address: string; timeoutSec: number; minLevel: 'info' | 'warn' | 'error' };
@@ -736,7 +746,12 @@ function App() {
   const [newTokenSystemWrite, setNewTokenSystemWrite] = useState(false);
   const [newTokenDomainIDs, setNewTokenDomainIDs] = useState<number[]>([]);
   const [newTokenTTL, setNewTokenTTL] = useState('720h');
+  const [newTokenConfirmUnlimited, setNewTokenConfirmUnlimited] = useState(false);
+  const [newTokenConfirmPassword, setNewTokenConfirmPassword] = useState('');
   const [createdToken, setCreatedToken] = useState('');
+  const [apiTokenQuery, setApiTokenQuery] = useState('');
+  const [apiRevokePending, setApiRevokePending] = useState<APIToken | null>(null);
+  const [apiTokensLoadError, setApiTokensLoadError] = useState('');
   const [resetUser, setResetUser] = useState('');
   const [resetTTL, setResetTTL] = useState('30m');
   const [resetToken, setResetToken] = useState('');
@@ -967,8 +982,10 @@ function App() {
       try {
         const t = await api<{ items: APIToken[] }>('/api/v1/tokens');
         setTokens(t.items || []);
-      } catch {
+        setApiTokensLoadError('');
+      } catch (e) {
         setTokens([]);
+        setApiTokensLoadError((e as Error).message || 'failed to load token inventory');
       }
       try {
         const u = await api<{ items: ManagedUser[] }>('/api/v1/users');
@@ -2252,6 +2269,19 @@ function App() {
   }, [users, usersRoleFilter, usersProviderFilter, usersQuery]);
   const editingUser = editUserID ? (users.find((u) => u.id === editUserID) || null) : null;
   const configuredAdminFQDN = settings?.adminFqdn || (settingsBaseDomain ? `admin.${settingsBaseDomain}` : '');
+  const tokenTTLClass = useMemo<'short' | 'medium' | 'long' | 'unlimited'>(() => {
+    if (newTokenTTL === 'unlimited') return 'unlimited';
+    if (newTokenTTL === '120h' || newTokenTTL === '168h') return 'short';
+    if (newTokenTTL === '720h') return 'medium';
+    return 'long';
+  }, [newTokenTTL]);
+  const tokenTTLPreview = useMemo(() => {
+    if (newTokenTTL === '120h') return 'Expires in 5 days';
+    if (newTokenTTL === '168h') return 'Expires in 7 days';
+    if (newTokenTTL === '720h') return 'Expires in 30 days';
+    if (newTokenTTL === 'unlimited') return 'No practical expiry (100-year token)';
+    return 'Custom TTL';
+  }, [newTokenTTL]);
   const activeTheme = useMemo<ThemeVars>(() => {
     const selectedProfile = identity ? settingsStyleProfile : publicStyleProfile;
     const selectedCustom = identity ? settingsStyleCustom : publicStyleCustom;
@@ -2292,6 +2322,12 @@ function App() {
   useEffect(() => {
     if (!settingsLogServers.tcpJson.enabled) setLogTCPExpanded(false);
   }, [settingsLogServers.tcpJson.enabled]);
+  useEffect(() => {
+    if (newTokenTTL !== 'unlimited') {
+      setNewTokenConfirmUnlimited(false);
+      setNewTokenConfirmPassword('');
+    }
+  }, [newTokenTTL]);
   const sshRouteByFQDN = useMemo(() => {
     const out: Record<string, SSHBastionRoute> = {};
     sshRoutes.forEach((r) => { out[r.fqdn.toLowerCase()] = r; });
@@ -2640,6 +2676,16 @@ function App() {
 
   const createToken = async () => {
     if (isReadOnlyRole) return;
+    if (newTokenTTL === 'unlimited') {
+      if (!newTokenConfirmUnlimited) {
+        setError('Unlimited TTL requires explicit risk confirmation.');
+        return;
+      }
+      if (!newTokenConfirmPassword.trim()) {
+        setError('Unlimited TTL requires your current admin password.');
+        return;
+      }
+    }
     setLoading(true);
     setError('');
     try {
@@ -2660,10 +2706,14 @@ function App() {
             systemWrite: newTokenSystemWrite,
           },
           expiresIn: newTokenTTL,
+          confirmUnlimited: newTokenTTL === 'unlimited',
+          confirmPassword: newTokenTTL === 'unlimited' ? newTokenConfirmPassword : '',
         }),
       });
       setCreatedToken(out.token || '');
       setNewTokenDomainIDs([]);
+      setNewTokenConfirmUnlimited(false);
+      setNewTokenConfirmPassword('');
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -2684,6 +2734,12 @@ function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const revokeTokenConfirmed = async () => {
+    if (!apiRevokePending) return;
+    await revokeToken(apiRevokePending.id);
+    setApiRevokePending(null);
   };
 
   const createResetToken = async () => {
@@ -6145,24 +6201,57 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
           {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'api' ? (
             <section className="card">
               <div className="card-head"><h3>API Management</h3></div>
-              <div className="row">
-                <input value={newTokenName} onChange={(e) => setNewTokenName(e.target.value)} placeholder="token name" />
-                <select value={newTokenRole} onChange={(e) => setNewTokenRole(e.target.value)}>
-                  <option value="operator">operator</option>
-                  <option value="admin">admin</option>
-                  <option value="read-only">read-only</option>
-                </select>
-                <input value={newTokenTTL} onChange={(e) => setNewTokenTTL(e.target.value)} placeholder="720h" />
+              <div className="field-grid api-token-grid">
+                <div className="field">
+                  <label>Token Name</label>
+                  <input value={newTokenName} onChange={(e) => setNewTokenName(e.target.value)} placeholder="token name" />
+                  <div className="field-hint-spacer" aria-hidden="true">.</div>
+                </div>
+                <div className="field">
+                  <label>Role</label>
+                  <select value={newTokenRole} onChange={(e) => setNewTokenRole(e.target.value)}>
+                    <option value="operator">operator</option>
+                    <option value="admin">admin</option>
+                    <option value="read-only">read-only</option>
+                  </select>
+                  <div className="field-hint-spacer" aria-hidden="true">.</div>
+                </div>
+                <div className="field">
+                  <label>TTL</label>
+                  <select value={newTokenTTL} onChange={(e) => setNewTokenTTL(e.target.value)} className={`ttl-select ${tokenTTLClass}`}>
+                    <option value="120h">5 days</option>
+                    <option value="168h">1 week</option>
+                    <option value="720h">1 month</option>
+                    <option value="unlimited">Unlimited (high risk)</option>
+                  </select>
+                  <div className={`field-hint ttl-hint ${tokenTTLClass}`}>{tokenTTLPreview}</div>
+                </div>
               </div>
+              <div className="muted" style={{ marginBottom: '.3rem' }}>Permissions</div>
               <div className="domain-pills">
                 <label className="pill"><input type="checkbox" checked={newTokenGlobalRead} onChange={(e) => setNewTokenGlobalRead(e.target.checked)} /> global read</label>
                 <label className="pill"><input type="checkbox" checked={newTokenGlobalWrite} onChange={(e) => setNewTokenGlobalWrite(e.target.checked)} /> global write</label>
                 <label className="pill"><input type="checkbox" checked={newTokenDomainRead} onChange={(e) => setNewTokenDomainRead(e.target.checked)} /> domain read</label>
                 <label className="pill"><input type="checkbox" checked={newTokenDomainWrite} onChange={(e) => setNewTokenDomainWrite(e.target.checked)} /> domain write</label>
                 <label className="pill"><input type="checkbox" checked={newTokenSystemRead} onChange={(e) => setNewTokenSystemRead(e.target.checked)} /> system read</label>
-                <label className="pill"><input type="checkbox" checked={newTokenSystemWrite} onChange={(e) => setNewTokenSystemWrite(e.target.checked)} /> system write</label>
+                <label className="pill danger"><input type="checkbox" checked={newTokenSystemWrite} onChange={(e) => setNewTokenSystemWrite(e.target.checked)} /> system write <span className="badge err" style={{ marginLeft: '.3rem' }}>high impact</span></label>
               </div>
-              <div className="muted" style={{ marginBottom: '.3rem' }}>Domain scope (only when not global):</div>
+              {newTokenTTL === 'unlimited' ? (
+                <div className="card" style={{ marginBottom: '.8rem', borderColor: '#6b2222' }}>
+                  <div className="muted" style={{ marginBottom: '.4rem' }}>Unlimited token requires double confirmation.</div>
+                  <label className="pill" style={{ marginBottom: '.45rem' }}>
+                    <input type="checkbox" checked={newTokenConfirmUnlimited} onChange={(e) => setNewTokenConfirmUnlimited(e.target.checked)} />
+                    I understand the risk of an unlimited API token
+                  </label>
+                  <input
+                    type="password"
+                    value={newTokenConfirmPassword}
+                    onChange={(e) => setNewTokenConfirmPassword(e.target.value)}
+                    placeholder="Confirm with current admin password"
+                  />
+                </div>
+              ) : null}
+              <div className="muted" style={{ marginBottom: '.3rem' }}>Domain scope (only when not global)</div>
               <div className="domain-pills">
                 {domains.map((d) => (
                   <label key={d.id} className="pill">
@@ -6173,7 +6262,18 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
               </div>
               <div className="row">
                 <input value={newTokenScopes} onChange={(e) => setNewTokenScopes(e.target.value)} placeholder="additional scopes comma-separated (optional)" />
-                <button className="btn" onClick={createToken} disabled={loading || !newTokenName || isReadOnlyRole}>Create Token</button>
+                <button
+                  className="btn"
+                  onClick={createToken}
+                  disabled={
+                    loading
+                    || !newTokenName
+                    || isReadOnlyRole
+                    || (newTokenTTL === 'unlimited' && (!newTokenConfirmUnlimited || !newTokenConfirmPassword.trim()))
+                  }
+                >
+                  Create Token
+                </button>
               </div>
               {createdToken ? (
                 <div className="card" style={{ marginBottom: '.8rem' }}>
@@ -6181,12 +6281,89 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                   <pre>{createdToken}</pre>
                 </div>
               ) : null}
-              <pre>{JSON.stringify(tokens, null, 2)}</pre>
-              <div className="row">
-                {tokens.map((t) => (
-                  <button key={t.id} className="btn" onClick={() => revokeToken(t.id)} disabled={isReadOnlyRole}>Revoke {t.name} ({t.tokenPrefix})</button>
-                ))}
+              <div className="row" style={{ alignItems: 'center', marginBottom: '.35rem' }}>
+                <strong>Token Inventory</strong>
+                <input value={apiTokenQuery} onChange={(e) => setApiTokenQuery(e.target.value)} placeholder="Filter by name, prefix, role, scope" />
               </div>
+              <div className="row" style={{ alignItems: 'center', gap: '.45rem', marginBottom: '.45rem' }}>
+                <span className="muted">Legend</span>
+                <span className="scope-badge read">Read</span>
+                <span className="scope-badge write">Write</span>
+                <span className="scope-badge rw">Read + Write</span>
+              </div>
+              <div className="log-table-wrap" style={{ maxHeight: '44vh' }}>
+                <table className="log-table user-table-compact">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Description</th>
+                      <th>Prefix</th>
+                      <th>Rights</th>
+                      <th>Domain Scope</th>
+                      <th>Last Used</th>
+                      <th>Expires</th>
+                      <th>Created</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tokens
+                      .filter((t) => {
+                        const q = apiTokenQuery.trim().toLowerCase();
+                        if (!q) return true;
+                        return `${t.name} ${t.tokenPrefix} ${t.scopes} ${t.role}`.toLowerCase().includes(q);
+                      })
+                      .map((t) => (
+                        <tr key={`token-${t.id}`}>
+                          <td><code>{t.id}</code></td>
+                          <td>{t.name}</td>
+                          <td><code>{t.tokenPrefix}</code></td>
+                          <td style={{ maxWidth: '20rem' }}>
+                            {(() => {
+                              const scopes = parseTokenScopes(t.scopes || '');
+                              const globalAccess = tokenScopeAccess(scopes, 'global');
+                              const domainAccess = tokenScopeAccess(scopes, 'domain');
+                              const systemAccess = tokenScopeAccess(scopes, 'system');
+                              return (
+                                <div className="token-scope-grid">
+                                  <span className="muted token-scope-label">Global</span>
+                                  <span className={`scope-badge ${globalAccess}`}>{scopeBadgeLabel(globalAccess)}</span>
+                                  <span className="muted token-scope-label">Domain</span>
+                                  <span className={`scope-badge ${domainAccess}`}>{scopeBadgeLabel(domainAccess)}</span>
+                                  <span className="muted token-scope-label">System</span>
+                                  <span className={`scope-badge ${systemAccess}`}>{scopeBadgeLabel(systemAccess)}</span>
+                                </div>
+                              );
+                            })()}
+                          </td>
+                          <td>
+                            {((t.domainIds || []).length === 0)
+                              ? <span className="badge ok">global</span>
+                              : (
+                                <div className="muted" style={{ whiteSpace: 'normal' }}>
+                                  {(t.domainIds || [])
+                                    .map((id) => domains.find((d) => d.id === id)?.name || `#${id}`)
+                                    .join(', ')}
+                                </div>
+                              )}
+                          </td>
+                          <td>{t.lastUsedAt ? formatDateTime(t.lastUsedAt) : <span className="muted">never</span>}</td>
+                          <td>{t.expiresAt ? formatDateTime(t.expiresAt) : '-'}</td>
+                          <td>{formatDateTime(t.createdAt || '')}</td>
+                          <td><button className="btn danger" onClick={() => setApiRevokePending(t)} disabled={isReadOnlyRole || loading}>Revoke</button></td>
+                        </tr>
+                      ))}
+                    {tokens.filter((t) => {
+                      const q = apiTokenQuery.trim().toLowerCase();
+                      if (!q) return true;
+                      return `${t.name} ${t.tokenPrefix} ${t.scopes} ${t.role}`.toLowerCase().includes(q);
+                    }).length === 0 ? (
+                      <tr><td colSpan={9} className="muted" style={{ padding: '.9rem' }}>No tokens match your filter.</td></tr>
+                    ) : null}
+                  </tbody>
+                </table>
+              </div>
+              {apiTokensLoadError ? <div className="muted danger" style={{ marginTop: '.5rem' }}>Token inventory load failed: {apiTokensLoadError}</div> : null}
             </section>
           ) : null}
 
@@ -7191,6 +7368,26 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         </div>
       ) : null}
 
+      {apiRevokePending ? (
+        <div className="overlay modal-overlay">
+          <div className="login-card modal-card" style={{ maxWidth: '560px', width: '94vw' }}>
+            <div className="modal-head">
+              <h3>Revoke API Token</h3>
+            </div>
+            <div className="muted" style={{ marginBottom: '.65rem' }}>
+              Revoke token <strong>{apiRevokePending.name}</strong> ({apiRevokePending.tokenPrefix})?
+            </div>
+            <div className="muted" style={{ marginBottom: '.75rem' }}>
+              This action is immediate and cannot be undone.
+            </div>
+            <div className="row" style={{ marginBottom: 0 }}>
+              <button className="btn danger" onClick={revokeTokenConfirmed} disabled={loading || isReadOnlyRole}>Revoke Token</button>
+              <button className="btn" onClick={() => setApiRevokePending(null)} disabled={loading}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       <style>{`
         :root { --bg:${activeTheme.bg}; --surface:${activeTheme.surface}; --panel:${activeTheme.panel}; --panel-hover:${activeTheme.panelHover}; --border:${activeTheme.border}; --text:${activeTheme.text}; --text-dim:${activeTheme.textDim}; --accent:${activeTheme.accent}; --accent-hover:${activeTheme.accentHover}; --accent-active:${activeTheme.accentActive}; --accent-soft:${activeTheme.accentSoft}; --green:${activeTheme.success}; --red:${activeTheme.danger}; --input-bg:${activeTheme.inputBg}; --hero-a:${activeTheme.heroA}; --hero-b:${activeTheme.heroB}; --radius:12px; }
         * { box-sizing: border-box; }
@@ -7378,6 +7575,22 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .field { display:grid; gap:.35rem; margin-bottom:.8rem; min-width:0; }
         .field > label { font-size:.78rem; color:var(--text-dim); letter-spacing:.02em; }
         .field-grid { display:grid; gap:.6rem; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); margin-bottom:.8rem; }
+        .api-token-grid .field {
+          margin-bottom:0;
+          display:grid;
+          grid-template-rows:auto 2.5rem 1rem;
+          gap:.28rem;
+          align-content:start;
+        }
+        .api-token-grid .field input,
+        .api-token-grid .field select {
+          height:2.5rem;
+          padding-top:0;
+          padding-bottom:0;
+          line-height:2.5rem;
+        }
+        .field-hint { min-height:1rem; font-size:.72rem; line-height:1rem; margin-top:0; }
+        .field-hint-spacer { min-height:1rem; margin-top:0; visibility:hidden; user-select:none; }
         .users-page { grid-template-columns:minmax(0,1fr); }
         .user-ops-filters { grid-template-columns:minmax(180px,.8fr) minmax(220px,1.2fr) auto; align-items:center; }
         .user-ops-filters .row { justify-content:flex-end; }
@@ -7460,6 +7673,15 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .check { display:flex; align-items:center; gap:.5rem; margin-bottom:.5rem; color:var(--text-dim); }
         .domain-pills { display:flex; flex-wrap:wrap; gap:.45rem; margin:.4rem 0 .8rem; }
         .pill { display:flex; align-items:center; gap:.35rem; background:#111118; border:1px solid var(--border); border-radius:999px; padding:.3rem .6rem; color:var(--text-dim); }
+        .pill.danger { border-color:#6b2222; background:#2e1414; color:#ffd2d2; }
+        .ttl-select.short { border-color:#1d5a45; box-shadow:inset 0 0 0 1px rgba(29,90,69,.2); }
+        .ttl-select.medium { border-color:#6b4d19; box-shadow:inset 0 0 0 1px rgba(107,77,25,.2); }
+        .ttl-select.long { border-color:#7a4f11; box-shadow:inset 0 0 0 1px rgba(122,79,17,.2); }
+        .ttl-select.unlimited { border-color:#6b2222; box-shadow:inset 0 0 0 1px rgba(107,34,34,.25); }
+        .ttl-hint.short { color:#9df3cb; }
+        .ttl-hint.medium { color:#ffd89a; }
+        .ttl-hint.long { color:#f6ba74; }
+        .ttl-hint.unlimited { color:#ffb3b3; font-weight:600; }
         ol { margin-top:.2rem; margin-bottom:.8rem; padding-left:1.2rem; }
         pre { margin:0; background:#101015; border:1px solid var(--border); border-radius:10px; padding:.75rem; overflow:auto; }
         .host { display:flex; justify-content:space-between; align-items:flex-start; gap:.6rem; border-top:1px solid var(--border); padding:.55rem 0; font-size:.9rem; }
@@ -7497,6 +7719,16 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .badge.ok { background:#103227; border-color:#1d5a45; color:#9df3cb; }
         .badge.warn { background:#3a2a0f; border-color:#6b4d19; color:#ffd89a; }
         .badge.err { background:#3a1717; border-color:#6b2222; color:#ffb3b3; }
+        .token-scope-grid { display:grid; grid-template-columns:auto auto; gap:.18rem .45rem; align-items:center; }
+        .token-scope-label { font-size:.72rem; }
+        .scope-badge { font-size:.72rem; font-weight:700; line-height:1; padding:.22rem .5rem; border-radius:999px; color:#fff; display:inline-flex; align-items:center; justify-content:center; min-width:2.1rem; border:1px solid transparent; transition:background .15s ease; }
+        .scope-badge.read { background:#2563EB; border-color:#1D4ED8; }
+        .scope-badge.read:hover { background:#1D4ED8; }
+        .scope-badge.write { background:#F97316; border-color:#EA580C; }
+        .scope-badge.write:hover { background:#EA580C; }
+        .scope-badge.rw { background:#7C3AED; border-color:#6D28D9; }
+        .scope-badge.rw:hover { background:#6D28D9; }
+        .scope-badge.none { background:#2a2c33; border-color:#3f4450; color:#b6bcc8; }
         .ti-tier-col { min-width:160px; white-space:nowrap; }
         .ti-feed-col { min-width:260px; word-break:break-word; }
         .muted { color:var(--text-dim); }
@@ -7587,6 +7819,55 @@ function threatDecisionBadge(decision: string): { cls: 'ok' | 'warn' | 'err'; la
   if (d.includes('check')) return { cls: 'warn', label: 'Check' };
   if (d.includes('monitor') || d.includes('observe')) return { cls: 'ok', label: 'Monitor' };
   return { cls: 'ok', label: 'Other' };
+}
+
+type TokenScopeAccess = 'none' | 'read' | 'write' | 'rw';
+
+function parseTokenScopes(raw: string): Set<string> {
+  return new Set(
+    String(raw || '')
+      .split(',')
+      .map((v) => v.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+function tokenScopeAccess(scopes: Set<string>, group: 'global' | 'domain' | 'system'): TokenScopeAccess {
+  // Preferred: explicit intent markers persisted by token creation flow.
+  if (scopes.has(`${group}:rw`)) return 'rw';
+  if (scopes.has(`${group}:w`)) return 'write';
+  if (scopes.has(`${group}:r`)) return 'read';
+
+  // Backward-compatible fallback for older tokens without intent markers.
+  if (group === 'global') {
+    const canRead = scopes.has('global:read');
+    const canWrite = scopes.has('global:write');
+    if (canRead && canWrite) return 'rw';
+    if (canWrite) return 'write';
+    if (canRead) return 'read';
+    return 'none';
+  }
+  if (group === 'domain') {
+    const canRead = scopes.has('domains:read') || scopes.has('hosts:read');
+    const canWrite = scopes.has('domains:write') || scopes.has('hosts:write') || scopes.has('dns:write') || scopes.has('cert:write');
+    if (canWrite && canRead) return 'rw';
+    if (canWrite) return 'write';
+    if (canRead) return 'read';
+    return 'none';
+  }
+  const canRead = scopes.has('system:read') || scopes.has('settings:read') || scopes.has('audit:read') || scopes.has('users:read') || scopes.has('tokens:read');
+  const canWrite = scopes.has('system:write') || scopes.has('settings:write') || scopes.has('reload:write') || scopes.has('users:write') || scopes.has('tokens:write');
+  if (canRead && canWrite) return 'rw';
+  if (canWrite) return 'write';
+  if (canRead) return 'read';
+  return 'none';
+}
+
+function scopeBadgeLabel(access: TokenScopeAccess): string {
+  if (access === 'rw') return 'R/W';
+  if (access === 'write') return 'W';
+  if (access === 'read') return 'R';
+  return '-';
 }
 
 function threatDecisionList(decisions: string): string[] {

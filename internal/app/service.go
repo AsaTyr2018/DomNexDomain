@@ -584,8 +584,8 @@ func New(cfg config.Config, st *store.Store, ks *crypto.Keystore, dnsProvider dn
 			Allowlist:        map[string]bool{},
 			FeedByIP:         map[string][]string{},
 		},
-		tiWin: map[string]tiWindow{},
-		nft:   firewall.NewNftEnforcer(),
+		tiWin:           map[string]tiWindow{},
+		nft:             firewall.NewNftEnforcer(),
 		maintReach:      map[string]bool{},
 		maintCFMismatch: map[string]bool{},
 	}
@@ -3423,7 +3423,7 @@ func (s *Service) ListAPITokens(ctx context.Context, limit int) ([]model.APIToke
 	return s.store.ListAPITokens(ctx, limit)
 }
 
-func (s *Service) RevokeAPIToken(ctx context.Context, id int64) error {
+func (s *Service) RevokeAPIToken(ctx context.Context, id int64) (bool, error) {
 	return s.store.RevokeAPIToken(ctx, id)
 }
 
