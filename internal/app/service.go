@@ -2442,6 +2442,9 @@ func (s *Service) UpdatePublicIP(ctx context.Context, ip string) error {
 		if err := s.dns.UpsertARecord(ctx, zoneID, "*."+d.Name, s.publicIP, false); err != nil {
 			s.log.Warn("dynDNS wildcard update failed", map[string]any{"domain": d.Name, "err": err.Error()})
 		}
+		if err := s.dns.UpsertARecord(ctx, zoneID, "admin."+d.Name, s.publicIP, false); err != nil {
+			s.log.Warn("dynDNS admin update failed", map[string]any{"domain": d.Name, "err": err.Error()})
+		}
 		hosts, hErr := s.store.ListHostsByDomainID(ctx, d.ID)
 		if hErr != nil {
 			s.log.Warn("dynDNS host list failed", map[string]any{"domain": d.Name, "err": hErr.Error()})
@@ -2855,6 +2858,7 @@ func (s *Service) runDNSMaintenanceOnce(parent context.Context) {
 		}
 		seen := map[string]bool{}
 		mismatchItems := []string{}
+		mismatchNames := []string{}
 		for _, n := range names {
 			n = strings.ToLower(strings.TrimSpace(n))
 			if n == "" || seen[n] {
@@ -2872,6 +2876,7 @@ func (s *Service) runDNSMaintenanceOnce(parent context.Context) {
 					obs = strings.Join(ips, ",")
 				}
 				mismatchItems = append(mismatchItems, n+"="+obs)
+				mismatchNames = append(mismatchNames, n)
 			}
 		}
 		hasMismatch := len(mismatchItems) > 0
@@ -2880,18 +2885,52 @@ func (s *Service) runDNSMaintenanceOnce(parent context.Context) {
 		if !hasMismatch {
 			continue
 		}
-		if err := s.UpdatePublicIP(ctx, expectedIP); err != nil {
+		updateErrs := []string{}
+		for _, n := range mismatchNames {
+			if err := cf.UpsertARecord(ctx, zoneID, n, expectedIP, false); err != nil {
+				updateErrs = append(updateErrs, n+":"+err.Error())
+			}
+		}
+		if len(updateErrs) > 0 {
 			if mismatchChanged {
 				_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
 					Actor:  "system",
 					Action: "maintenance.cloudflare.update_failed",
 					Target: d.Name,
-					Meta:   "expected=" + expectedIP + ";records=" + strings.Join(mismatchItems, "|") + ";err=" + err.Error(),
+					Meta:   "expected=" + expectedIP + ";records=" + strings.Join(mismatchItems, "|") + ";err=" + strings.Join(updateErrs, "|"),
 				})
 			}
-			s.log.Warn("dns maintenance cloudflare reconcile failed", map[string]any{"domain": d.Name, "err": err.Error()})
+			s.log.Warn("dns maintenance cloudflare reconcile failed", map[string]any{"domain": d.Name, "err": strings.Join(updateErrs, "|")})
 			continue
 		}
+
+		postMismatch := []string{}
+		for _, n := range mismatchNames {
+			ips, lErr := cf.LookupARecordContents(ctx, zoneID, n)
+			if lErr != nil || !containsString(ips, expectedIP) {
+				obs := "-"
+				if len(ips) > 0 {
+					obs = strings.Join(ips, ",")
+				}
+				if lErr != nil {
+					obs = "lookup_error"
+				}
+				postMismatch = append(postMismatch, n+"="+obs)
+			}
+		}
+		if len(postMismatch) > 0 {
+			if mismatchChanged {
+				_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
+					Actor:  "system",
+					Action: "maintenance.cloudflare.update_failed",
+					Target: d.Name,
+					Meta:   "expected=" + expectedIP + ";records=" + strings.Join(postMismatch, "|") + ";err=post_verify_mismatch",
+				})
+			}
+			s.log.Warn("dns maintenance cloudflare reconcile post-verify mismatch", map[string]any{"domain": d.Name, "records": strings.Join(postMismatch, "|")})
+			continue
+		}
+
 		_ = s.store.AddAuditEvent(ctx, model.AuditEvent{
 			Actor:  "system",
 			Action: "maintenance.cloudflare.domain_updated",
