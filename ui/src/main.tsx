@@ -5,7 +5,8 @@ import QRCode from 'qrcode';
 type Identity = { username: string; role: string; type: string };
 type Domain = { id: number; name: string; dnsMode?: string; certMode?: string; provider?: string; zoneId?: string; status?: string };
 type HABackend = { name: string; url: string };
-type Host = { id: number; fqdn: string; upstreamUrl: string; insecureTls?: boolean; haEnabled?: boolean; haMode?: string; haBackends?: HABackend[]; authEnabled?: boolean; authUser?: string; geoMode?: string; geoCountries?: string[]; state: string; errorReason?: string };
+type HostConnectionProfile = 'http' | 'streaming';
+type Host = { id: number; fqdn: string; connectionProfile?: HostConnectionProfile; upstreamUrl: string; insecureTls?: boolean; haEnabled?: boolean; haMode?: string; haBackends?: HABackend[]; authEnabled?: boolean; authUser?: string; geoMode?: string; geoCountries?: string[]; state: string; errorReason?: string };
 type HostDiagnostic = { fqdn: string; dnsRecords: string[]; httpStatus: number; httpsStatus: number; tlsOk: boolean; certSubject: string; certIssuer: string; certNotAfter: string; certDaysLeft: number; haEnabled?: boolean; haMode?: string; haOnline?: number; haTotal?: number; haOffline?: string[]; error?: string };
 type HostLiveCheck = { fqdn: string; dnsOk: boolean; dnsPointsToServer: boolean; httpReachable: boolean; httpsReachable: boolean; tlsOk: boolean; certDaysLeft: number; cloudflareRecordFound: boolean; error?: string };
 type DomainLiveCheck = { domain: string; dnsMode: string; provider: string; serverIpv4?: string; apexDnsOk: boolean; apexPointsToServer: boolean; cloudflareApiOk: boolean; cloudflareZoneId?: string; cloudflareError?: string; hosts: HostLiveCheck[]; warnings?: string[]; overallOk: boolean };
@@ -260,6 +261,45 @@ type ThemeVars = {
 const SSH_BASTION_DEFAULT_UPSTREAM = 'http://127.0.0.1:8443';
 const SSH_BASTION_DEFAULT_TARGET_HOST = '127.0.0.1';
 const SSH_BASTION_DEFAULT_TARGET_PORT = 22;
+const TAB_VALUES: readonly Tab[] = ['dashboard', 'strategicIntel', 'threatIntel', 'domains', 'hosts', 'backup', 'users', 'settings', 'api', 'ssh', 'account', 'accessControl', 'integrations', 'help'];
+const STRATEGIC_TAB_VALUES: readonly StrategicIntelTab[] = ['overview', 'events', 'telemetry', 'geo', 'investigations', 'notifications'];
+const SETTINGS_TAB_VALUES: readonly SettingsTab[] = ['general', 'security', 'threatintel', 'idp', 'mfa', 'logservers', 'geoip', 'appearance', 'advanced'];
+const IDENTITY_TAB_VALUES: readonly IdentityTab[] = ['users', 'groups', 'matrix'];
+const BACKUP_TAB_VALUES: readonly BackupTab[] = ['general', 'browser', 'settings', 'manual'];
+
+type UIRouteState = {
+  tab: Tab;
+  strategicIntelTab: StrategicIntelTab;
+  settingsTab: SettingsTab;
+  identityTab: IdentityTab;
+  backupTab: BackupTab;
+};
+
+function parseUIRouteState(): UIRouteState {
+  const defaults: UIRouteState = {
+    tab: 'dashboard',
+    strategicIntelTab: 'overview',
+    settingsTab: 'general',
+    identityTab: 'users',
+    backupTab: 'general',
+  };
+  if (typeof window === 'undefined') return defaults;
+  const rawHash = String(window.location.hash || '').replace(/^#/, '');
+  if (!rawHash) return defaults;
+  const params = new URLSearchParams(rawHash.startsWith('?') ? rawHash.slice(1) : rawHash);
+  const tab = params.get('tab') as Tab | null;
+  const strategic = params.get('si') as StrategicIntelTab | null;
+  const settings = params.get('st') as SettingsTab | null;
+  const identity = params.get('idtab') as IdentityTab | null;
+  const backup = params.get('bt') as BackupTab | null;
+  return {
+    tab: tab && TAB_VALUES.includes(tab) ? tab : defaults.tab,
+    strategicIntelTab: strategic && STRATEGIC_TAB_VALUES.includes(strategic) ? strategic : defaults.strategicIntelTab,
+    settingsTab: settings && SETTINGS_TAB_VALUES.includes(settings) ? settings : defaults.settingsTab,
+    identityTab: identity && IDENTITY_TAB_VALUES.includes(identity) ? identity : defaults.identityTab,
+    backupTab: backup && BACKUP_TAB_VALUES.includes(backup) ? backup : defaults.backupTab,
+  };
+}
 const defaultLogServers = (): LogServerSettings => ({
   syslog: { enabled: false, protocol: 'udp', address: '', minLevel: 'info', appName: 'DomNexDomain' },
   http: { enabled: false, url: '', timeoutSec: 4, minLevel: 'warn', insecure: false },
@@ -602,8 +642,9 @@ class RootErrorBoundary extends React.Component<{ children: React.ReactNode }, {
 }
 
 function App() {
-  const [tab, setTab] = useState<Tab>('dashboard');
-  const [strategicIntelTab, setStrategicIntelTab] = useState<StrategicIntelTab>('overview');
+  const initialRoute = useMemo(() => parseUIRouteState(), []);
+  const [tab, setTab] = useState<Tab>(initialRoute.tab);
+  const [strategicIntelTab, setStrategicIntelTab] = useState<StrategicIntelTab>(initialRoute.strategicIntelTab);
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [dashboardLayout, setDashboardLayout] = useState<DashboardLayout>(defaultDashboardLayout());
   const [dashboardTabID, setDashboardTabID] = useState('minimal');
@@ -666,7 +707,7 @@ function App() {
   const [identityGroups, setIdentityGroups] = useState<PermissionGroupView[]>([]);
   const [identityPermCatalog, setIdentityPermCatalog] = useState<PermissionCatalogItem[]>([]);
   const [identityMatrix, setIdentityMatrix] = useState<PermissionMatrixRow[]>([]);
-  const [identityTab, setIdentityTab] = useState<IdentityTab>('users');
+  const [identityTab, setIdentityTab] = useState<IdentityTab>(initialRoute.identityTab);
   const [domainChecks, setDomainChecks] = useState<Record<number, DomainLiveCheck>>({});
   const [trafficOverview, setTrafficOverview] = useState<TrafficOverview | null>(null);
   const [selectedHostTraffic, setSelectedHostTraffic] = useState<HostTrafficDetails | null>(null);
@@ -712,6 +753,7 @@ function App() {
   const [domainPreflightRunning, setDomainPreflightRunning] = useState(false);
   const [hostDomain, setHostDomain] = useState('');
   const [hostSub, setHostSub] = useState('');
+  const [hostConnectionProfile, setHostConnectionProfile] = useState<HostConnectionProfile>('http');
   const [hostUpstream, setHostUpstream] = useState('http://127.0.0.1:3000');
   const [hostSSHBastion, setHostSSHBastion] = useState(false);
   const [hostInsecureTLS, setHostInsecureTLS] = useState(false);
@@ -723,6 +765,7 @@ function App() {
   const [hostPreflightRunning, setHostPreflightRunning] = useState(false);
   const hostPreflightReadyRef = useRef(false);
   const [selectedHostID, setSelectedHostID] = useState<number | null>(null);
+  const [detailConnectionProfile, setDetailConnectionProfile] = useState<HostConnectionProfile>('http');
   const [detailUpstream, setDetailUpstream] = useState('');
   const [detailInsecureTLS, setDetailInsecureTLS] = useState(false);
   const [detailHAEnabled, setDetailHAEnabled] = useState(false);
@@ -806,10 +849,10 @@ function App() {
   const [backupFTPPass, setBackupFTPPass] = useState('');
   const [backupArchives, setBackupArchives] = useState<BackupArchive[]>([]);
   const [backupStats, setBackupStats] = useState<BackupStats>({ totalArchives: 0, localArchives: 0, ftpArchives: 0 });
-  const [backupTab, setBackupTab] = useState<BackupTab>('general');
+  const [backupTab, setBackupTab] = useState<BackupTab>(initialRoute.backupTab);
   const [timeSyncStatus, setTimeSyncStatus] = useState<TimeSyncStatus | null>(null);
   const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general');
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>(initialRoute.settingsTab);
   const [publicStyleProfile, setPublicStyleProfile] = useState<StyleProfile>('monolith');
   const [publicStyleCustom, setPublicStyleCustom] = useState('');
   const [settingsMessage, setSettingsMessage] = useState('');
@@ -1257,6 +1300,32 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const params = new URLSearchParams();
+    params.set('tab', tab);
+    if (tab === 'strategicIntel') params.set('si', strategicIntelTab);
+    if (tab === 'settings') params.set('st', settingsTab);
+    if (tab === 'users') params.set('idtab', identityTab);
+    if (tab === 'backup') params.set('bt', backupTab);
+    const nextHash = params.toString();
+    const currentHash = String(window.location.hash || '').replace(/^#/, '').replace(/^\?/, '');
+    if (currentHash === nextHash) return;
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${nextHash}`);
+  }, [tab, strategicIntelTab, settingsTab, identityTab, backupTab]);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      const r = parseUIRouteState();
+      setTab(r.tab);
+      setStrategicIntelTab(r.strategicIntelTab);
+      setSettingsTab(r.settingsTab);
+      setIdentityTab(r.identityTab);
+      setBackupTab(r.backupTab);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
+  useEffect(() => {
     if (domains.length === 0) {
       setHostDomain('');
       return;
@@ -1275,7 +1344,7 @@ function App() {
 
   useEffect(() => {
     hostPreflightReadyRef.current = false;
-  }, [hostWizardStep, hostDomain, hostSub, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends, hostSSHBastion]);
+  }, [hostWizardStep, hostDomain, hostSub, hostConnectionProfile, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends, hostSSHBastion]);
 
   useEffect(() => {
     if (tab !== 'hosts' || hostWizardStep !== 2 || !hostDomain || !hostSub || (!hostHAEnabled && !hostSSHBastion && !hostUpstream)) return;
@@ -1286,7 +1355,7 @@ function App() {
       void checkHostPreflight();
     }, 4000);
     return () => window.clearInterval(t);
-  }, [tab, hostWizardStep, hostDomain, hostSub, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends, hostSSHBastion]);
+  }, [tab, hostWizardStep, hostDomain, hostSub, hostConnectionProfile, hostUpstream, hostInsecureTLS, hostHAEnabled, hostHAMode, hostHABackends, hostSSHBastion]);
 
   useEffect(() => {
     if (!selectedHostID) {
@@ -1841,6 +1910,7 @@ function App() {
         body: JSON.stringify({
           domain: hostDomain,
           subdomain: hostSub,
+          connectionProfile: hostConnectionProfile,
           upstream: hostEffectiveUpstream,
           insecureTls: hostInsecureTLS,
           haEnabled: hostHAEnabled,
@@ -1865,6 +1935,7 @@ function App() {
         }
       }
       setHostSub('');
+      setHostConnectionProfile('http');
       setHostHAEnabled(false);
       setHostSSHBastion(false);
       setHostHAMode('failover');
@@ -1918,6 +1989,7 @@ function App() {
         body: JSON.stringify({
           domain: hostDomain,
           subdomain: hostSub,
+          connectionProfile: hostConnectionProfile,
           upstream: hostEffectiveUpstream,
           insecureTls: hostInsecureTLS,
           haEnabled: hostHAEnabled,
@@ -1951,6 +2023,7 @@ function App() {
 
   const openHostDetail = (h: Host) => {
     setSelectedHostID(h.id);
+    setDetailConnectionProfile((h.connectionProfile === 'streaming' ? 'streaming' : 'http'));
     setDetailUpstream(h.upstreamUrl || '');
     setDetailInsecureTLS(!!h.insecureTls);
     setDetailHAEnabled(!!h.haEnabled);
@@ -1973,6 +2046,7 @@ function App() {
         method: 'PUT',
         headers: { 'X-CSRF-Token': csrf },
         body: JSON.stringify({
+          connectionProfile: detailConnectionProfile,
           upstream: detailUpstream,
           insecureTls: detailInsecureTLS,
           haEnabled: detailHAEnabled,
@@ -2239,12 +2313,6 @@ function App() {
   const manualDomains = Math.max(0, domains.length - cloudflareDomains);
   const domainsChecked = Object.keys(domainChecks).length;
   const domainsWithIssues = Object.values(domainChecks).filter((c) => !c.overallOk).length;
-  const hostsWithDiagnostics = hosts.filter((h) => !!hostDiagnostics[h.fqdn]).length;
-  const hostsHealthy = hosts.filter((h) => {
-    const d = hostDiagnostics[h.fqdn];
-    if (!d) return false;
-    return (d.dnsRecords || []).length > 0 && d.tlsOk && d.httpsStatus >= 200 && d.httpsStatus < 500;
-  }).length;
   const hostsGroupedByApex = useMemo(() => {
     const normalizedDomains = [...domains]
       .map((d) => String(d.name || '').trim().toLowerCase())
@@ -4783,6 +4851,7 @@ function App() {
                       </div>
                       <div className="cc-pills">
                         <span className={`cc-pill ${selectedHost.authEnabled ? 'ok' : ''}`}>Auth {selectedHost.authEnabled ? 'On' : 'Off'}</span>
+                        <span className={`cc-pill ${selectedHost.connectionProfile === 'streaming' ? 'warn' : 'ok'}`}>Profile {(selectedHost.connectionProfile === 'streaming' ? 'Streaming' : 'HTTP')}</span>
                         <span className={`cc-pill ${selectedHost.haEnabled ? 'ok' : ''}`}>HA {selectedHost.haEnabled ? (selectedHost.haMode || 'failover') : 'Off'}</span>
                         <span className={`cc-pill ${selectedHost.state === 'maintenance' ? 'warn' : 'ok'}`}>Maintenance {selectedHost.state === 'maintenance' ? 'On' : 'Off'}</span>
                         <span className={`cc-pill ${selectedHost.insecureTls ? 'warn' : 'ok'}`}>TLS Verify {selectedHost.insecureTls ? 'Off' : 'On'}</span>
@@ -4832,6 +4901,10 @@ function App() {
                   <section className="card cc-block cc-panel">
                     <div className="card-head"><h3>Routing Control</h3></div>
                     <div className="row">
+                      <select value={detailConnectionProfile} onChange={(e) => setDetailConnectionProfile((e.target.value === 'streaming' ? 'streaming' : 'http'))}>
+                        <option value="http">HTTP (Default)</option>
+                        <option value="streaming">Streaming</option>
+                      </select>
                       <label className="check"><input type="checkbox" checked={detailHAEnabled} onChange={(e) => setDetailHAEnabled(e.target.checked)} /> Enable HA</label>
                     </div>
                     {detailHAEnabled ? (
@@ -4920,6 +4993,7 @@ function App() {
                     <div className="metric-grid">
                       <MetricTile label="State" value={hostStateBadge(selectedHost.state).label} hint="Current lifecycle state" />
                       <MetricTile label="Auth Page" value={selectedHost.authEnabled ? 'enabled' : 'disabled'} hint="Per-host access gate" />
+                      <MetricTile label="Profile" value={selectedHost.connectionProfile === 'streaming' ? 'streaming' : 'http'} hint="Connection optimization preset" />
                       <MetricTile label="TLS Verify" value={selectedHost.insecureTls ? 'disabled' : 'enabled'} hint="Upstream certificate policy" />
                       <MetricTile label="Routing" value={selectedHost.haEnabled ? `HA (${selectedHost.haMode || 'failover'})` : 'Single Upstream'} hint="Proxy mode" />
                       <MetricTile label="Geo Policy" value={selectedHost.geoMode ? `${selectedHost.geoMode} (${(selectedHost.geoCountries || []).length})` : 'off'} hint="Country access filter" />
@@ -4960,7 +5034,7 @@ function App() {
                 </aside>
               </section>
             ) : (
-              <section className="entity-page">
+              <section className="entity-page entity-page-single">
                 <div className="entity-main">
                   {isReadOnlyRole ? (
                     <section className="card">
@@ -4984,8 +5058,12 @@ function App() {
                             ))}
                           </select>
                           <input value={hostSub} onChange={(e) => setHostSub(e.target.value.toLowerCase().trim())} placeholder="app" />
+                          <select value={hostConnectionProfile} onChange={(e) => setHostConnectionProfile((e.target.value === 'streaming' ? 'streaming' : 'http'))} disabled={hostSSHBastion}>
+                            <option value="http">HTTP (Default)</option>
+                            <option value="streaming">Streaming</option>
+                          </select>
                           <label className="check"><input type="checkbox" checked={hostHAEnabled} onChange={(e) => { const checked = e.target.checked; setHostHAEnabled(checked); if (checked) setHostSSHBastion(false); }} /> Enable HA</label>
-                          {identity?.role === 'admin' ? <label className="check"><input type="checkbox" checked={hostSSHBastion} onChange={(e) => { const checked = e.target.checked; setHostSSHBastion(checked); if (checked) setHostHAEnabled(false); }} /> SSH Bastion</label> : null}
+                          {identity?.role === 'admin' ? <label className="check"><input type="checkbox" checked={hostSSHBastion} onChange={(e) => { const checked = e.target.checked; setHostSSHBastion(checked); if (checked) { setHostHAEnabled(false); setHostConnectionProfile('http'); } }} /> SSH Bastion</label> : null}
                           {hostUsesDirectUpstream ? <input value={hostUpstream} onChange={(e) => setHostUpstream(e.target.value)} placeholder="http://127.0.0.1:3000" /> : null}
                           {hostHAEnabled ? (
                             <select value={hostHAMode} onChange={(e) => setHostHAMode(e.target.value as 'failover' | 'round_robin')}>
@@ -5027,7 +5105,7 @@ function App() {
                           Checks run automatically every 4 seconds until green, then stop automatically. Continue only when all checks are green.
                         </div>
                         <div className="muted" style={{ marginBottom: '.5rem' }}>
-                          Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled (self-signed accepted)' : 'enabled (strict verify)'}</strong> · Routing: <strong>{hostHAEnabled ? `HA (${hostHAMode})` : hostSSHBastion ? 'SSH Bastion' : 'Single Upstream'}</strong>
+                          Profile: <strong>{hostConnectionProfile === 'streaming' ? 'Streaming' : 'HTTP'}</strong> · Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled (self-signed accepted)' : 'enabled (strict verify)'}</strong> · Routing: <strong>{hostHAEnabled ? `HA (${hostHAMode})` : hostSSHBastion ? 'SSH Bastion' : 'Single Upstream'}</strong>
                         </div>
                         {hostPreflight ? (
                           <div className="diag" style={{ marginBottom: '.5rem' }}>
@@ -5050,6 +5128,9 @@ function App() {
                       <div className="card" style={{ marginBottom: '.8rem' }}>
                         <div className="muted" style={{ marginBottom: '.5rem' }}>
                           Ready to create: <strong>{hostPreflight?.fqdn || fqdnPreview}</strong>
+                        </div>
+                        <div className="muted" style={{ marginBottom: '.5rem' }}>
+                          Connection profile: <strong>{hostConnectionProfile === 'streaming' ? 'Streaming' : 'HTTP'}</strong>
                         </div>
                         <div className="muted" style={{ marginBottom: '.5rem' }}>
                           Upstream TLS verify: <strong>{hostInsecureTLS ? 'disabled' : 'enabled'}</strong>
@@ -5090,6 +5171,7 @@ function App() {
                                 );
                               })()}
                               {h.haEnabled ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>HA {h.haMode || 'failover'}</span> : null}
+                              {h.connectionProfile === 'streaming' ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>STREAMING</span> : null}
                               {h.insecureTls ? <span className="badge warn" style={{ marginLeft: '.45rem' }}>insecure TLS</span> : null}
                               {h.authEnabled ? <span className="badge ok" style={{ marginLeft: '.45rem' }}>auth page enabled</span> : null}
                               <span className={`badge ${hostStateBadge(h.state).cls}`} style={{ marginLeft: '.45rem' }}>{hostStateBadge(h.state).label}</span>
@@ -5141,23 +5223,6 @@ function App() {
                     ))}
                   </section>
                 </div>
-                <aside className="entity-side">
-                  <section className="card">
-                    <div className="card-head"><h3>Subdomain Stats</h3></div>
-                    <div className="metric-grid">
-                      <MetricTile label="Total Hosts" value={String(hosts.length)} hint="Configured subdomains" />
-                      <MetricTile label="Active" value={String(activeHosts)} hint="Proxy routes online" />
-                      <MetricTile label="Errors" value={String(errorHosts)} hint="Needs attention" />
-                      <MetricTile label="Diagnostics" value={String(hostsWithDiagnostics)} hint="Hosts with checks" />
-                      <MetricTile label="Healthy" value={String(hostsHealthy)} hint="DNS+TLS+HTTPS good" />
-                    </div>
-                  </section>
-                  <section className="card">
-                    <div className="card-head"><h3>Routing Note</h3></div>
-                    <div className="muted">Use `Edit` to open a dedicated settings page for each subdomain.</div>
-                    <div className="muted" style={{ marginTop: '.45rem' }}>There you can manage upstream, TLS behavior and auth page credentials.</div>
-                  </section>
-                </aside>
               </section>
             )
           ) : null}
@@ -7470,6 +7535,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .dashboard-side { display:grid; gap:1rem; min-width:0; }
         .snapshot-row { display:grid; gap:1rem; grid-template-columns:repeat(2,minmax(0,1fr)); }
         .entity-page { display:grid; gap:1rem; grid-template-columns:minmax(0,1.7fr) minmax(320px,1fr); align-items:start; }
+        .entity-page.entity-page-single { grid-template-columns:minmax(0,1fr); }
         .entity-main { display:grid; gap:1rem; }
         .entity-side { display:grid; gap:1rem; }
         .threatintel-page { grid-template-columns:minmax(0,1fr); }

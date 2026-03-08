@@ -19,7 +19,7 @@ func TestHostStateTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := s.CreateHost(ctx, d.ID, "app", "app.example.com", "http://127.0.0.1:3000", false, false, "", nil)
+	h, err := s.CreateHost(ctx, d.ID, "app", "app.example.com", "http", "http://127.0.0.1:3000", false, false, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

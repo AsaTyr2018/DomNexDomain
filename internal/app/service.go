@@ -659,7 +659,7 @@ func (s *Service) Bootstrap(ctx context.Context, bootstrapUser, bootstrapPass st
 	if strings.HasPrefix(s.cfg.AdminBindAddr, ":") {
 		adminUpstream = "http://127.0.0.1" + s.cfg.AdminBindAddr
 	}
-	h, err := s.store.CreateHost(ctx, d.ID, "admin", adminDomain, adminUpstream, false, false, "", nil)
+	h, err := s.store.CreateHost(ctx, d.ID, "admin", adminDomain, "http", adminUpstream, false, false, "", nil)
 	if err != nil {
 		return err
 	}
@@ -1565,7 +1565,7 @@ func (s *Service) ensureAdminHostForDomain(ctx context.Context, domainName strin
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	_, err := s.CreateHost(ctx, domainName, "admin", s.adminUpstreamURL(), false, false, "", nil)
+	_, err := s.CreateHost(ctx, domainName, "admin", "http", s.adminUpstreamURL(), false, false, "", nil)
 	return err
 }
 
@@ -2188,11 +2188,15 @@ func (s *Service) SetHostGeoPolicy(ctx context.Context, hostID int64, mode strin
 	return s.store.GetHostByID(ctx, hostID)
 }
 
-func (s *Service) UpdateHostRouting(ctx context.Context, hostID int64, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) (model.Host, error) {
+func (s *Service) UpdateHostRouting(ctx context.Context, hostID int64, connectionProfile, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) (model.Host, error) {
 	current, err := s.store.GetHostByID(ctx, hostID)
 	if err != nil {
 		return model.Host{}, err
 	}
+	if strings.TrimSpace(connectionProfile) == "" {
+		connectionProfile = current.ConnectionProfile
+	}
+	connectionProfile = normalizeConnectionProfile(connectionProfile)
 	// Keep existing upstream when switching non-HA settings without editing the URL field.
 	if !haEnabled && strings.TrimSpace(upstream) == "" {
 		upstream = current.UpstreamURL
@@ -2205,13 +2209,13 @@ func (s *Service) UpdateHostRouting(ctx context.Context, hostID int64, upstream 
 		haMode = ""
 		haBackends = nil
 	}
-	if err := s.store.UpdateHostRouting(ctx, hostID, upstream, insecureTLS, haEnabled, haMode, haBackends); err != nil {
+	if err := s.store.UpdateHostRouting(ctx, hostID, connectionProfile, upstream, insecureTLS, haEnabled, haMode, haBackends); err != nil {
 		return model.Host{}, err
 	}
 	return s.store.GetHostByID(ctx, hostID)
 }
 
-func (s *Service) CreateHost(ctx context.Context, domainName, subdomain, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) (model.Host, error) {
+func (s *Service) CreateHost(ctx context.Context, domainName, subdomain, connectionProfile, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) (model.Host, error) {
 	d, err := s.store.GetDomainByName(ctx, strings.ToLower(domainName))
 	if err != nil {
 		return model.Host{}, err
@@ -2219,13 +2223,14 @@ func (s *Service) CreateHost(ctx context.Context, domainName, subdomain, upstrea
 	if subdomain == "" || strings.Contains(subdomain, ".") {
 		return model.Host{}, fmt.Errorf("subdomain must be single label")
 	}
+	connectionProfile = normalizeConnectionProfile(connectionProfile)
 	upstream, haMode, haBackends, err = validateRoutingInput(strings.TrimSpace(upstream), haEnabled, haMode, haBackends)
 	if err != nil {
 		return model.Host{}, err
 	}
 	fqdn := fmt.Sprintf("%s.%s", strings.ToLower(subdomain), d.Name)
 
-	h, err := s.store.CreateHost(ctx, d.ID, strings.ToLower(subdomain), fqdn, upstream, insecureTLS, haEnabled, haMode, haBackends)
+	h, err := s.store.CreateHost(ctx, d.ID, strings.ToLower(subdomain), fqdn, connectionProfile, upstream, insecureTLS, haEnabled, haMode, haBackends)
 	if err != nil {
 		return model.Host{}, err
 	}
@@ -2381,6 +2386,17 @@ func validateRoutingInput(upstream string, haEnabled bool, haMode string, haBack
 		return "", "", nil, fmt.Errorf("ha requires at least 2 backends")
 	}
 	return out[0].URL, mode, out, nil
+}
+
+func normalizeConnectionProfile(profile string) string {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "", "http":
+		return "http"
+	case "streaming":
+		return "streaming"
+	default:
+		return "http"
+	}
 }
 
 func normalizeHostGeoPolicy(mode string, countries []string) (string, []string, error) {

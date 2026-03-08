@@ -262,7 +262,7 @@ func (s *Service) ApplyInitialSetup(ctx context.Context, in SetupApplyInput) err
 		firstSub := strings.ToLower(strings.TrimSpace(in.FirstSubdomain))
 		firstUpstream := strings.TrimSpace(in.FirstUpstream)
 		if domainName != "" && firstSub != "" && firstUpstream != "" {
-			if _, err := s.CreateHost(ctx, domainName, firstSub, firstUpstream, in.FirstInsecureTLS, false, "", nil); err != nil {
+			if _, err := s.CreateHost(ctx, domainName, firstSub, "http", firstUpstream, in.FirstInsecureTLS, false, "", nil); err != nil {
 				return err
 			}
 		}

@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS hosts (
   domain_id INTEGER NOT NULL,
   subdomain TEXT NOT NULL,
   fqdn TEXT NOT NULL UNIQUE,
+  connection_profile TEXT NOT NULL DEFAULT 'http',
   upstream_url TEXT NOT NULL,
   insecure_tls INTEGER NOT NULL DEFAULT 0,
   ha_enabled INTEGER NOT NULL DEFAULT 0,
@@ -463,6 +464,9 @@ CREATE INDEX IF NOT EXISTS idx_backup_archives_storage_created ON backup_archive
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE hosts ADD COLUMN geo_countries TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE hosts ADD COLUMN connection_profile TEXT NOT NULL DEFAULT 'http'`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE threat_intel_matches ADD COLUMN xp_delta INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
@@ -885,15 +889,15 @@ func (s *Store) ListDomains(ctx context.Context) ([]model.Domain, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) CreateHost(ctx context.Context, domainID int64, subdomain, fqdn, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) (model.Host, error) {
+func (s *Store) CreateHost(ctx context.Context, domainID int64, subdomain, fqdn, connectionProfile, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) (model.Host, error) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	haBackendsJSON, err := encodeBackends(haBackends)
 	if err != nil {
 		return model.Host{}, err
 	}
 	res, err := s.db.ExecContext(ctx, `
-INSERT INTO hosts(domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, state, created_at, updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?)`, domainID, subdomain, fqdn, upstream, boolToInt(insecureTLS), boolToInt(haEnabled), haMode, haBackendsJSON, "created", now, now)
+INSERT INTO hosts(domain_id, subdomain, fqdn, connection_profile, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, state, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, domainID, subdomain, fqdn, connectionProfile, upstream, boolToInt(insecureTLS), boolToInt(haEnabled), haMode, haBackendsJSON, "created", now, now)
 	if err != nil {
 		return model.Host{}, err
 	}
@@ -910,8 +914,8 @@ func (s *Store) GetHostByID(ctx context.Context, id int64) (model.Host, error) {
 	var insecure, haEnabled, authEnabled int
 	var haBackendsJSON string
 	var geoCountriesCSV string
-	err := s.db.QueryRowContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE id=?`, id).
-		Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated)
+	err := s.db.QueryRowContext(ctx, `SELECT id, domain_id, subdomain, fqdn, connection_profile, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE id=?`, id).
+		Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.ConnectionProfile, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated)
 	if err != nil {
 		return h, err
 	}
@@ -926,7 +930,7 @@ func (s *Store) GetHostByID(ctx context.Context, id int64) (model.Host, error) {
 }
 
 func (s *Store) ListHosts(ctx context.Context) ([]model.Host, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts ORDER BY fqdn`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, domain_id, subdomain, fqdn, connection_profile, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts ORDER BY fqdn`)
 	if err != nil {
 		return nil, err
 	}
@@ -938,7 +942,7 @@ func (s *Store) ListHosts(ctx context.Context) ([]model.Host, error) {
 		var insecure, haEnabled, authEnabled int
 		var haBackendsJSON string
 		var geoCountriesCSV string
-		if err := rows.Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated); err != nil {
+		if err := rows.Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.ConnectionProfile, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated); err != nil {
 			return nil, err
 		}
 		h.InsecureTLS = insecure != 0
@@ -954,7 +958,7 @@ func (s *Store) ListHosts(ctx context.Context) ([]model.Host, error) {
 }
 
 func (s *Store) ListHostsByDomainID(ctx context.Context, domainID int64) ([]model.Host, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE domain_id=? ORDER BY fqdn`, domainID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, domain_id, subdomain, fqdn, connection_profile, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE domain_id=? ORDER BY fqdn`, domainID)
 	if err != nil {
 		return nil, err
 	}
@@ -966,7 +970,7 @@ func (s *Store) ListHostsByDomainID(ctx context.Context, domainID int64) ([]mode
 		var insecure, haEnabled, authEnabled int
 		var haBackendsJSON string
 		var geoCountriesCSV string
-		if err := rows.Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated); err != nil {
+		if err := rows.Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.ConnectionProfile, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated); err != nil {
 			return nil, err
 		}
 		h.InsecureTLS = insecure != 0
@@ -1260,8 +1264,8 @@ func (s *Store) FindHostByFQDN(ctx context.Context, fqdn string) (model.Host, er
 	var insecure, haEnabled, authEnabled int
 	var haBackendsJSON string
 	var geoCountriesCSV string
-	err := s.db.QueryRowContext(ctx, `SELECT id, domain_id, subdomain, fqdn, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE fqdn=?`, fqdn).
-		Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated)
+	err := s.db.QueryRowContext(ctx, `SELECT id, domain_id, subdomain, fqdn, connection_profile, upstream_url, insecure_tls, ha_enabled, ha_mode, ha_backends, auth_enabled, auth_user, auth_pass_hash, geo_mode, geo_countries, state, error_reason, created_at, updated_at FROM hosts WHERE fqdn=?`, fqdn).
+		Scan(&h.ID, &h.DomainID, &h.Subdomain, &h.FQDN, &h.ConnectionProfile, &h.UpstreamURL, &insecure, &haEnabled, &h.HAMode, &haBackendsJSON, &authEnabled, &h.AuthUser, &h.AuthPassHash, &h.GeoMode, &geoCountriesCSV, &h.State, &h.ErrorReason, &created, &updated)
 	if err != nil {
 		return h, err
 	}
@@ -1283,15 +1287,15 @@ WHERE id=?`, boolToInt(enabled), username, passHash, time.Now().UTC().Format(tim
 	return err
 }
 
-func (s *Store) UpdateHostRouting(ctx context.Context, id int64, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) error {
+func (s *Store) UpdateHostRouting(ctx context.Context, id int64, connectionProfile, upstream string, insecureTLS bool, haEnabled bool, haMode string, haBackends []model.HABackend) error {
 	haBackendsJSON, err := encodeBackends(haBackends)
 	if err != nil {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `
 UPDATE hosts
-SET upstream_url=?, insecure_tls=?, ha_enabled=?, ha_mode=?, ha_backends=?, updated_at=?
-WHERE id=?`, upstream, boolToInt(insecureTLS), boolToInt(haEnabled), haMode, haBackendsJSON, time.Now().UTC().Format(time.RFC3339Nano), id)
+SET connection_profile=?, upstream_url=?, insecure_tls=?, ha_enabled=?, ha_mode=?, ha_backends=?, updated_at=?
+WHERE id=?`, connectionProfile, upstream, boolToInt(insecureTLS), boolToInt(haEnabled), haMode, haBackendsJSON, time.Now().UTC().Format(time.RFC3339Nano), id)
 	return err
 }
 

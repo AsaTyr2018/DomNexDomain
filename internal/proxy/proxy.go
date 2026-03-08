@@ -969,6 +969,7 @@ func dropConnection(w *statusWriter) {
 
 func newReverseProxy(e *Engine, u *url.URL, h model.Host, upstreamRef string) *httputil.ReverseProxy {
 	rp := httputil.NewSingleHostReverseProxy(u)
+	isStreaming := strings.EqualFold(strings.TrimSpace(h.ConnectionProfile), "streaming")
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -978,10 +979,19 @@ func newReverseProxy(e *Engine, u *url.URL, h model.Host, upstreamRef string) *h
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	if isStreaming {
+		transport.MaxIdleConns = 512
+		transport.MaxIdleConnsPerHost = 256
+		transport.IdleConnTimeout = 180 * time.Second
+		transport.ResponseHeaderTimeout = 30 * time.Second
+	}
 	if strings.EqualFold(u.Scheme, "https") && h.InsecureTLS {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 	rp.Transport = transport
+	if isStreaming {
+		rp.FlushInterval = 100 * time.Millisecond
+	}
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		traceID, _ := randomHex(8)
 		clientIP := e.clientIPFromRequest(r)

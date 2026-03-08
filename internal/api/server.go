@@ -1624,13 +1624,14 @@ func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Domain      string            `json:"domain"`
-		Sub         string            `json:"subdomain"`
-		Upstream    string            `json:"upstream"`
-		InsecureTLS bool              `json:"insecureTls"`
-		HAEnabled   bool              `json:"haEnabled"`
-		HAMode      string            `json:"haMode"`
-		HABackends  []model.HABackend `json:"haBackends"`
+		Domain            string            `json:"domain"`
+		Sub               string            `json:"subdomain"`
+		ConnectionProfile string            `json:"connectionProfile"`
+		Upstream          string            `json:"upstream"`
+		InsecureTLS       bool              `json:"insecureTls"`
+		HAEnabled         bool              `json:"haEnabled"`
+		HAMode            string            `json:"haMode"`
+		HABackends        []model.HABackend `json:"haBackends"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -1647,7 +1648,7 @@ func (s *Server) handleCreateHost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	h, err := s.app.CreateHost(r.Context(), in.Domain, in.Sub, in.Upstream, in.InsecureTLS, in.HAEnabled, in.HAMode, in.HABackends)
+	h, err := s.app.CreateHost(r.Context(), in.Domain, in.Sub, in.ConnectionProfile, in.Upstream, in.InsecureTLS, in.HAEnabled, in.HAMode, in.HABackends)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -1711,17 +1712,18 @@ func (s *Server) handleUpdateHostRouting(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	var in struct {
-		Upstream    string            `json:"upstream"`
-		InsecureTLS bool              `json:"insecureTls"`
-		HAEnabled   bool              `json:"haEnabled"`
-		HAMode      string            `json:"haMode"`
-		HABackends  []model.HABackend `json:"haBackends"`
+		ConnectionProfile string            `json:"connectionProfile"`
+		Upstream          string            `json:"upstream"`
+		InsecureTLS       bool              `json:"insecureTls"`
+		HAEnabled         bool              `json:"haEnabled"`
+		HAMode            string            `json:"haMode"`
+		HABackends        []model.HABackend `json:"haBackends"`
 	}
 	if err := decodeJSON(r.Body, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	updated, err := s.app.UpdateHostRouting(r.Context(), hostID, in.Upstream, in.InsecureTLS, in.HAEnabled, in.HAMode, in.HABackends)
+	updated, err := s.app.UpdateHostRouting(r.Context(), hostID, in.ConnectionProfile, in.Upstream, in.InsecureTLS, in.HAEnabled, in.HAMode, in.HABackends)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -1990,13 +1992,13 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Name        string   `json:"name"`
-		Role        string   `json:"role"`
-		Scopes      []string `json:"scopes"`
-		DomainIDs   []int64  `json:"domainIds"`
-		ConfirmUnlimited bool   `json:"confirmUnlimited"`
-		ConfirmPassword  string `json:"confirmPassword"`
-		Permissions struct {
+		Name             string   `json:"name"`
+		Role             string   `json:"role"`
+		Scopes           []string `json:"scopes"`
+		DomainIDs        []int64  `json:"domainIds"`
+		ConfirmUnlimited bool     `json:"confirmUnlimited"`
+		ConfirmPassword  string   `json:"confirmPassword"`
+		Permissions      struct {
 			GlobalRead  bool `json:"globalRead"`
 			GlobalWrite bool `json:"globalWrite"`
 			DomainRead  bool `json:"domainRead"`
