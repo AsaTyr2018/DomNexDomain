@@ -43,7 +43,9 @@ func defaultThreatSignatures() []threatSignatureRule {
 	return []threatSignatureRule{
 		{ID: "wp-core", Signal: "signature.wp_scanner", Family: "wp_scanner", PathContains: []string{"/wp-admin", "/wp-login", "/wp-content", "/wp-includes", "xmlrpc.php", "wlwmanifest.xml", "wp-trackback"}},
 		{ID: "secret-leaks", Signal: "signature.secret_hunter", Family: "secret_hunter", PathContains: []string{"/.env", "/.git/config", "/config.env", "/api/.env", "/laravel/.env", "/docker/.env"}},
-		{ID: "webshell-probe", Signal: "signature.webshell_probe", Family: "webshell_probe", PathContains: []string{"ioxi-o.php", "/file.php", "/rip.php", "/sf.php", "/wso.php", "/r57.php", "/shell.php", "/cmd.php"}},
+		{ID: "webshell-probe", Signal: "signature.webshell_probe", Family: "webshell_probe", PathContains: []string{"ioxi-o.php", "/file.php", "/rip.php", "/sf.php", "/wso.php", "/r57.php", "/shell.php", "/cmd.php", "/xmr.php", "/xmrlpc.php", "/zwso.php"}},
+		{ID: "flat-php-probe", Signal: "signature.flat_php_probe", Family: "flat_php_probe", PathContains: []string{"/inputs.php", "/adminfuns.php", "/class-t.api.php", "/ms-edit.php", "/randkeyword.php", "/randkeyword.php7", "/kbfr.php"}},
+		{ID: "hidden-index-dropper", Signal: "signature.hidden_index_dropper", Family: "hidden_index_dropper", PathContains: []string{"/wk/index.php", "/.well-known/logs233/index.php", "/.trash7206/index.php", "/update/da222.php"}},
 		{ID: "admin-surface", Signal: "signature.admin_surface_probe", Family: "admin_surface_probe", PathContains: []string{"/admin.php", "/admin/", "/manager/html", "/hudson", "/jenkins", "/server-status", "/actuator/env"}},
 		{ID: "api-enum", Signal: "signature.api_enum", Family: "api_enum", PathPrefix: []string{"/api/"}, PathContains: []string{"/api/settings", "/api/config", "/graphql"}},
 		{ID: "scanner-ua", Signal: "signature.scanner_ua", Family: "scanner_ua", UAContains: []string{"zgrab", "masscan", "nmap", "sqlmap", "nikto", "nuclei", "dirbuster", "gobuster", "wpscan"}},

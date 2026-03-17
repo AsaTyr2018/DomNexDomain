@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "source": "DomNexDomain Community Signatures",
   "rules": [
     {
@@ -41,7 +41,35 @@
         "/wso.php",
         "/r57.php",
         "/shell.php",
-        "/cmd.php"
+        "/cmd.php",
+        "/xmr.php",
+        "/xmrlpc.php",
+        "/zwso.php"
+      ]
+    },
+    {
+      "id": "flat-php-probe",
+      "signal": "signature.flat_php_probe",
+      "family": "flat_php_probe",
+      "pathContains": [
+        "/inputs.php",
+        "/adminfuns.php",
+        "/class-t.api.php",
+        "/ms-edit.php",
+        "/randkeyword.php",
+        "/randkeyword.php7",
+        "/kbfr.php"
+      ]
+    },
+    {
+      "id": "hidden-index-dropper",
+      "signal": "signature.hidden_index_dropper",
+      "family": "hidden_index_dropper",
+      "pathContains": [
+        "/wk/index.php",
+        "/.well-known/logs233/index.php",
+        "/.trash7206/index.php",
+        "/update/da222.php"
       ]
     },
     {

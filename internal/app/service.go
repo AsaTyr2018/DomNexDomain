@@ -4224,19 +4224,21 @@ func uniqueThreatSignals(in []string) []string {
 
 func calcThreatBaseXP(signals []string) (int, string) {
 	points := map[string]int{
-		"behavior.unknown_host":         1,
-		"behavior.path_scan":            4,
-		"behavior.ua_scanner":           2,
-		"behavior.invalid_host":         2,
-		"behavior.auth_failed":          3,
-		"protocol.ssh.auth_denied":      3,
-		"protocol.ssh.forward_denied":   4,
-		"signature.wp_scanner":          6,
-		"signature.secret_hunter":       7,
-		"signature.webshell_probe":      8,
-		"signature.admin_surface_probe": 4,
-		"signature.api_enum":            4,
-		"signature.scanner_ua":          3,
+		"behavior.unknown_host":          1,
+		"behavior.path_scan":             4,
+		"behavior.ua_scanner":            2,
+		"behavior.invalid_host":          2,
+		"behavior.auth_failed":           3,
+		"protocol.ssh.auth_denied":       3,
+		"protocol.ssh.forward_denied":    4,
+		"signature.wp_scanner":           6,
+		"signature.secret_hunter":        7,
+		"signature.webshell_probe":       8,
+		"signature.flat_php_probe":       5,
+		"signature.hidden_index_dropper": 7,
+		"signature.admin_surface_probe":  4,
+		"signature.api_enum":             4,
+		"signature.scanner_ua":           3,
 	}
 	total := 0
 	top := ""
