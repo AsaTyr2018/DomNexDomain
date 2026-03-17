@@ -150,6 +150,33 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS trace_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  trace_id TEXT NOT NULL,
+  event_kind TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL DEFAULT '',
+  target TEXT NOT NULL DEFAULT '',
+  meta TEXT NOT NULL DEFAULT '',
+  source_ip TEXT NOT NULL DEFAULT '',
+  ip TEXT NOT NULL DEFAULT '',
+  decision TEXT NOT NULL DEFAULT '',
+  feed TEXT NOT NULL DEFAULT '',
+  host TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  country TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT '',
+  source_scope TEXT NOT NULL DEFAULT '',
+  hits INTEGER NOT NULL DEFAULT 0,
+  xp INTEGER NOT NULL DEFAULT 0,
+  level INTEGER NOT NULL DEFAULT 0,
+  tier TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL DEFAULT '',
+  event_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trace_events_trace_id ON trace_events(trace_id, event_at);
+
 CREATE TABLE IF NOT EXISTS state_transitions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   host_id INTEGER NOT NULL,
@@ -658,12 +685,85 @@ WHERE last_seen_at < ?
 	return res.RowsAffected()
 }
 
+func (s *Store) PurgeTraceEventsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM trace_events WHERE event_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) RecordTraceEvent(ctx context.Context, e model.TraceEvent) error {
+	now := time.Now().UTC()
+	if e.EventAt.IsZero() {
+		e.EventAt = now
+	}
+	traceID := strings.ToLower(strings.TrimSpace(e.TraceID))
+	if traceID == "" {
+		return fmt.Errorf("trace id required")
+	}
+	kind := strings.ToLower(strings.TrimSpace(e.Kind))
+	if kind == "" {
+		kind = "flow"
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO trace_events(trace_id, event_kind, actor, action, target, meta, source_ip, ip, decision, feed, host, path, country, mode, source_scope, hits, xp, level, tier, summary, event_at, created_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		traceID,
+		kind,
+		strings.TrimSpace(e.Actor),
+		strings.TrimSpace(e.Action),
+		strings.TrimSpace(e.Target),
+		strings.TrimSpace(e.Meta),
+		strings.TrimSpace(e.SourceIP),
+		strings.TrimSpace(e.IP),
+		strings.TrimSpace(e.Decision),
+		strings.TrimSpace(e.Feed),
+		strings.TrimSpace(e.Host),
+		strings.TrimSpace(e.Path),
+		strings.TrimSpace(e.Country),
+		strings.TrimSpace(e.Mode),
+		strings.TrimSpace(e.SourceScope),
+		e.Hits,
+		e.XP,
+		e.Level,
+		strings.TrimSpace(e.Tier),
+		strings.TrimSpace(e.Summary),
+		e.EventAt.UTC().Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+	)
+	return err
+}
+
 func (s *Store) PurgeBlockedIPsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM blocked_ips WHERE updated_at < ?`, cutoff.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+func (s *Store) ListBlockedIPsBefore(ctx context.Context, cutoff time.Time, limit int) ([]model.BlockedIP, error) {
+	if limit <= 0 || limit > 200000 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT ip, reason, created_at, updated_at FROM blocked_ips WHERE created_at < ? ORDER BY created_at ASC LIMIT ?`, cutoff.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.BlockedIP{}
+	for rows.Next() {
+		var b model.BlockedIP
+		var created, updated string
+		if err := rows.Scan(&b.IP, &b.Reason, &created, &updated); err != nil {
+			return nil, err
+		}
+		b.CreatedAt = parseTimeOrZero(created)
+		b.UpdatedAt = parseTimeOrZero(updated)
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) PurgeLoginAttemptsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
@@ -1049,6 +1149,12 @@ func (s *Store) AddAuditEvent(ctx context.Context, e model.AuditEvent) error {
 	}
 	e.CreatedAt = now
 	e.SourceIP = parseSourceFromMeta(e.Meta)
+	if traceID := parseTraceFromMeta(e.Meta); traceID != "" {
+		_, _ = s.db.ExecContext(ctx, `
+INSERT INTO trace_events(trace_id, event_kind, actor, action, target, meta, source_ip, summary, event_at, created_at)
+VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			traceID, "action", strings.TrimSpace(e.Actor), strings.TrimSpace(e.Action), strings.TrimSpace(e.Target), strings.TrimSpace(e.Meta), strings.TrimSpace(e.SourceIP), "Operational action recorded", now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	}
 	s.hookMu.RLock()
 	hook := s.auditHookFn
 	s.hookMu.RUnlock()
@@ -1082,6 +1188,48 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]model.AuditEv
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) ListAuditEventsByTrace(ctx context.Context, traceID string, limit int) ([]model.AuditEvent, error) {
+	traceID = strings.ToLower(strings.TrimSpace(traceID))
+	if traceID == "" {
+		return nil, fmt.Errorf("trace id required")
+	}
+	if limit <= 0 {
+		limit = 250
+	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	needle := "trace=" + traceID
+	rows, err := s.db.QueryContext(ctx, `SELECT id, actor, action, target, meta, created_at FROM audit_events WHERE instr(lower(meta), ?) > 0 ORDER BY created_at ASC LIMIT ?`, needle, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.AuditEvent{}
+	for rows.Next() {
+		var e model.AuditEvent
+		var created string
+		if err := rows.Scan(&e.ID, &e.Actor, &e.Action, &e.Target, &e.Meta, &created); err != nil {
+			return nil, err
+		}
+		e.SourceIP = parseSourceFromMeta(e.Meta)
+		e.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func parseTraceFromMeta(meta string) string {
+	parts := strings.Split(strings.TrimSpace(meta), ";")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if strings.HasPrefix(strings.ToLower(p), "trace=") {
+			return strings.ToLower(strings.TrimSpace(p[len("trace="):]))
+		}
+	}
+	return ""
 }
 
 func parseSourceFromMeta(meta string) string {
@@ -2440,9 +2588,7 @@ SELECT s.ip, ?, ?, ?
 FROM threat_intel_ip_state s
 LEFT JOIN threat_intel_allowlist a ON a.ip = s.ip
 WHERE s.level >= ? AND a.ip IS NULL
-ON CONFLICT(ip) DO UPDATE SET
-  reason=excluded.reason,
-  updated_at=excluded.updated_at`, "threat_intel_auto:level_hard", now, now, hardLevel); err != nil {
+ON CONFLICT(ip) DO NOTHING`, "threat_intel_auto:level_hard", now, now, hardLevel); err != nil {
 		return 0, err
 	}
 	res, err := tx.ExecContext(ctx, `
@@ -2704,7 +2850,16 @@ ON CONFLICT(ip, feed, host, path, decision) DO UPDATE SET
   level_after=excluded.level_after,
   tier_after=excluded.tier_after`,
 		in.IP, in.Feed, in.Host, in.Path, in.Country, in.Mode, in.Decision, 1, now, now, in.TraceID, in.SourceScope, in.XPDelta, in.XPAfter, in.LevelAfter, in.TierAfter)
-	return err
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(in.TraceID) != "" {
+		_, _ = s.db.ExecContext(ctx, `
+INSERT INTO trace_events(trace_id, event_kind, ip, decision, feed, host, path, country, mode, source_scope, hits, xp, level, tier, summary, event_at, created_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			strings.ToLower(strings.TrimSpace(in.TraceID)), "evidence", in.IP, in.Decision, in.Feed, in.Host, in.Path, in.Country, in.Mode, in.SourceScope, 1, in.XPAfter, in.LevelAfter, in.TierAfter, "Threat evidence recorded", now, now)
+	}
+	return nil
 }
 
 func (s *Store) GetThreatIntelIPState(ctx context.Context, ip string) (model.ThreatIntelIPState, error) {
@@ -2826,78 +2981,71 @@ func (s *Store) ListThreatIntelMatches(ctx context.Context, since time.Time, dec
 	if offset < 0 {
 		offset = 0
 	}
-	if eventMinHits <= 0 {
-		eventMinHits = 2
-	}
-	if offenderMinHits <= eventMinHits {
-		offenderMinHits = eventMinHits + 1
-	}
-	decision = strings.ToLower(strings.TrimSpace(decision))
 	q = strings.TrimSpace(q)
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	baseArgs := []any{since.UTC().Format(time.RFC3339Nano), now}
-	where := []string{"m.last_seen_at >= ?", "m.ip NOT IN (SELECT ip FROM blocked_ips)", "(s.level > 0 OR s.xp > 0 OR (s.ban_until != '' AND s.ban_until > ?))"}
-	if decision != "" && decision != "all" {
-		where = append(where, "m.decision = ?")
-		baseArgs = append(baseArgs, decision)
-	}
+	baseArgs := []any{}
+	where := []string{"b.ip IS NULL", "s.level >= 0", "s.level < 3", "(s.level > 0 OR s.xp > 0 OR s.risk_state = 'watch' OR (s.ban_until != '' AND s.ban_until > CURRENT_TIMESTAMP))"}
 	if q != "" {
-		where = append(where, "(m.ip LIKE ? OR m.host LIKE ? OR m.path LIKE ? OR m.feed LIKE ? OR m.country LIKE ? OR m.decision LIKE ?)")
+		where = append(where, `(s.ip LIKE ? OR
+		 COALESCE((SELECT GROUP_CONCAT(DISTINCT m2.host) FROM threat_intel_matches m2 WHERE m2.ip=s.ip AND m2.last_seen_at>=?), '') LIKE ? OR
+		 COALESCE((SELECT GROUP_CONCAT(DISTINCT m3.path) FROM threat_intel_matches m3 WHERE m3.ip=s.ip AND m3.last_seen_at>=?), '') LIKE ? OR
+		 COALESCE((SELECT GROUP_CONCAT(DISTINCT m4.feed) FROM threat_intel_matches m4 WHERE m4.ip=s.ip AND m4.last_seen_at>=?), '') LIKE ? OR
+		 COALESCE((SELECT MAX(m5.country) FROM threat_intel_matches m5 WHERE m5.ip=s.ip AND m5.last_seen_at>=?), '') LIKE ? OR
+		 COALESCE((SELECT m6.decision FROM threat_intel_matches m6 WHERE m6.ip=s.ip ORDER BY m6.last_seen_at DESC LIMIT 1), '') LIKE ?)`)
 		like := "%" + q + "%"
-		baseArgs = append(baseArgs, like, like, like, like, like, like)
+		sinceRaw := since.UTC().Format(time.RFC3339Nano)
+		baseArgs = append(baseArgs, like, sinceRaw, like, sinceRaw, like, sinceRaw, like, sinceRaw, like, like)
 	}
-	countQuery := `SELECT COUNT(1) FROM (
-SELECT m.ip
-FROM threat_intel_matches m
-LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
-WHERE ` + strings.Join(where, " AND ") + `
-GROUP BY m.ip
-HAVING SUM(m.hits) >= ? AND SUM(m.hits) < ?
-) t`
+	countQuery := `SELECT COUNT(1) FROM threat_intel_ip_state s
+LEFT JOIN blocked_ips b ON b.ip = s.ip
+WHERE ` + strings.Join(where, " AND ")
 	var total int64
-	countArgs := append([]any{}, baseArgs...)
-	countArgs = append(countArgs, eventMinHits, offenderMinHits)
-	if err := s.db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, countQuery, baseArgs...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	args := append([]any{}, baseArgs...)
 	args = append(args, limit, offset)
 	query := `
 SELECT
-  MIN(m.id) AS id,
-  m.ip,
-  GROUP_CONCAT(DISTINCT m.feed) AS feed,
+  COALESCE((SELECT MIN(m0.id) FROM threat_intel_matches m0 WHERE m0.ip=s.ip), 0) AS id,
+  s.ip,
+  COALESCE((SELECT GROUP_CONCAT(DISTINCT m1.feed) FROM threat_intel_matches m1 WHERE m1.ip=s.ip AND m1.last_seen_at>=?), '') AS feed,
   '' AS host,
   '' AS path,
-  COUNT(DISTINCT m.host || '|' || m.path) AS target_count,
-  MAX(m.country) AS country,
-  GROUP_CONCAT(DISTINCT m.mode) AS mode,
-  GROUP_CONCAT(DISTINCT m.decision) AS decision,
-  SUM(m.hits) AS hits,
-  MIN(m.first_seen_at) AS first_seen_at,
-  MAX(m.last_seen_at) AS last_seen_at,
-  MAX(m.last_trace_id) AS last_trace_id,
-  MAX(m.source_scope) AS source_scope,
-  COALESCE(MAX(s.xp), 0) AS xp,
-  COALESCE(MAX(s.level), 0) AS level,
+  COALESCE((SELECT COUNT(DISTINCT m2.host || '|' || m2.path) FROM threat_intel_matches m2 WHERE m2.ip=s.ip AND m2.last_seen_at>=?), 0) AS target_count,
+  COALESCE((SELECT MAX(m3.country) FROM threat_intel_matches m3 WHERE m3.ip=s.ip AND m3.last_seen_at>=?), '') AS country,
+  COALESCE((SELECT GROUP_CONCAT(DISTINCT m4.mode) FROM threat_intel_matches m4 WHERE m4.ip=s.ip AND m4.last_seen_at>=?), '') AS mode,
+  COALESCE((SELECT m5.decision FROM threat_intel_matches m5 WHERE m5.ip=s.ip ORDER BY m5.last_seen_at DESC LIMIT 1), 'monitor_observe') AS decision,
+  COALESCE((SELECT SUM(m6.hits) FROM threat_intel_matches m6 WHERE m6.ip=s.ip AND m6.last_seen_at>=?), 0) AS hits,
+  COALESCE((SELECT MIN(m7.first_seen_at) FROM threat_intel_matches m7 WHERE m7.ip=s.ip), s.last_seen_at) AS first_seen_at,
+  s.last_seen_at AS last_seen_at,
+  COALESCE((SELECT m8.last_trace_id FROM threat_intel_matches m8 WHERE m8.ip=s.ip ORDER BY m8.last_seen_at DESC LIMIT 1), '') AS last_trace_id,
+  COALESCE((SELECT m9.source_scope FROM threat_intel_matches m9 WHERE m9.ip=s.ip ORDER BY m9.last_seen_at DESC LIMIT 1), '') AS source_scope,
+  COALESCE(s.xp, 0) AS xp,
+  COALESCE(s.level, 0) AS level,
   CASE
-    WHEN COALESCE(MAX(s.level), 0) >= 6 THEN 'tier6'
-    WHEN COALESCE(MAX(s.level), 0) >= 5 THEN 'tier5'
-    WHEN COALESCE(MAX(s.level), 0) >= 4 THEN 'tier4'
-    WHEN COALESCE(MAX(s.level), 0) >= 3 THEN 'tier3'
-    WHEN COALESCE(MAX(s.level), 0) >= 2 THEN 'tier2'
-    WHEN COALESCE(MAX(s.level), 0) >= 1 THEN 'tier1'
+    WHEN COALESCE(s.level, 0) >= 6 THEN 'tier6'
+    WHEN COALESCE(s.level, 0) >= 5 THEN 'tier5'
+    WHEN COALESCE(s.level, 0) >= 4 THEN 'tier4'
+    WHEN COALESCE(s.level, 0) >= 3 THEN 'tier3'
+    WHEN COALESCE(s.level, 0) >= 2 THEN 'tier2'
+    WHEN COALESCE(s.level, 0) >= 1 THEN 'tier1'
     ELSE 'tier0'
   END AS tier,
-  COALESCE(MAX(s.risk_state), 'monitoring') AS risk_state
-FROM threat_intel_matches m
-LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
+  COALESCE(s.risk_state, 'monitoring') AS risk_state
+FROM threat_intel_ip_state s
+LEFT JOIN blocked_ips b ON b.ip = s.ip
 WHERE ` + strings.Join(where, " AND ") + `
-GROUP BY m.ip
-HAVING SUM(m.hits) >= ? AND SUM(m.hits) < ?
-ORDER BY SUM(m.hits) DESC, MAX(m.last_seen_at) DESC
+ORDER BY COALESCE((SELECT SUM(mx.hits) FROM threat_intel_matches mx WHERE mx.ip=s.ip AND mx.last_seen_at>=?), 0) DESC, s.last_seen_at DESC
 LIMIT ? OFFSET ?`
-	args = append(args, eventMinHits, offenderMinHits)
+	args = append([]any{
+		since.UTC().Format(time.RFC3339Nano),
+		since.UTC().Format(time.RFC3339Nano),
+		since.UTC().Format(time.RFC3339Nano),
+		since.UTC().Format(time.RFC3339Nano),
+		since.UTC().Format(time.RFC3339Nano),
+		since.UTC().Format(time.RFC3339Nano),
+	}, args...)
+	args = append(args, since.UTC().Format(time.RFC3339Nano))
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, err
@@ -2952,6 +3100,68 @@ LIMIT ?`, ip, since.UTC().Format(time.RFC3339Nano), limit)
 	return out, rows.Err()
 }
 
+func (s *Store) ListThreatIntelEvidenceByTrace(ctx context.Context, traceID string, limit int) ([]model.ThreatTraceEvidence, error) {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
+		return nil, fmt.Errorf("trace id required")
+	}
+	if limit <= 0 || limit > 2000 {
+		limit = 250
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT ip, feed, host, path, country, mode, decision, hits, last_seen_at, source_scope, xp_after, level_after, tier_after, last_trace_id
+FROM threat_intel_matches
+WHERE last_trace_id=?
+ORDER BY last_seen_at ASC
+LIMIT ?`, traceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.ThreatTraceEvidence{}
+	for rows.Next() {
+		var it model.ThreatTraceEvidence
+		var last string
+		if err := rows.Scan(&it.IP, &it.Feed, &it.Host, &it.Path, &it.Country, &it.Mode, &it.Decision, &it.Hits, &last, &it.SourceScope, &it.XP, &it.Level, &it.Tier, &it.TraceID); err != nil {
+			return nil, err
+		}
+		it.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListTraceTimelineEntries(ctx context.Context, traceID string, limit int) ([]model.ThreatTraceTimelineEntry, error) {
+	traceID = strings.ToLower(strings.TrimSpace(traceID))
+	if traceID == "" {
+		return nil, fmt.Errorf("trace id required")
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT event_at, event_kind, trace_id, ip, actor, action, target, source_ip, decision, feed, host, path, country, mode, source_scope, hits, xp, level, tier, summary, meta
+FROM trace_events
+WHERE trace_id=?
+ORDER BY event_at ASC, id ASC
+LIMIT ?`, traceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.ThreatTraceTimelineEntry{}
+	for rows.Next() {
+		var it model.ThreatTraceTimelineEntry
+		var eventAt string
+		if err := rows.Scan(&eventAt, &it.Kind, &it.TraceID, &it.IP, &it.Actor, &it.Action, &it.Target, &it.SourceIP, &it.Decision, &it.Feed, &it.Host, &it.Path, &it.Country, &it.Mode, &it.SourceScope, &it.Hits, &it.XP, &it.Level, &it.Tier, &it.Summary, &it.Meta); err != nil {
+			return nil, err
+		}
+		it.Timestamp = parseTimeOrZero(eventAt)
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListThreatIntelOffenders(ctx context.Context, since time.Time, offenderMinHits, limit, offset int) ([]model.ThreatIntelOffender, int64, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200
@@ -2959,33 +3169,30 @@ func (s *Store) ListThreatIntelOffenders(ctx context.Context, since time.Time, o
 	if offset < 0 {
 		offset = 0
 	}
-	if offenderMinHits <= 1 {
-		offenderMinHits = 10
+	hardLevel := 6
+	if offenderMinHits > 1 {
+		hardLevel = offenderMinHits
 	}
 	var total int64
-	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := s.db.QueryRowContext(ctx, `
-SELECT COUNT(1) FROM (
-  SELECT m.ip
-  FROM threat_intel_matches m
-  LEFT JOIN blocked_ips b ON b.ip = m.ip
-  LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
-  WHERE m.last_seen_at >= ? AND b.ip IS NULL AND (s.level > 0 OR s.xp > 0 OR (s.ban_until != '' AND s.ban_until > ?))
-  GROUP BY m.ip
-  HAVING SUM(m.hits) >= ?
-) t`, since.UTC().Format(time.RFC3339Nano), now, offenderMinHits).Scan(&total); err != nil {
+SELECT COUNT(1)
+FROM threat_intel_ip_state s
+LEFT JOIN blocked_ips b ON b.ip = s.ip
+WHERE b.ip IS NULL
+  AND s.level >= 3
+  AND s.level < ?`, hardLevel).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT m.ip,
-       SUM(m.hits) AS total_hits,
-       COUNT(DISTINCT m.feed) AS distinct_feeds,
-       COUNT(DISTINCT m.host) AS distinct_hosts,
+SELECT s.ip,
+       COALESCE((SELECT SUM(m.hits) FROM threat_intel_matches m WHERE m.ip=s.ip AND m.last_seen_at>=?), 0) AS total_hits,
+       COALESCE((SELECT COUNT(DISTINCT m.feed) FROM threat_intel_matches m WHERE m.ip=s.ip AND m.last_seen_at>=?), 0) AS distinct_feeds,
+       COALESCE((SELECT COUNT(DISTINCT m.host) FROM threat_intel_matches m WHERE m.ip=s.ip AND m.last_seen_at>=?), 0) AS distinct_hosts,
        COALESCE((
          SELECT GROUP_CONCAT(x, ' | ') FROM (
            SELECT (CASE WHEN COALESCE(mf.feed, '') = '' THEN '(none)' ELSE mf.feed END || ' (' || SUM(mf.hits) || ')') AS x
-           FROM threat_intel_matches mf
-           WHERE mf.ip = m.ip AND mf.last_seen_at >= ?
+            FROM threat_intel_matches mf
+           WHERE mf.ip = s.ip AND mf.last_seen_at >= ?
            GROUP BY mf.feed
            ORDER BY SUM(mf.hits) DESC
            LIMIT 3
@@ -2994,35 +3201,40 @@ SELECT m.ip,
        COALESCE((
          SELECT m2.decision
          FROM threat_intel_matches m2
-         WHERE m2.ip = m.ip
+         WHERE m2.ip = s.ip
          ORDER BY m2.last_seen_at DESC
          LIMIT 1
        ), 'monitor_observe') AS latest_decision,
-       MAX(m.last_seen_at),
-       CASE WHEN b.ip IS NULL THEN 0 ELSE 1 END AS blocked,
+       s.last_seen_at,
+       COALESCE((
+         SELECT m3.last_trace_id
+         FROM threat_intel_matches m3
+         WHERE m3.ip = s.ip
+         ORDER BY m3.last_seen_at DESC
+         LIMIT 1
+       ), '') AS last_trace_id,
+       0 AS blocked,
        CASE WHEN a.ip IS NULL THEN 0 ELSE 1 END AS allowlisted,
-       COALESCE(MAX(s.xp), 0) AS xp,
-       COALESCE(MAX(s.level), 0) AS level,
+       COALESCE(s.xp, 0) AS xp,
+       COALESCE(s.level, 0) AS level,
        CASE
-         WHEN COALESCE(MAX(s.level), 0) >= 6 THEN 'tier6'
-         WHEN COALESCE(MAX(s.level), 0) >= 5 THEN 'tier5'
-         WHEN COALESCE(MAX(s.level), 0) >= 4 THEN 'tier4'
-         WHEN COALESCE(MAX(s.level), 0) >= 3 THEN 'tier3'
-         WHEN COALESCE(MAX(s.level), 0) >= 2 THEN 'tier2'
-         WHEN COALESCE(MAX(s.level), 0) >= 1 THEN 'tier1'
+         WHEN COALESCE(s.level, 0) >= 6 THEN 'tier6'
+         WHEN COALESCE(s.level, 0) >= 5 THEN 'tier5'
+         WHEN COALESCE(s.level, 0) >= 4 THEN 'tier4'
+         WHEN COALESCE(s.level, 0) >= 3 THEN 'tier3'
+         WHEN COALESCE(s.level, 0) >= 2 THEN 'tier2'
+         WHEN COALESCE(s.level, 0) >= 1 THEN 'tier1'
          ELSE 'tier0'
        END AS tier,
-       COALESCE(MAX(s.risk_state), 'monitoring') AS risk_state
-FROM threat_intel_matches m
-LEFT JOIN blocked_ips b ON b.ip = m.ip
-LEFT JOIN threat_intel_allowlist a ON a.ip = m.ip
-LEFT JOIN threat_intel_ip_state s ON s.ip = m.ip
-WHERE m.last_seen_at >= ? AND b.ip IS NULL
-  AND (s.level > 0 OR s.xp > 0 OR (s.ban_until != '' AND s.ban_until > ?))
-GROUP BY m.ip, b.ip, a.ip
-HAVING SUM(m.hits) >= ?
-ORDER BY total_hits DESC, MAX(m.last_seen_at) DESC
-LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), since.UTC().Format(time.RFC3339Nano), now, offenderMinHits, limit, offset)
+       COALESCE(s.risk_state, 'monitoring') AS risk_state
+FROM threat_intel_ip_state s
+LEFT JOIN blocked_ips b ON b.ip = s.ip
+LEFT JOIN threat_intel_allowlist a ON a.ip = s.ip
+WHERE b.ip IS NULL
+  AND s.level >= 3
+  AND s.level < ?
+ORDER BY total_hits DESC, s.last_seen_at DESC
+LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), since.UTC().Format(time.RFC3339Nano), since.UTC().Format(time.RFC3339Nano), since.UTC().Format(time.RFC3339Nano), hardLevel, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -3030,14 +3242,15 @@ LIMIT ? OFFSET ?`, since.UTC().Format(time.RFC3339Nano), since.UTC().Format(time
 	out := []model.ThreatIntelOffender{}
 	for rows.Next() {
 		var o model.ThreatIntelOffender
-		var feedSummary, decisions, last string
+		var feedSummary, decisions, last, lastTrace string
 		var blocked, allowlisted int
-		if err := rows.Scan(&o.IP, &o.TotalHits, &o.DistinctFeeds, &o.DistinctHosts, &feedSummary, &decisions, &last, &blocked, &allowlisted, &o.XP, &o.Level, &o.Tier, &o.RiskState); err != nil {
+		if err := rows.Scan(&o.IP, &o.TotalHits, &o.DistinctFeeds, &o.DistinctHosts, &feedSummary, &decisions, &last, &lastTrace, &blocked, &allowlisted, &o.XP, &o.Level, &o.Tier, &o.RiskState); err != nil {
 			return nil, 0, err
 		}
 		o.FeedSummary = strings.TrimSpace(feedSummary)
 		o.Decisions = decisions
 		o.LastSeenAt, _ = time.Parse(time.RFC3339Nano, last)
+		o.LastTraceID = strings.TrimSpace(lastTrace)
 		o.Blocked = blocked != 0
 		o.Allowlisted = allowlisted != 0
 		out = append(out, o)
@@ -3090,6 +3303,13 @@ SELECT b.ip,
        COUNT(DISTINCT m.feed) AS distinct_feeds,
        COUNT(DISTINCT m.host) AS distinct_hosts,
        COALESCE(MAX(m.last_seen_at), '') AS last_seen_at,
+       COALESCE((
+         SELECT m3.last_trace_id
+         FROM threat_intel_matches m3
+         WHERE m3.ip = b.ip
+         ORDER BY m3.last_seen_at DESC
+         LIMIT 1
+       ), '') AS last_trace_id,
        COALESCE(MAX(s.xp), 0) AS xp,
        COALESCE(MAX(s.level), 0) AS level,
        CASE
@@ -3116,14 +3336,15 @@ LIMIT ? OFFSET ?`, queryArgs...)
 	out := []model.ThreatIntelBlocked{}
 	for rows.Next() {
 		var b model.ThreatIntelBlocked
-		var blockedOn, blockedUntil, updated, last string
-		if err := rows.Scan(&b.IP, &b.Reason, &b.History, &blockedOn, &blockedUntil, &updated, &b.TotalHits, &b.DistinctFeeds, &b.DistinctHosts, &last, &b.XP, &b.Level, &b.Tier, &b.RiskState); err != nil {
+		var blockedOn, blockedUntil, updated, last, lastTrace string
+		if err := rows.Scan(&b.IP, &b.Reason, &b.History, &blockedOn, &blockedUntil, &updated, &b.TotalHits, &b.DistinctFeeds, &b.DistinctHosts, &last, &lastTrace, &b.XP, &b.Level, &b.Tier, &b.RiskState); err != nil {
 			return nil, 0, err
 		}
 		b.BlockedOn = parseTimeOrZero(blockedOn)
 		b.BlockedUntil = parseTimeOrZero(blockedUntil)
 		b.UpdatedAt = parseTimeOrZero(updated)
 		b.LastSeenAt = parseTimeOrZero(last)
+		b.LastTraceID = strings.TrimSpace(lastTrace)
 		out = append(out, b)
 	}
 	if err := rows.Err(); err != nil {

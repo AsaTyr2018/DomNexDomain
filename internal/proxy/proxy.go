@@ -36,12 +36,17 @@ type HostSource interface {
 	ListSSHBastionRoutes(ctx context.Context) ([]model.SSHBastionRoute, error)
 	PublicIPv4(ctx context.Context) string
 	AddAuditEvent(ctx context.Context, e model.AuditEvent) error
+	AddTraceEvent(ctx context.Context, e model.TraceEvent) error
 	GetStyleSettings(ctx context.Context) (string, string, error)
 	GetThreatIntelSnapshot(ctx context.Context) (model.ThreatIntelSnapshot, error)
 	ApplyThreatIntelEvent(ctx context.Context, in model.ThreatIntelEventInput) (model.ThreatIntelEventResult, error)
 	IsIPBlocked(ctx context.Context, ip string) (bool, error)
 	UpsertBlockedIP(ctx context.Context, ip, reason string) error
 }
+
+type traceContextKey string
+
+const requestTraceContextKey traceContextKey = "domnex-request-trace-id"
 
 type Engine struct {
 	source   HostSource
@@ -326,6 +331,12 @@ func (e *Engine) Handler() http.Handler {
 		var publicIP string
 		var blocked bool
 		var scannerSignal bool
+		var traceID string
+		if r.URL.Path != edgeLogoPath {
+			traceID, _ = randomHex(8)
+			r = r.WithContext(context.WithValue(r.Context(), requestTraceContextKey, traceID))
+			sw.Header().Set("X-DomNex-Trace", traceID)
+		}
 		defer func() {
 			hostLabel := "_unknown"
 			host := r.Host
@@ -381,6 +392,43 @@ func (e *Engine) Handler() http.Handler {
 				})
 			}
 			edgeError := strings.EqualFold(strings.TrimSpace(sw.Header().Get("X-DomNex-Edge-Error")), "1")
+			if traceID != "" && clientIP != "" {
+				traceHost := hostLabel
+				if selectedRoute != nil && strings.TrimSpace(selectedRoute.host.FQDN) != "" {
+					traceHost = selectedRoute.host.FQDN
+				}
+				traceCountry := strings.TrimSpace(strings.ToUpper(country))
+				if traceCountry == "" {
+					traceCountry = e.countryFromHeaders(r)
+				}
+				if traceCountry == "" {
+					traceCountry = e.geo.CountryCode(r.Context(), clientIP)
+				}
+				traceSourceType := requestScope(clientIP, publicIP)
+				decision := "completed"
+				if blocked {
+					decision = "blocked"
+				} else if edgeError {
+					decision = "edge_error"
+				}
+				_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+					TraceID:     traceID,
+					Kind:        "flow",
+					Actor:       "edge",
+					Action:      "request.completed",
+					Target:      traceHost,
+					SourceIP:    clientIP,
+					IP:          clientIP,
+					Host:        traceHost,
+					Path:        r.URL.Path,
+					Country:     traceCountry,
+					Decision:    decision,
+					Mode:        strconv.Itoa(sw.StatusCode()),
+					SourceScope: traceSourceType,
+					Summary:     "Request completed at edge",
+					Hits:        sw.BytesWritten(),
+				})
+			}
 			if e.tr != nil && selectedRoute != nil && !edgeError {
 				contentIn := int64(0)
 				if r.ContentLength > 0 {
@@ -419,11 +467,40 @@ func (e *Engine) Handler() http.Handler {
 		managedApex := e.managed[host]
 		tiSnap := e.tiSnap
 		e.mu.RUnlock()
+		if traceID != "" {
+			_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+				TraceID:     traceID,
+				Kind:        "flow",
+				Actor:       "edge",
+				Action:      "request.ingress",
+				Target:      host,
+				SourceIP:    clientIP,
+				IP:          clientIP,
+				Host:        host,
+				Path:        r.URL.Path,
+				Mode:        r.Method,
+				SourceScope: requestScope(clientIP, publicIP),
+				Summary:     "Request accepted at edge",
+			})
+		}
 		selectedRoute = route
 		if isBlockedIP, _ := e.source.IsIPBlocked(r.Context(), clientIP); isBlockedIP {
 			blocked = true
 			scannerSignal = true
-			traceID, _ := randomHex(8)
+			_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+				TraceID:     traceID,
+				Kind:        "flow",
+				Actor:       "edge",
+				Action:      "policy.blocked_ip",
+				Target:      host,
+				SourceIP:    clientIP,
+				IP:          clientIP,
+				Host:        host,
+				Path:        r.URL.Path,
+				Decision:    "hard_drop",
+				SourceScope: requestScope(clientIP, publicIP),
+				Summary:     "Source matched blocked IP list before routing",
+			})
 			e.auditProxyEvent(r.Context(), "proxy.block.hard_drop", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";reason=blocked_ip")
 			dropConnection(sw)
 			return
@@ -445,7 +522,6 @@ func (e *Engine) Handler() http.Handler {
 					country = e.geo.CountryCode(r.Context(), clientIP)
 				}
 			}
-			traceID, _ := randomHex(8)
 			scope := requestScope(clientIP, publicIP)
 			mode := strings.ToLower(strings.TrimSpace(tiSnap.Mode))
 			if mode == "" {
@@ -473,10 +549,40 @@ func (e *Engine) Handler() http.Handler {
 				scannerSignal = true
 				if out.HardBlock {
 					blocked = true
+					_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+						TraceID:     traceID,
+						Kind:        "flow",
+						Actor:       "edge",
+						Action:      "policy.threat_intel.hard_block",
+						Target:      host,
+						SourceIP:    clientIP,
+						IP:          clientIP,
+						Host:        host,
+						Path:        r.URL.Path,
+						Country:     country,
+						Decision:    "hard_drop",
+						SourceScope: scope,
+						Summary:     "Threat Intel escalated request to hard block",
+					})
 					e.auditProxyEvent(r.Context(), "proxy.block.hard_drop", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";reason=threat_intel_hardblock")
 					dropConnection(sw)
 					return
 				}
+				_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+					TraceID:     traceID,
+					Kind:        "flow",
+					Actor:       "edge",
+					Action:      "policy.threat_intel.soft_block",
+					Target:      host,
+					SourceIP:    clientIP,
+					IP:          clientIP,
+					Host:        host,
+					Path:        r.URL.Path,
+					Country:     country,
+					Decision:    "soft_block",
+					SourceScope: scope,
+					Summary:     "Threat Intel escalated request to temporary block",
+				})
 				e.renderSmartErrorPage(sw, r, smartErrorPage{
 					HTTPStatus:   http.StatusTooManyRequests,
 					Title:        "Temporarily Blocked",
@@ -493,7 +599,21 @@ func (e *Engine) Handler() http.Handler {
 		}
 		if isBlocked, until, _ := e.wafIsBlocked(clientIP, publicIP); isBlocked {
 			scannerSignal = true
-			traceID, _ := randomHex(8)
+			_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+				TraceID:     traceID,
+				Kind:        "flow",
+				Actor:       "edge",
+				Action:      "policy.waf.active",
+				Target:      host,
+				SourceIP:    clientIP,
+				IP:          clientIP,
+				Host:        host,
+				Path:        r.URL.Path,
+				Decision:    "soft_block",
+				SourceScope: requestScope(clientIP, publicIP),
+				Summary:     "WAF soft block already active for source",
+				EventAt:     until.UTC(),
+			})
 			e.auditProxyEvent(r.Context(), "proxy.waf.temp_block.hit", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path+";until="+until.UTC().Format(time.RFC3339))
 			e.renderSmartErrorPage(sw, r, smartErrorPage{
 				HTTPStatus:   http.StatusTooManyRequests,
@@ -511,12 +631,22 @@ func (e *Engine) Handler() http.Handler {
 		if !ok {
 			scannerSignal = true
 			if managedApex {
-				traceID, _ := randomHex(8)
+				_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+					TraceID:  traceID,
+					Kind:     "flow",
+					Actor:    "edge",
+					Action:   "routing.managed_apex",
+					Target:   host,
+					SourceIP: clientIP,
+					IP:       clientIP,
+					Host:     host,
+					Path:     r.URL.Path,
+					Summary:  "Managed apex landing page served",
+				})
 				e.renderManagedDomainPage(host, traceID, sw, r)
 				return
 			}
 			if threatIntelRecognized {
-				traceID, _ := randomHex(8)
 				e.renderSmartErrorPage(sw, r, smartErrorPage{
 					HTTPStatus:   http.StatusNotFound,
 					Title:        "Nothing here yet",
@@ -530,9 +660,24 @@ func (e *Engine) Handler() http.Handler {
 				return
 			}
 			triggered, until, hits := e.wafTrackUnknownHost(clientIP, publicIP)
-			traceID, _ := randomHex(8)
 			if triggered {
 				scannerSignal = true
+				_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+					TraceID:     traceID,
+					Kind:        "flow",
+					Actor:       "edge",
+					Action:      "policy.waf.set",
+					Target:      host,
+					SourceIP:    clientIP,
+					IP:          clientIP,
+					Host:        host,
+					Path:        r.URL.Path,
+					Decision:    "soft_block",
+					SourceScope: requestScope(clientIP, publicIP),
+					Hits:        int64(hits),
+					Summary:     "Unknown-host flood tripped WAF soft block",
+					EventAt:     until.UTC(),
+				})
 				e.log.Warn("waf temporary block set", map[string]any{
 					"source":  clientIP,
 					"host":    host,
@@ -569,7 +714,6 @@ func (e *Engine) Handler() http.Handler {
 			return
 		}
 		if isBastionHost {
-			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.error.unknown_host", host, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
 			e.renderSmartErrorPage(sw, r, smartErrorPage{
 				HTTPStatus:   http.StatusNotFound,
@@ -584,13 +728,11 @@ func (e *Engine) Handler() http.Handler {
 			return
 		}
 		if route.host.State == "disabled" {
-			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.error.host_disabled", route.host.FQDN, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
 			e.renderHostDisabledPage(route.host, traceID, sw, r)
 			return
 		}
 		if route.host.State == "maintenance" && !isLANClient(clientIP, publicIP) {
-			traceID, _ := randomHex(8)
 			e.auditProxyEvent(r.Context(), "proxy.error.maintenance", route.host.FQDN, "trace="+traceID+";source="+clientIP+";path="+r.URL.Path)
 			e.renderHostMaintenancePage(route.host, traceID, sw, r)
 			return
@@ -602,7 +744,22 @@ func (e *Engine) Handler() http.Handler {
 		if deny, mode := e.isGeoBlocked(country, route.host); deny {
 			blocked = true
 			scannerSignal = true
-			traceID, _ := randomHex(8)
+			_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+				TraceID:     traceID,
+				Kind:        "flow",
+				Actor:       "edge",
+				Action:      "policy.geo_block",
+				Target:      route.host.FQDN,
+				SourceIP:    clientIP,
+				IP:          clientIP,
+				Host:        route.host.FQDN,
+				Path:        r.URL.Path,
+				Country:     country,
+				Mode:        mode,
+				Decision:    "blocked",
+				SourceScope: requestScope(clientIP, publicIP),
+				Summary:     "Geo policy denied request",
+			})
 			if e.m != nil {
 				e.m.GeoBlocks.WithLabelValues(route.host.FQDN, country, mode).Inc()
 			}
@@ -641,8 +798,21 @@ func (e *Engine) Handler() http.Handler {
 			idx, online, total, offline := e.selectBackendIndex(route)
 			if idx < 0 {
 				scannerSignal = true
-				traceID, _ := randomHex(8)
 				scope := requestScope(clientIP, publicIP)
+				_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+					TraceID:     traceID,
+					Kind:        "flow",
+					Actor:       "edge",
+					Action:      "routing.ha_down",
+					Target:      route.host.FQDN,
+					SourceIP:    clientIP,
+					IP:          clientIP,
+					Host:        route.host.FQDN,
+					Path:        r.URL.Path,
+					Decision:    "origin_unreachable",
+					SourceScope: scope,
+					Summary:     "All HA backends were unavailable",
+				})
 				e.log.Warn("ha all backends unreachable", map[string]any{
 					"fqdn":    route.host.FQDN,
 					"online":  online,
@@ -664,9 +834,37 @@ func (e *Engine) Handler() http.Handler {
 				})
 				return
 			}
+			_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+				TraceID:     traceID,
+				Kind:        "flow",
+				Actor:       "edge",
+				Action:      "routing.selected",
+				Target:      route.host.FQDN,
+				SourceIP:    clientIP,
+				IP:          clientIP,
+				Host:        route.host.FQDN,
+				Path:        r.URL.Path,
+				Decision:    "route_selected",
+				SourceScope: requestScope(clientIP, publicIP),
+				Summary:     "HA route selected an available backend",
+			})
 			route.backends[idx].proxy.ServeHTTP(sw, r)
 			return
 		}
+		_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+			TraceID:     traceID,
+			Kind:        "flow",
+			Actor:       "edge",
+			Action:      "routing.selected",
+			Target:      route.host.FQDN,
+			SourceIP:    clientIP,
+			IP:          clientIP,
+			Host:        route.host.FQDN,
+			Path:        r.URL.Path,
+			Decision:    "route_selected",
+			SourceScope: requestScope(clientIP, publicIP),
+			Summary:     "Request routed to configured upstream",
+		})
 		route.proxy.ServeHTTP(sw, r)
 	})
 }
@@ -993,9 +1191,27 @@ func newReverseProxy(e *Engine, u *url.URL, h model.Host, upstreamRef string) *h
 		rp.FlushInterval = 100 * time.Millisecond
 	}
 	rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		traceID, _ := randomHex(8)
+		traceID := traceIDFromContext(r.Context())
+		if traceID == "" {
+			traceID, _ = randomHex(8)
+		}
 		clientIP := e.clientIPFromRequest(r)
 		e.log.Error("proxy error", map[string]any{"host": r.Host, "upstream": upstreamRef, "traceID": traceID, "source": clientIP, "err": err.Error()})
+		_ = e.source.AddTraceEvent(r.Context(), model.TraceEvent{
+			TraceID:     traceID,
+			Kind:        "flow",
+			Actor:       "edge",
+			Action:      "origin.error",
+			Target:      h.FQDN,
+			SourceIP:    clientIP,
+			IP:          clientIP,
+			Host:        h.FQDN,
+			Path:        r.URL.Path,
+			Decision:    "origin_unreachable",
+			SourceScope: requestScope(clientIP, e.source.PublicIPv4(context.Background())),
+			Summary:     "Configured origin could not be reached",
+			Meta:        "upstream=" + upstreamRef + ";err=" + err.Error(),
+		})
 		e.auditProxyEvent(r.Context(), "proxy.error.origin_unreachable", h.FQDN, "trace="+traceID+";source="+clientIP+";upstream="+upstreamRef+";path="+r.URL.Path+";err="+err.Error())
 		e.mu.RLock()
 		publicIP := e.publicIP
@@ -1270,6 +1486,14 @@ func requestScope(clientIP, publicIP string) string {
 		return "internal (LAN/hairpin request)"
 	}
 	return "external (internet request)"
+}
+
+func traceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(requestTraceContextKey).(string)
+	return strings.TrimSpace(v)
 }
 
 func (e *Engine) auditProxyEvent(ctx context.Context, action, target, meta string) {

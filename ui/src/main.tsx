@@ -179,8 +179,8 @@ type ThreatSignatureConfig = {
 type ThreatIntelFeed = { id: number; name: string; url: string; enabled: boolean; isDefault?: boolean; entryCount?: number; lastSyncAt?: string; lastError?: string; lastHash?: string; createdAt?: string; updatedAt?: string };
 type ThreatIntelMatch = { id: number; ip: string; feed: string; host: string; path: string; targetCount?: number; country: string; mode: string; decision: string; hits: number; firstSeenAt: string; lastSeenAt: string; lastTraceId?: string; sourceScope?: string; xp?: number; level?: number; tier?: string; riskState?: string };
 type ThreatIntelTarget = { host: string; path: string; feed: string; decision: string; hits: number; lastSeenAt: string };
-type ThreatIntelOffender = { ip: string; totalHits: number; distinctFeeds: number; distinctHosts: number; feedSummary?: string; decisions: string; lastSeenAt: string; blocked: boolean; allowlisted: boolean; xp?: number; level?: number; tier?: string; riskState?: string };
-type ThreatIntelBlocked = { ip: string; reason?: string; history?: string; blockedOn?: string; blockedUntil?: string; updatedAt: string; totalHits: number; distinctFeeds: number; distinctHosts: number; lastSeenAt?: string; xp?: number; level?: number; tier?: string; riskState?: string };
+type ThreatIntelOffender = { ip: string; totalHits: number; distinctFeeds: number; distinctHosts: number; feedSummary?: string; decisions: string; lastSeenAt: string; lastTraceId?: string; blocked: boolean; allowlisted: boolean; xp?: number; level?: number; tier?: string; riskState?: string };
+type ThreatIntelBlocked = { ip: string; reason?: string; history?: string; blockedOn?: string; blockedUntil?: string; updatedAt: string; totalHits: number; distinctFeeds: number; distinctHosts: number; lastSeenAt?: string; lastTraceId?: string; xp?: number; level?: number; tier?: string; riskState?: string };
 type ThreatIntelMetaDashboard = {
   totalBannedIps: number;
   averageEscalationSeconds: number;
@@ -197,6 +197,10 @@ type ThreatIntelMetaDashboard = {
 type ThreatIntelMatchesPage = { items: ThreatIntelMatch[]; total: number; page: number; pageSize: number };
 type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; page: number; pageSize: number };
 type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
+type ThreatTraceTimelineEntry = { timestamp: string; kind: 'evidence' | 'action'; traceId: string; ip?: string; actor?: string; action?: string; target?: string; sourceIp?: string; decision?: string; feed?: string; host?: string; path?: string; country?: string; mode?: string; sourceScope?: string; hits?: number; xp?: number; level?: number; tier?: string; summary?: string; meta?: string };
+type ThreatTraceTimeline = { traceId: string; items: ThreatTraceTimelineEntry[] };
+type ThreatIntelStatusFilter = 'all' | 'watch' | 'softblock' | 'hardblock' | 'monitoring';
+type ThreatIntelSourceFilter = 'all' | 'signature' | 'feed' | 'behavior';
 type DashboardWidgetType =
   | 'ha_alerts'
   | 'kpi_overview'
@@ -680,9 +684,14 @@ function App() {
   const [tiOffenders, setTiOffenders] = useState<ThreatIntelOffender[]>([]);
   const [tiAllowlist, setTiAllowlist] = useState<BlockedIP[]>([]);
   const [tiHours, setTiHours] = useState(24);
-  const [tiDecision, setTiDecision] = useState('all');
   const [tiQuery, setTiQuery] = useState('');
-  const [tiView, setTiView] = useState<'meta' | 'events' | 'offenders'>('meta');
+  const [tiView, setTiView] = useState<'meta' | 'new' | 'watched' | 'blocked'>('meta');
+  const [tiStatusFilter, setTiStatusFilter] = useState<ThreatIntelStatusFilter>('all');
+  const [tiSourceFilter, setTiSourceFilter] = useState<ThreatIntelSourceFilter>('all');
+  const [tiLoadError, setTiLoadError] = useState('');
+  const [traceTimeline, setTraceTimeline] = useState<ThreatTraceTimelineEntry[]>([]);
+  const [traceTimelineID, setTraceTimelineID] = useState('');
+  const [traceTimelineError, setTraceTimelineError] = useState('');
   const [tiMeta, setTiMeta] = useState<ThreatIntelMetaDashboard | null>(null);
   const [tiPage, setTiPage] = useState(1);
   const [tiPageSize, setTiPageSize] = useState(100);
@@ -691,7 +700,6 @@ function App() {
   const [tiTotalBlocked, setTiTotalBlocked] = useState(0);
   const [tiFeedsOpen, setTiFeedsOpen] = useState(false);
   const [tiAllowOpen, setTiAllowOpen] = useState(false);
-  const [tiBlockedOpen, setTiBlockedOpen] = useState(false);
   const [tiTargetsOpen, setTiTargetsOpen] = useState(false);
   const [tiTargetsIP, setTiTargetsIP] = useState('');
   const [tiTargets, setTiTargets] = useState<ThreatIntelTarget[]>([]);
@@ -1240,15 +1248,18 @@ function App() {
   };
 
   const loadThreatIntel = async () => {
-    try {
-      const [cfg, feeds, allow, blockedSummary, sig, meta] = await Promise.all([
-        api<ThreatIntelConfig>('/api/v1/threat-intel/config'),
-        api<{ items: ThreatIntelFeed[] }>('/api/v1/threat-intel/feeds'),
-        api<{ items: BlockedIP[] }>('/api/v1/threat-intel/allowlist'),
-        api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=&page=1&pageSize=1`),
-        api<ThreatSignatureConfig>('/api/v1/threat-intel/signatures/config'),
-        api<ThreatIntelMetaDashboard>('/api/v1/threat-intel/meta'),
-      ]);
+    const errs: string[] = [];
+    const base = await Promise.allSettled([
+      api<ThreatIntelConfig>('/api/v1/threat-intel/config'),
+      api<{ items: ThreatIntelFeed[] }>('/api/v1/threat-intel/feeds'),
+      api<{ items: BlockedIP[] }>('/api/v1/threat-intel/allowlist'),
+      api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=&page=1&pageSize=1`),
+      api<ThreatSignatureConfig>('/api/v1/threat-intel/signatures/config'),
+      api<ThreatIntelMetaDashboard>('/api/v1/threat-intel/meta'),
+    ]);
+    const [cfgRes, feedsRes, allowRes, blockedSummaryRes, sigRes, metaRes] = base;
+    if (cfgRes.status === 'fulfilled') {
+      const cfg = cfgRes.value;
       setTiConfig({
         enabled: !!cfg.enabled,
         mode: (cfg.mode || 'monitor_only') as 'monitor_only' | 'auto_mode',
@@ -1262,8 +1273,26 @@ function App() {
         hardLevel: Number(cfg.hardLevel || 6),
         softBlockMinutes: Number(cfg.softBlockMinutes || 15),
       });
-      setTiFeeds(feeds.items || []);
-      setTiAllowlist(allow.items || []);
+    } else {
+      errs.push(`config: ${String(cfgRes.reason)}`);
+    }
+    if (feedsRes.status === 'fulfilled') {
+      setTiFeeds(feedsRes.value.items || []);
+    } else {
+      errs.push(`feeds: ${String(feedsRes.reason)}`);
+    }
+    if (allowRes.status === 'fulfilled') {
+      setTiAllowlist(allowRes.value.items || []);
+    } else {
+      errs.push(`allowlist: ${String(allowRes.reason)}`);
+    }
+    if (blockedSummaryRes.status === 'fulfilled') {
+      setTiTotalBlocked(Number(blockedSummaryRes.value.total || 0));
+    } else {
+      errs.push(`blocked-summary: ${String(blockedSummaryRes.reason)}`);
+    }
+    if (sigRes.status === 'fulfilled') {
+      const sig = sigRes.value;
       setTiSigConfig({
         enabled: !!sig.enabled,
         autoUpdate: !!sig.autoUpdate,
@@ -1273,25 +1302,44 @@ function App() {
         ruleCount: Number(sig.ruleCount || 0),
         source: sig.source || '',
       });
-      setTiMeta(meta || null);
-      setTiTotalBlocked(Number(blockedSummary.total || 0));
-      if (tiView === 'events') {
-        const matchesPage = await api<ThreatIntelMatchesPage>(`/api/v1/threat-intel/matches?hours=${encodeURIComponent(String(tiHours))}&decision=${encodeURIComponent(tiDecision)}&q=${encodeURIComponent(tiQuery)}&page=${encodeURIComponent(String(tiPage))}&pageSize=${encodeURIComponent(String(tiPageSize))}`);
+    } else {
+      errs.push(`signatures: ${String(sigRes.reason)}`);
+    }
+    if (metaRes.status === 'fulfilled') {
+      setTiMeta(metaRes.value || null);
+    } else {
+      errs.push(`meta: ${String(metaRes.reason)}`);
+    }
+
+    try {
+      if (tiView === 'new') {
+        const matchesPage = await api<ThreatIntelMatchesPage>(`/api/v1/threat-intel/matches?hours=${encodeURIComponent(String(tiHours))}&decision=all&q=${encodeURIComponent(tiQuery)}&page=${encodeURIComponent(String(tiPage))}&pageSize=${encodeURIComponent(String(tiPageSize))}`);
         setTiMatches(matchesPage.items || []);
         setTiTotalMatches(Number(matchesPage.total || 0));
-      } else if (tiView === 'offenders') {
+      } else if (tiView === 'watched') {
         const offendersPage = await api<ThreatIntelOffendersPage>(`/api/v1/threat-intel/offenders?hours=${encodeURIComponent(String(tiHours))}&page=${encodeURIComponent(String(tiPage))}&pageSize=${encodeURIComponent(String(tiPageSize))}`);
         setTiOffenders(offendersPage.items || []);
         setTiTotalOffenders(Number(offendersPage.total || 0));
-      }
-      if (tiBlockedOpen) {
-        const blockedPage = await api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=${encodeURIComponent(tiQuery)}&page=1&pageSize=500`);
+      } else if (tiView === 'blocked') {
+        const blockedPage = await api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=${encodeURIComponent(tiQuery)}&page=${encodeURIComponent(String(tiPage))}&pageSize=${encodeURIComponent(String(tiPageSize))}`);
         setTiBlocked(blockedPage.items || []);
         setTiTotalBlocked(Number(blockedPage.total || 0));
       }
-    } catch {
-      // Keep previous data on transient failures.
+    } catch (e) {
+      const msg = (e as Error).message || String(e);
+      errs.push(`${tiView}: ${msg}`);
+      if (tiView === 'new') {
+        setTiMatches([]);
+        setTiTotalMatches(0);
+      } else if (tiView === 'watched') {
+        setTiOffenders([]);
+        setTiTotalOffenders(0);
+      } else if (tiView === 'blocked') {
+        setTiBlocked([]);
+      }
     }
+
+    setTiLoadError(errs.join(' | '));
   };
 
   useEffect(() => {
@@ -1380,11 +1428,16 @@ function App() {
   }, [tab, strategicIntelTab]);
 
   useEffect(() => {
+    if (tab !== 'strategicIntel' || strategicIntelTab !== 'investigations') return;
+    void loadTraceTimeline();
+  }, [tab, strategicIntelTab, logQuery]);
+
+  useEffect(() => {
     if (tab !== 'threatIntel') return;
     void loadThreatIntel();
     const t = window.setInterval(() => { void loadThreatIntel(); }, 8000);
     return () => window.clearInterval(t);
-  }, [tab, tiHours, tiDecision, tiQuery, tiPage, tiPageSize, tiView, tiBlockedOpen]);
+  }, [tab, tiHours, tiQuery, tiPage, tiPageSize, tiView]);
 
   useEffect(() => {
     if (identity?.role !== 'admin') return;
@@ -1414,7 +1467,7 @@ function App() {
 
   useEffect(() => {
     setTiPage(1);
-  }, [tiHours, tiDecision, tiQuery, tiView, tiPageSize]);
+  }, [tiHours, tiQuery, tiView, tiPageSize]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3965,23 +4018,49 @@ function App() {
     }
   };
 
-  const openThreatIntelBlocked = async () => {
-    setLoading(true);
-    setError('');
+  const openTraceInvestigation = (traceID: string) => {
+    const trace = (traceID || '').trim();
+    if (!trace) return;
+    setLogQuery(trace);
+    setStrategicIntelTab('investigations');
+    setTab('strategicIntel');
+  };
+
+  const loadTraceTimeline = async () => {
+    const traceID = extractTraceNeedles(logQuery)[0] || '';
+    if (!traceID) {
+      setTraceTimelineID('');
+      setTraceTimeline([]);
+      setTraceTimelineError('');
+      return;
+    }
     try {
-      const out = await api<ThreatIntelBlockedPage>(`/api/v1/threat-intel/blocked?hours=${encodeURIComponent(String(tiHours))}&q=${encodeURIComponent(tiQuery)}&page=1&pageSize=500`);
-      setTiBlocked(out.items || []);
-      setTiTotalBlocked(Number(out.total || 0));
-      setTiBlockedOpen(true);
+      const out = await api<ThreatTraceTimeline>(`/api/v1/threat-intel/traces/${encodeURIComponent(traceID)}?limit=500`);
+      setTraceTimelineID(out.traceId || traceID);
+      setTraceTimeline(out.items || []);
+      setTraceTimelineError('');
     } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setLoading(false);
+      setTraceTimelineID(traceID);
+      setTraceTimeline([]);
+      setTraceTimelineError((e as Error).message || String(e));
     }
   };
 
-  const tiTotalCurrent = tiView === 'events' ? tiTotalMatches : tiView === 'offenders' ? tiTotalOffenders : 0;
+  const tiTotalCurrent = tiView === 'new' ? tiTotalMatches : tiView === 'watched' ? tiTotalOffenders : tiView === 'blocked' ? tiTotalBlocked : 0;
   const tiPageCount = Math.max(1, Math.ceil(Math.max(0, tiTotalCurrent) / Math.max(1, tiPageSize)));
+  const threatSourceClass = (raw: string): ThreatIntelSourceFilter[] => {
+    const text = (raw || '').toLowerCase();
+    const out: ThreatIntelSourceFilter[] = [];
+    if (text.includes('signature.')) out.push('signature');
+    if (text.includes('behavior.') || text.includes('protocol.')) out.push('behavior');
+    if (/(^|[, |])(?!behavior\.|protocol\.|signature\.)[a-z0-9_.:-]+/i.test(text)) out.push('feed');
+    return out.length ? out : ['behavior'];
+  };
+  const threatStateMatches = (state?: string) => tiStatusFilter === 'all' || (state || '').toLowerCase() === tiStatusFilter;
+  const threatSourceMatches = (text: string) => tiSourceFilter === 'all' || threatSourceClass(text).includes(tiSourceFilter);
+  const tiMatchesFiltered = tiMatches.filter((m) => threatStateMatches(m.riskState) && threatSourceMatches(`${m.feed} ${m.decision}`));
+  const tiOffendersFiltered = tiOffenders.filter((o) => threatStateMatches(o.riskState) && threatSourceMatches(`${o.feedSummary || ''} ${o.decisions || ''}`));
+  const tiBlockedFiltered = tiBlocked.filter((b) => threatStateMatches(b.riskState) && threatSourceMatches(`${b.reason || ''} ${b.history || ''}`));
   const tabTitle: Record<Tab, string> = {
     dashboard: 'Dashboard',
     strategicIntel: 'Strategic Intel',
@@ -4238,35 +4317,45 @@ function App() {
                   <div className="muted" style={{ marginBottom: '.55rem' }}>
                     Pivot from one indicator across retained event data. Use source IP, trace id, actor, action, target or meta fragments.
                   </div>
+                  {extractTraceNeedles(logQuery).length > 0 ? (
+                    <div className="muted" style={{ marginBottom: '.55rem' }}>
+                      Trace pivot active. Preview below shows the decision path and related retained events for this trace.
+                    </div>
+                  ) : null}
                   <div className="row" style={{ marginBottom: '.5rem' }}>
                     <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="Pivot value (IP / trace / actor / target / path)" />
-                    <button className="btn" onClick={() => setStrategicIntelTab('events')}>Run in Events</button>
+                    <button className="btn" onClick={loadTraceTimeline}>Refresh Pivot</button>
                   </div>
-                  <div className="muted">Result preview from current filter:</div>
+                  {traceTimelineError ? <div className="error" style={{ marginBottom: '.55rem' }}>Trace timeline issue: {traceTimelineError}</div> : null}
+                  <div className="muted">Chronological trace timeline:</div>
                   <div className="log-table-wrap" style={{ marginTop: '.4rem' }}>
                     <table className="log-table">
                       <thead>
                         <tr>
                           <th>Time</th>
-                          <th>Action</th>
-                          <th>Actor</th>
+                          <th>Type</th>
+                          <th>Summary</th>
+                          <th>Decision / Action</th>
+                          <th>Details</th>
                           <th>Target</th>
                           <th>Source</th>
                           <th>Trace</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {filteredAudit.slice(0, 20).map((e) => (
-                          <tr key={`inv-${e.id}`}>
-                            <td>{new Date(e.createdAt).toLocaleString()}</td>
-                            <td><code>{e.action}</code></td>
-                            <td>{e.actor || '-'}</td>
-                            <td>{e.target || '-'}</td>
-                            <td>{extractSourceIP(e) || '-'}</td>
-                            <td><code>{extractTraceID(e) || '-'}</code></td>
+                        {traceTimeline.map((e, idx) => (
+                          <tr key={`trace-timeline-${idx}-${e.timestamp}`}>
+                            <td>{formatDateTime(e.timestamp)}</td>
+                            <td><span className={`badge ${e.kind === 'evidence' ? 'ok' : e.kind === 'flow' ? 'warn' : 'err'}`}>{e.kind === 'evidence' ? 'Evidence' : e.kind === 'flow' ? 'Flow' : 'Action'}</span></td>
+                            <td>{e.kind === 'evidence' ? `${e.host || '-'}${e.path || ''} · ${e.feed || '-'}` : (e.summary || e.host || e.target || '-')}</td>
+                            <td>{e.kind === 'evidence' ? <span className={`badge ${threatDecisionBadge(e.decision || '').cls}`}>{threatDecisionBadge(e.decision || '').label}</span> : <code>{e.action || e.decision || '-'}</code>}</td>
+                            <td>{e.kind === 'evidence' ? `L${e.level || 0} · XP ${e.xp || 0} · ${e.tier || '-'}` : (e.meta || `${e.sourceScope || '-'}${e.country ? ` · ${e.country}` : ''}`)}</td>
+                            <td>{e.target || e.ip || '-'}</td>
+                            <td>{e.sourceIp || e.country || e.sourceScope || '-'}</td>
+                            <td><code>{e.traceId || traceTimelineID || '-'}</code></td>
                           </tr>
                         ))}
-                        {filteredAudit.length === 0 ? <tr><td colSpan={6} className="muted">No matching events.</td></tr> : null}
+                        {traceTimeline.length === 0 ? <tr><td colSpan={8} className="muted">No trace timeline available for the current pivot.</td></tr> : null}
                       </tbody>
                     </table>
                   </div>
@@ -4531,14 +4620,14 @@ function App() {
                     <h3>Threat Data</h3>
                     <div className="row" style={{ marginBottom: 0 }}>
                       <button className="btn" onClick={() => setTiAllowOpen(true)}>Allowlist</button>
-                      <button className="btn danger" onClick={openThreatIntelBlocked}>Blocked ({tiTotalBlocked})</button>
                     </div>
                   </div>
                   <div className="row">
                     <div className="wizard-steps" style={{ marginBottom: 0 }}>
                       <button className={tiView === 'meta' ? 'wiz active' : 'wiz'} onClick={() => setTiView('meta')}>Meta Dashboard</button>
-                      <button className={tiView === 'events' ? 'wiz active' : 'wiz'} onClick={() => setTiView('events')}>Events</button>
-                      <button className={tiView === 'offenders' ? 'wiz active' : 'wiz'} onClick={() => setTiView('offenders')}>Offenders</button>
+                      <button className={tiView === 'new' ? 'wiz active' : 'wiz'} onClick={() => setTiView('new')}>New</button>
+                      <button className={tiView === 'watched' ? 'wiz active' : 'wiz'} onClick={() => setTiView('watched')}>Watched</button>
+                      <button className={tiView === 'blocked' ? 'wiz active' : 'wiz'} onClick={() => setTiView('blocked')}>Blocked</button>
                     </div>
                     <select value={String(tiHours)} onChange={(e) => setTiHours(Number(e.target.value) || 24)}>
                       <option value="1">Last 1h</option>
@@ -4554,22 +4643,34 @@ function App() {
                         <option value="500">500 / page</option>
                       </select>
                     ) : null}
-                    {tiView === 'events' ? (
-                      <select value={tiDecision} onChange={(e) => setTiDecision(e.target.value)}>
-                        <option value="all">All decisions</option>
-                        <option value="monitor_observe">Monitor</option>
-                        <option value="soft_block_set">Soft block set</option>
-                        <option value="soft_block_active">Soft block active</option>
-                        <option value="hard_block_set">Hard block set</option>
-                        <option value="hard_block_permanent">Hard block active</option>
+                    {tiView !== 'meta' ? (
+                      <select value={tiStatusFilter} onChange={(e) => setTiStatusFilter(e.target.value as ThreatIntelStatusFilter)}>
+                        <option value="all">All states</option>
+                        <option value="watch">Watch</option>
+                        <option value="softblock">Soft block</option>
+                        <option value="hardblock">Hard block</option>
+                        <option value="monitoring">Monitoring</option>
+                      </select>
+                    ) : null}
+                    {tiView !== 'meta' ? (
+                      <select value={tiSourceFilter} onChange={(e) => setTiSourceFilter(e.target.value as ThreatIntelSourceFilter)}>
+                        <option value="all">All sources</option>
+                        <option value="signature">Pattern signatures</option>
+                        <option value="feed">Threat feeds</option>
+                        <option value="behavior">Behavior / protocol</option>
                       </select>
                     ) : null}
                     <input value={tiQuery} onChange={(e) => setTiQuery(e.target.value)} placeholder="Search ip/host/path/feed/country" />
                   </div>
+                  {tiLoadError ? <div className="error" style={{ marginBottom: '.55rem' }}>Threat Intel load issue: {tiLoadError}</div> : null}
                   <div className="muted" style={{ marginBottom: '.55rem' }}>
                     {tiView === 'meta'
                       ? 'Meta Dashboard summarizes block lifecycle quality and rehabilitation behavior.'
-                      : `Showing page ${tiPage} / ${tiPageCount} · total records: ${tiTotalCurrent} · Events: repeated IPs only (hits >= ${tiConfig.eventMinHits || 2}, < ${tiConfig.offenderMinHits || 10}) · Offenders: burst offenders (hits >= ${tiConfig.offenderMinHits || 10}) · Tiering: XP + Level + State`}
+                      : tiView === 'new'
+                        ? `Showing page ${tiPage} / ${tiPageCount} · total records: ${tiTotalCurrent} · filtered: ${tiMatchesFiltered.length} · New = level 0 to <3. Full rehab removes entries from this view.`
+                        : tiView === 'watched'
+                          ? `Showing page ${tiPage} / ${tiPageCount} · total records: ${tiTotalCurrent} · filtered: ${tiOffendersFiltered.length} · Watched = level 3 to <${tiConfig.hardLevel || 6}. Rehabilitated blocked IPs re-enter here at level 3.`
+                          : `Showing page ${tiPage} / ${tiPageCount} · total records: ${tiTotalCurrent} · filtered: ${tiBlockedFiltered.length} · Blocked = active hard blocks at level ${tiConfig.hardLevel || 6}.`}
                   </div>
                   <div className="log-table-wrap">
                     {tiView === 'meta' ? (
@@ -4584,40 +4685,44 @@ function App() {
                         <MetricTile label="Hard Ban Avg Decay" value={formatDurationShort(tiMeta?.hardBanAvgDecaySeconds || 0)} hint="Hard-ban -> rehab" />
                         <MetricTile label="False-Positive Rehabilitated Share" value={`${(tiMeta?.falsePositiveRehabSharePct || 0).toFixed(1)}%`} hint={`${tiMeta?.falsePositiveRehabCount || 0} of ${tiMeta?.rehabCount || 0} rehab cases`} />
                       </div>
-                    ) : tiView === 'events' ? (
+                    ) : tiView === 'new' ? (
                       <table className="log-table">
                         <thead>
                           <tr>
                             <th>Last Seen</th>
                             <th>IP</th>
+                            <th>State</th>
                             <th>Decision</th>
                             <th>Hits</th>
-                            <th className="ti-tier-col">Tier</th>
+                            <th className="ti-tier-col">Level</th>
                             <th className="ti-feed-col">Feed</th>
+                            <th>Trace</th>
                             <th>Targets</th>
                             <th>Country</th>
-                            <th>Trace</th>
                             <th>Action</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {tiMatches.length === 0 ? (
-                            <tr><td colSpan={10} className="muted">No repeated threat events in current filter.</td></tr>
-                          ) : tiMatches.map((m) => (
+                          {tiMatchesFiltered.length === 0 ? (
+                            <tr><td colSpan={10} className="muted">No new IPs in the current level window.</td></tr>
+                          ) : tiMatchesFiltered.map((m) => (
                             <tr key={`ti-match-${m.id}`}>
                               <td>{new Date(m.lastSeenAt).toLocaleString()}</td>
                               <td><code>{m.ip}</code></td>
+                              <td><span className={`badge ${m.riskState === 'hardblock' ? 'err' : m.riskState === 'softblock' ? 'warn' : 'ok'}`}>{humanThreatState(m.riskState)}</span></td>
                               <td><span className={`badge ${threatDecisionBadge(m.decision).cls}`}>{threatDecisionBadge(m.decision).label}</span></td>
                               <td>{m.hits}</td>
                               <td className="ti-tier-col"><span className={`badge ${m.riskState === 'hardblock' ? 'err' : m.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(m.tier || 'tier0').toUpperCase()} · L{m.level || 0} · XP {m.xp || 0}</span></td>
                               <td className="ti-feed-col">{m.feed}</td>
+                              <td>
+                                {m.lastTraceId ? <button className="btn" onClick={() => openTraceInvestigation(m.lastTraceId)}><code>{m.lastTraceId}</code></button> : <code>-</code>}
+                              </td>
                               <td>
                                 <button className="btn" onClick={() => openThreatIntelTargets(m.ip)} disabled={loading}>
                                   View ({m.targetCount || 0})
                                 </button>
                               </td>
                               <td>{m.country || 'ZZ'}</td>
-                              <td><code>{m.lastTraceId || '-'}</code></td>
                               <td>
                                 <button className="btn danger" onClick={() => threatIntelBlockIP(m.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Block</button>
                               </td>
@@ -4625,27 +4730,34 @@ function App() {
                           ))}
                         </tbody>
                       </table>
-                    ) : (
+                    ) : tiView === 'watched' ? (
                       <table className="log-table">
                         <thead>
                           <tr>
+                            <th>Last Seen</th>
                             <th>IP</th>
+                            <th>State</th>
+                            <th>Trace</th>
                             <th>Hits</th>
                             <th>Feeds</th>
                             <th>Hosts</th>
                             <th className="ti-feed-col">Feed Breakdown</th>
                             <th>Decision</th>
-                            <th className="ti-tier-col">Tier</th>
-                            <th>Last Seen</th>
+                            <th className="ti-tier-col">Level</th>
                             <th>Action</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {tiOffenders.length === 0 ? (
-                            <tr><td colSpan={9} className="muted">No burst offenders ({'>='}{tiConfig.offenderMinHits || 10} hits) in current filter.</td></tr>
-                          ) : tiOffenders.map((o) => (
+                          {tiOffendersFiltered.length === 0 ? (
+                            <tr><td colSpan={10} className="muted">No watched IPs in the current level window.</td></tr>
+                          ) : tiOffendersFiltered.map((o) => (
                             <tr key={`ti-off-${o.ip}`}>
+                              <td>{new Date(o.lastSeenAt).toLocaleString()}</td>
                               <td><code>{o.ip}</code></td>
+                              <td><span className={`badge ${o.riskState === 'hardblock' ? 'err' : o.riskState === 'softblock' ? 'warn' : 'ok'}`}>{humanThreatState(o.riskState)}</span></td>
+                              <td>
+                                {o.lastTraceId ? <button className="btn" onClick={() => openTraceInvestigation(o.lastTraceId!)}><code>{o.lastTraceId}</code></button> : <code>-</code>}
+                              </td>
                               <td>{o.totalHits}</td>
                               <td>{o.distinctFeeds}</td>
                               <td>{o.distinctHosts}</td>
@@ -4657,11 +4769,55 @@ function App() {
                                 })()}
                               </td>
                               <td className="ti-tier-col"><span className={`badge ${o.riskState === 'hardblock' ? 'err' : o.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(o.tier || 'tier0').toUpperCase()} · L{o.level || 0} · XP {o.xp || 0}</span></td>
-                              <td>{new Date(o.lastSeenAt).toLocaleString()}</td>
                               <td>
                                 <div className="row" style={{ marginBottom: 0 }}>
                                   <button className="btn danger" onClick={() => threatIntelBlockIP(o.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Block</button>
                                   {o.allowlisted ? <span className="badge ok">allowlisted</span> : null}
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <table className="log-table">
+                        <thead>
+                          <tr>
+                            <th>Last Seen</th>
+                            <th>IP</th>
+                            <th>State</th>
+                            <th>Trace</th>
+                            <th>Reason</th>
+                            <th>Hits</th>
+                            <th>Feed/Host</th>
+                            <th className="ti-tier-col">Level</th>
+                            <th>Blocked On</th>
+                            <th>Blocked Until</th>
+                            <th>Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {tiBlockedFiltered.length === 0 ? (
+                            <tr><td colSpan={11} className="muted">No blocked entries in current filter.</td></tr>
+                          ) : tiBlockedFiltered.map((b) => (
+                            <tr key={`ti-blocked-inline-${b.ip}`}>
+                              <td>{formatDateTime(b.lastSeenAt)}</td>
+                              <td><code>{b.ip}</code></td>
+                              <td><span className={`badge ${b.riskState === 'hardblock' ? 'err' : b.riskState === 'softblock' ? 'warn' : 'ok'}`}>{humanThreatState(b.riskState)}</span></td>
+                              <td>
+                                {b.lastTraceId ? <button className="btn" onClick={() => openTraceInvestigation(b.lastTraceId!)}><code>{b.lastTraceId}</code></button> : <code>-</code>}
+                              </td>
+                              <td>{b.reason || '-'}</td>
+                              <td>{b.totalHits || 0}</td>
+                              <td>{b.distinctFeeds || 0} / {b.distinctHosts || 0}</td>
+                              <td className="ti-tier-col"><span className={`badge ${b.riskState === 'hardblock' ? 'err' : b.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(b.tier || 'tier0').toUpperCase()} · L{b.level || 0} · XP {b.xp || 0}</span></td>
+                              <td>{formatDateTime(b.blockedOn || b.updatedAt)}</td>
+                              <td>{(b.blockedUntil && formatDateTime(b.blockedUntil) !== '-') ? formatDateTime(b.blockedUntil) : ((b.riskState || '').toLowerCase() === 'hardblock' ? 'Permanent' : '-')}</td>
+                              <td>
+                                <div className="row" style={{ marginBottom: 0 }}>
+                                  <button className="btn" onClick={() => openThreatIntelTargets(b.ip)} disabled={loading}>Details</button>
+                                  <button className="btn danger" onClick={() => unblockIP(b.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Unblock</button>
+                                  <button className="btn" onClick={() => threatIntelAllowIP(b.ip, 'allow from blocked list')} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Allow</button>
                                 </div>
                               </td>
                             </tr>
@@ -7350,63 +7506,6 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         </div>
       ) : null}
 
-      {identity && tiBlockedOpen ? (
-        <div className="overlay modal-overlay">
-          <div className="login-card modal-card" style={{ maxWidth: '1080px', width: '96vw' }}>
-            <div className="modal-head">
-              <h3>Threat Intel Blocked Entries</h3>
-            </div>
-            <div className="row modal-controls">
-              <div className="muted">Compact blocked list with timing + tier state. Total blocked: {tiTotalBlocked}</div>
-              <button className="btn" onClick={openThreatIntelBlocked} disabled={loading}>Refresh</button>
-              <button className="btn" onClick={() => setTiBlockedOpen(false)}>Close</button>
-            </div>
-            <div className="modal-body">
-              <div className="log-table-wrap modal-table-wrap">
-                <table className="log-table">
-                  <thead>
-                    <tr>
-                      <th>IP</th>
-                      <th>Reason</th>
-                      <th>Hits</th>
-                      <th>Feed/Host</th>
-                      <th className="ti-tier-col">Tier</th>
-                      <th>Last Seen</th>
-                      <th>Blocked On</th>
-                      <th>Blocked Until</th>
-                      <th>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tiBlocked.length === 0 ? (
-                      <tr><td colSpan={9} className="muted">No blocked entries in current filter.</td></tr>
-                    ) : tiBlocked.map((b) => (
-                      <tr key={`ti-blocked-${b.ip}`}>
-                        <td><code>{b.ip}</code></td>
-                        <td>{b.reason || '-'}</td>
-                        <td>{b.totalHits || 0}</td>
-                        <td>{b.distinctFeeds || 0} / {b.distinctHosts || 0}</td>
-                        <td className="ti-tier-col"><span className={`badge ${b.riskState === 'hardblock' ? 'err' : b.riskState === 'softblock' ? 'warn' : 'ok'}`}>{(b.tier || 'tier0').toUpperCase()} · L{b.level || 0} · XP {b.xp || 0}</span></td>
-                        <td>{formatDateTime(b.lastSeenAt)}</td>
-                        <td>{formatDateTime(b.blockedOn || b.updatedAt)}</td>
-                        <td>{(b.blockedUntil && formatDateTime(b.blockedUntil) !== '-') ? formatDateTime(b.blockedUntil) : ((b.riskState || '').toLowerCase() === 'hardblock' ? 'Permanent' : '-')}</td>
-                        <td>
-                          <div className="row" style={{ marginBottom: 0 }}>
-                            <button className="btn" onClick={() => openThreatIntelTargets(b.ip)} disabled={loading}>Details</button>
-                            <button className="btn danger" onClick={() => unblockIP(b.ip)} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Unblock</button>
-                            <button className="btn" onClick={() => threatIntelAllowIP(b.ip, 'allow from blocked list')} disabled={loading || isReadOnlyRole || identity?.role !== 'admin'}>Allow</button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
       {identity && tiTargetsOpen ? (
         <div className="overlay modal-overlay">
           <div className="login-card modal-card" style={{ maxWidth: '1100px', width: '95vw' }}>
@@ -7904,6 +8003,15 @@ function threatDecisionBadge(decision: string): { cls: 'ok' | 'warn' | 'err'; la
   if (d.includes('check')) return { cls: 'warn', label: 'Check' };
   if (d.includes('monitor') || d.includes('observe')) return { cls: 'ok', label: 'Monitor' };
   return { cls: 'ok', label: 'Other' };
+}
+
+function humanThreatState(state?: string): string {
+  const s = (state || '').trim().toLowerCase();
+  if (s === 'watch') return 'Watch';
+  if (s === 'softblock') return 'Soft Block';
+  if (s === 'hardblock') return 'Hard Block';
+  if (s === 'monitoring') return 'Monitoring';
+  return state || '-';
 }
 
 type TokenScopeAccess = 'none' | 'read' | 'write' | 'rw';

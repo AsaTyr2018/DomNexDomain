@@ -240,6 +240,71 @@ type ThreatIntelTarget struct {
 	LastSeenAt time.Time `json:"lastSeenAt"`
 }
 
+type ThreatTraceEvidence struct {
+	IP          string    `json:"ip"`
+	Feed        string    `json:"feed"`
+	Host        string    `json:"host"`
+	Path        string    `json:"path"`
+	Country     string    `json:"country"`
+	Mode        string    `json:"mode"`
+	Decision    string    `json:"decision"`
+	Hits        int64     `json:"hits"`
+	LastSeenAt  time.Time `json:"lastSeenAt"`
+	SourceScope string    `json:"sourceScope"`
+	XP          int       `json:"xp"`
+	Level       int       `json:"level"`
+	Tier        string    `json:"tier"`
+	TraceID     string    `json:"traceId"`
+}
+
+type ThreatTraceTimelineEntry struct {
+	Timestamp   time.Time `json:"timestamp"`
+	Kind        string    `json:"kind"` // evidence | action
+	TraceID     string    `json:"traceId"`
+	IP          string    `json:"ip,omitempty"`
+	Actor       string    `json:"actor,omitempty"`
+	Action      string    `json:"action,omitempty"`
+	Target      string    `json:"target,omitempty"`
+	SourceIP    string    `json:"sourceIp,omitempty"`
+	Decision    string    `json:"decision,omitempty"`
+	Feed        string    `json:"feed,omitempty"`
+	Host        string    `json:"host,omitempty"`
+	Path        string    `json:"path,omitempty"`
+	Country     string    `json:"country,omitempty"`
+	Mode        string    `json:"mode,omitempty"`
+	SourceScope string    `json:"sourceScope,omitempty"`
+	Hits        int64     `json:"hits,omitempty"`
+	XP          int       `json:"xp,omitempty"`
+	Level       int       `json:"level,omitempty"`
+	Tier        string    `json:"tier,omitempty"`
+	Summary     string    `json:"summary,omitempty"`
+	Meta        string    `json:"meta,omitempty"`
+}
+
+type TraceEvent struct {
+	TraceID     string    `json:"traceId"`
+	Kind        string    `json:"kind"`
+	Actor       string    `json:"actor,omitempty"`
+	Action      string    `json:"action,omitempty"`
+	Target      string    `json:"target,omitempty"`
+	Meta        string    `json:"meta,omitempty"`
+	SourceIP    string    `json:"sourceIp,omitempty"`
+	IP          string    `json:"ip,omitempty"`
+	Decision    string    `json:"decision,omitempty"`
+	Feed        string    `json:"feed,omitempty"`
+	Host        string    `json:"host,omitempty"`
+	Path        string    `json:"path,omitempty"`
+	Country     string    `json:"country,omitempty"`
+	Mode        string    `json:"mode,omitempty"`
+	SourceScope string    `json:"sourceScope,omitempty"`
+	Hits        int64     `json:"hits,omitempty"`
+	XP          int       `json:"xp,omitempty"`
+	Level       int       `json:"level,omitempty"`
+	Tier        string    `json:"tier,omitempty"`
+	Summary     string    `json:"summary,omitempty"`
+	EventAt     time.Time `json:"eventAt"`
+}
+
 type ThreatIntelOffender struct {
 	IP            string    `json:"ip"`
 	TotalHits     int64     `json:"totalHits"`
@@ -248,6 +313,7 @@ type ThreatIntelOffender struct {
 	FeedSummary   string    `json:"feedSummary"`
 	Decisions     string    `json:"decisions"`
 	LastSeenAt    time.Time `json:"lastSeenAt"`
+	LastTraceID   string    `json:"lastTraceId"`
 	Blocked       bool      `json:"blocked"`
 	Allowlisted   bool      `json:"allowlisted"`
 	XP            int       `json:"xp"`
@@ -267,6 +333,7 @@ type ThreatIntelBlocked struct {
 	DistinctFeeds int64     `json:"distinctFeeds"`
 	DistinctHosts int64     `json:"distinctHosts"`
 	LastSeenAt    time.Time `json:"lastSeenAt"`
+	LastTraceID   string    `json:"lastTraceId"`
 	XP            int       `json:"xp"`
 	Level         int       `json:"level"`
 	Tier          string    `json:"tier"`

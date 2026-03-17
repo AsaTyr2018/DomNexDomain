@@ -117,7 +117,6 @@ const (
 	defaultTISoftMinLevel     = 3
 	defaultTIHardLevel        = 6
 	defaultTISoftBlockMinutes = 15
-	defaultTIHardToWatchDays  = 60
 	defaultTIWatchLevel       = 3
 )
 
@@ -194,13 +193,14 @@ type RetentionPurgeResult struct {
 	VisitorHashes       int64 `json:"visitorHashes"`
 	ThreatMatches       int64 `json:"threatMatches"`
 	ThreatStates        int64 `json:"threatStates"`
+	TraceEvents         int64 `json:"traceEvents"`
 	BlockedIPs          int64 `json:"blockedIps"`
 	LoginAttempts       int64 `json:"loginAttempts"`
 	PasswordResetTokens int64 `json:"passwordResetTokens"`
 }
 
 func (r RetentionPurgeResult) Total() int64 {
-	return r.AuditEvents + r.TrafficBuckets + r.VisitorHashes + r.ThreatMatches + r.ThreatStates + r.BlockedIPs + r.LoginAttempts + r.PasswordResetTokens
+	return r.AuditEvents + r.TrafficBuckets + r.VisitorHashes + r.ThreatMatches + r.ThreatStates + r.TraceEvents + r.BlockedIPs + r.LoginAttempts + r.PasswordResetTokens
 }
 
 type TimeSyncProbe struct {
@@ -547,6 +547,11 @@ type ThreatIntelBlockedPage struct {
 	Total    int64                      `json:"total"`
 	Page     int                        `json:"page"`
 	PageSize int                        `json:"pageSize"`
+}
+
+type ThreatTraceTimeline struct {
+	TraceID string                           `json:"traceId"`
+	Items   []model.ThreatTraceTimelineEntry `json:"items"`
 }
 
 func normalizeRequestClass(class string) string {
@@ -1755,6 +1760,10 @@ func (s *Service) ListHosts(ctx context.Context) ([]model.Host, error) {
 
 func (s *Service) AddAuditEvent(ctx context.Context, e model.AuditEvent) error {
 	return s.store.AddAuditEvent(ctx, e)
+}
+
+func (s *Service) AddTraceEvent(ctx context.Context, e model.TraceEvent) error {
+	return s.store.RecordTraceEvent(ctx, e)
 }
 
 func (s *Service) IsSourceBlocked(ctx context.Context, ip string) (bool, bool, time.Time, string, error) {
@@ -4080,17 +4089,7 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 	}
 
 	decayThreatState(&st, now)
-	externalHit := hasExternalFeedSignal(in.Signals)
-	behaviorHit := hasBehaviorThreatSignal(in.Signals)
-	watchBoost := externalHit && !behaviorHit
-	if watchBoost && st.Level < defaultTIWatchLevel {
-		st.Level = defaultTIWatchLevel
-		minXP := threatLevelThreshold(defaultTIWatchLevel)
-		if st.XP < minXP {
-			st.XP = minXP
-		}
-		st.RiskState = "watch"
-	}
+	watchBoost := hasKnownThreatBoostSignal(in.Signals)
 	baseXP, topSignal := calcThreatBaseXP(in.Signals)
 	xpDelta := applyThreatMultipliers(baseXP, s.bumpThreatWindow(in.IP, topSignal, in.Signals, now), in.Signals)
 	if xpDelta < 0 {
@@ -4115,6 +4114,19 @@ func (s *Service) ApplyThreatIntelEvent(ctx context.Context, in model.ThreatInte
 		if st.XP > maxXP {
 			st.XP = maxXP
 		}
+	}
+	if watchBoost && st.Level < defaultTIWatchLevel {
+		st.Level = defaultTIWatchLevel
+		// Known bad IPs and pattern signatures enter directly into the watched band,
+		// but they should not skip straight into higher levels on the same event.
+		maxWatchXP := threatLevelThreshold(defaultTIWatchLevel) - 1
+		if maxWatchXP < 0 {
+			maxWatchXP = 0
+		}
+		if st.XP > maxWatchXP {
+			st.XP = maxWatchXP
+		}
+		st.RiskState = "watch"
 	}
 	st.RiskState = threatRiskState(st.Level, softMinLevel, hardLevel)
 	if watchBoost && !st.PermBlocked && (st.BanUntil.IsZero() || !st.BanUntil.After(now)) {
@@ -4261,20 +4273,24 @@ func calcThreatBaseXP(signals []string) (int, string) {
 
 func hasExternalFeedSignal(signals []string) bool {
 	for _, sig := range uniqueThreatSignals(signals) {
-		if !strings.HasPrefix(sig, "behavior.") && !strings.HasPrefix(sig, "protocol.") {
+		if !strings.HasPrefix(sig, "behavior.") && !strings.HasPrefix(sig, "protocol.") && !strings.HasPrefix(sig, "signature.") {
 			return true
 		}
 	}
 	return false
 }
 
-func hasBehaviorThreatSignal(signals []string) bool {
+func hasThreatSignatureSignal(signals []string) bool {
 	for _, sig := range uniqueThreatSignals(signals) {
-		if strings.HasPrefix(sig, "behavior.") || strings.HasPrefix(sig, "protocol.") {
+		if strings.HasPrefix(sig, "signature.") {
 			return true
 		}
 	}
 	return false
+}
+
+func hasKnownThreatBoostSignal(signals []string) bool {
+	return hasExternalFeedSignal(signals) || hasThreatSignatureSignal(signals)
 }
 
 func applyThreatMultipliers(base int, burstFactor float64, signals []string) int {
@@ -4431,13 +4447,13 @@ func (s *Service) ListThreatIntelOffenders(ctx context.Context, hours int, page,
 		pageSize = 1000
 	}
 	offset := (page - 1) * pageSize
-	shortHours := hours
-	if shortHours > 6 {
-		shortHours = 6
-	}
-	since := time.Now().UTC().Add(-time.Duration(shortHours) * time.Hour)
+	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
 	cfg, _ := s.store.GetThreatIntelConfig(ctx)
-	items, total, err := s.store.ListThreatIntelOffenders(ctx, since, cfg.OffenderMinHits, pageSize, offset)
+	hardLevel := cfg.HardLevel
+	if hardLevel <= 0 {
+		hardLevel = defaultTIHardLevel
+	}
+	items, total, err := s.store.ListThreatIntelOffenders(ctx, since, hardLevel, pageSize, offset)
 	if err != nil {
 		return ThreatIntelOffendersPage{}, err
 	}
@@ -4491,6 +4507,21 @@ func (s *Service) ListThreatIntelTargetsByIP(ctx context.Context, hours int, ip 
 	}
 	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
 	return s.store.ListThreatIntelTargetsByIP(ctx, since, ip, limit)
+}
+
+func (s *Service) GetThreatTraceTimeline(ctx context.Context, traceID string, limit int) (ThreatTraceTimeline, error) {
+	traceID = strings.ToLower(strings.TrimSpace(traceID))
+	if traceID == "" {
+		return ThreatTraceTimeline{}, fmt.Errorf("trace id required")
+	}
+	if limit <= 0 || limit > 2000 {
+		limit = 250
+	}
+	items, err := s.store.ListTraceTimelineEntries(ctx, traceID, limit)
+	if err != nil {
+		return ThreatTraceTimeline{}, err
+	}
+	return ThreatTraceTimeline{TraceID: traceID, Items: items}, nil
 }
 
 func (s *Service) ListThreatIntelAllowlist(ctx context.Context) ([]model.BlockedIP, error) {
@@ -4725,9 +4756,12 @@ func (s *Service) RunRetentionPurge(ctx context.Context) (RetentionPurgeResult, 
 	if out.ThreatStates, err = s.store.PurgeThreatIntelStateBefore(ctx, now.AddDate(0, 0, -policy.ThreatDays)); err != nil {
 		return out, err
 	}
-	if out.BlockedIPs, err = s.store.PurgeBlockedIPsBefore(ctx, now.AddDate(0, 0, -policy.BlockedDays)); err != nil {
+	if out.TraceEvents, err = s.store.PurgeTraceEventsBefore(ctx, now.AddDate(0, 0, -60)); err != nil {
 		return out, err
 	}
+	// Active blocked IP lifecycle is handled by Threat Intel decay/rehab so
+	// block windows are closed deliberately with matching rehab history updates.
+	out.BlockedIPs = 0
 	if out.LoginAttempts, err = s.store.PurgeLoginAttemptsBefore(ctx, now.AddDate(0, 0, -policy.LoginAttemptDays)); err != nil {
 		return out, err
 	}
@@ -4756,6 +4790,7 @@ func (s *Service) StartRetentionWorker(ctx context.Context) {
 			";visitors=" + strconv.FormatInt(result.VisitorHashes, 10) +
 			";threat_matches=" + strconv.FormatInt(result.ThreatMatches, 10) +
 			";threat_states=" + strconv.FormatInt(result.ThreatStates, 10) +
+			";trace_events=" + strconv.FormatInt(result.TraceEvents, 10) +
 			";blocked=" + strconv.FormatInt(result.BlockedIPs, 10) +
 			";login_attempts=" + strconv.FormatInt(result.LoginAttempts, 10) +
 			";password_reset_tokens=" + strconv.FormatInt(result.PasswordResetTokens, 10) +
@@ -4788,6 +4823,10 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 	cfg, cfgErr := s.store.GetThreatIntelConfig(ctx)
 	softMinLevel := defaultTISoftMinLevel
 	hardLevel := defaultTIHardLevel
+	retentionDays := s.getRetentionPolicy(ctx).BlockedDays
+	if retentionDays <= 0 {
+		retentionDays = 60
+	}
 	if cfgErr == nil {
 		if cfg.SoftMinLevel > 0 {
 			softMinLevel = cfg.SoftMinLevel
@@ -4815,22 +4854,37 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 	}
 	now := time.Now().UTC()
 	rehab := 0
+	firewallChanged := false
+	expiredBlocked, err := s.store.ListBlockedIPsBefore(ctx, now.AddDate(0, 0, -retentionDays), 50000)
+	if err != nil {
+		return 0, err
+	}
+	expiredByIP := make(map[string]model.BlockedIP, len(expiredBlocked))
+	for _, b := range expiredBlocked {
+		ip := strings.TrimSpace(b.IP)
+		if ip == "" {
+			continue
+		}
+		expiredByIP[ip] = b
+	}
 	for _, st := range states {
 		if st.IP == "" {
 			continue
 		}
-		idle := now.Sub(st.LastSeenAt)
-		// Lifecycle downgrade: long-lived hard blocks become watch entries, not infinite database growth.
-		if st.PermBlocked && idle >= time.Duration(defaultTIHardToWatchDays)*24*time.Hour {
+		if _, expired := expiredByIP[st.IP]; expired && st.PermBlocked {
 			st.PermBlocked = false
 			st.BanUntil = time.Time{}
 			st.RiskState = "watch"
 			st.Level = defaultTIWatchLevel
 			st.XP = threatLevelThreshold(defaultTIWatchLevel)
+			st.TempBlockCount = 0
 			st.LastSeenAt = now
-			idle = 0
-			_ = s.removeBlockedIPTracked(ctx, st.IP, false)
+			if err := s.removeBlockedIPTrackedOnly(ctx, st.IP, false, "hard_block_retention_expired"); err == nil {
+				firewallChanged = true
+				rehab++
+			}
 		}
+		idle := now.Sub(st.LastSeenAt)
 		decayThreatState(&st, now)
 		if !st.BanUntil.IsZero() && !st.BanUntil.After(now) {
 			_ = s.store.RecordThreatIntelRehabEvent(ctx, st.IP, true, "soft_ban_expired")
@@ -4861,6 +4915,28 @@ func (s *Service) ReconcileThreatIntelDecay(ctx context.Context) (int, error) {
 			s.log.Warn("threat intel state reconcile failed", map[string]any{"ip": st.IP, "err": err.Error()})
 		}
 	}
+	for ip := range expiredByIP {
+		if allow[ip] {
+			continue
+		}
+		found := false
+		for _, st := range states {
+			if st.IP == ip {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		if err := s.removeBlockedIPTrackedOnly(ctx, ip, false, "hard_block_retention_expired"); err == nil {
+			firewallChanged = true
+			rehab++
+		}
+	}
+	if firewallChanged {
+		_ = s.reconcileOSFirewall(ctx)
+	}
 	return rehab, nil
 }
 
@@ -4881,14 +4957,28 @@ func (s *Service) UpsertBlockedIP(ctx context.Context, ip, reason string) error 
 	return nil
 }
 
-func (s *Service) removeBlockedIPTracked(ctx context.Context, ip string, falsePositive bool) error {
+func (s *Service) removeBlockedIPTrackedOnly(ctx context.Context, ip string, falsePositive bool, reason string) error {
 	if err := s.store.RemoveBlockedIP(ctx, ip); err != nil {
 		return err
 	}
-	_ = s.store.RecordThreatIntelRehabEvent(ctx, ip, true, "blocked_ip_removed")
+	if strings.TrimSpace(reason) == "" {
+		reason = "blocked_ip_removed"
+	}
+	_ = s.store.RecordThreatIntelRehabEvent(ctx, ip, true, reason)
 	_ = s.store.CloseThreatIntelBanHistory(ctx, ip, "hard", falsePositive)
+	return nil
+}
+
+func (s *Service) removeBlockedIPTrackedWithReason(ctx context.Context, ip string, falsePositive bool, reason string) error {
+	if err := s.removeBlockedIPTrackedOnly(ctx, ip, falsePositive, reason); err != nil {
+		return err
+	}
 	_ = s.reconcileOSFirewall(ctx)
 	return nil
+}
+
+func (s *Service) removeBlockedIPTracked(ctx context.Context, ip string, falsePositive bool) error {
+	return s.removeBlockedIPTrackedWithReason(ctx, ip, falsePositive, "blocked_ip_removed")
 }
 
 func (s *Service) RemoveBlockedIP(ctx context.Context, ip string) error {

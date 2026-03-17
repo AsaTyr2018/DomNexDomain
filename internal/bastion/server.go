@@ -25,6 +25,7 @@ import (
 type AuthSource interface {
 	GetSSHBastionAuthByFingerprint(ctx context.Context, fingerprint string) (model.SSHBastionKeyAuth, error)
 	AddAuditEvent(ctx context.Context, e model.AuditEvent) error
+	AddTraceEvent(ctx context.Context, e model.TraceEvent) error
 	ApplyThreatIntelEvent(ctx context.Context, in model.ThreatIntelEventInput) (model.ThreatIntelEventResult, error)
 	IsSourceBlocked(ctx context.Context, ip string) (bool, bool, time.Time, string, error)
 }
@@ -58,6 +59,7 @@ func (s *Server) Start(ctx context.Context) error {
 		PublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			sourceIP := addrIP(meta.RemoteAddr())
 			if blocked, hard, until, why, err := s.src.IsSourceBlocked(context.Background(), sourceIP); err == nil && blocked {
+				traceID := sshTraceID(sourceIP, meta.User(), "auth_blocked")
 				blockReason := strings.TrimSpace(why)
 				if blockReason == "" {
 					if hard {
@@ -66,10 +68,24 @@ func (s *Server) Start(ctx context.Context) error {
 						blockReason = "threat_intel_softblock"
 					}
 				}
-				metaBits := "source=" + sourceIP + ";user=" + meta.User() + ";reason=" + blockReason
+				metaBits := "source=" + sourceIP + ";user=" + meta.User() + ";reason=" + blockReason + ";trace=" + traceID
 				if !until.IsZero() {
 					metaBits += ";until=" + until.UTC().Format(time.RFC3339)
 				}
+				_ = s.src.AddTraceEvent(context.Background(), model.TraceEvent{
+					TraceID:     traceID,
+					Kind:        "flow",
+					Actor:       "ssh-bastion",
+					Action:      "auth.blocked",
+					Target:      meta.User(),
+					SourceIP:    sourceIP,
+					IP:          sourceIP,
+					Host:        "ssh-bastion",
+					Path:        "auth",
+					Decision:    blockReason,
+					SourceScope: sourceScopeFromIP(sourceIP),
+					Summary:     "SSH bastion rejected a blocked source before key evaluation",
+				})
 				_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
 					Actor:  "ssh-bastion",
 					Action: "ssh.bastion.auth.blocked",
@@ -92,6 +108,20 @@ func (s *Server) Start(ctx context.Context) error {
 					Signals:     []string{"behavior.auth_failed", "protocol.ssh.auth_denied"},
 					Mode:        "auto_mode",
 				})
+				_ = s.src.AddTraceEvent(context.Background(), model.TraceEvent{
+					TraceID:     traceID,
+					Kind:        "flow",
+					Actor:       "ssh-bastion",
+					Action:      "auth.denied",
+					Target:      meta.User(),
+					SourceIP:    sourceIP,
+					IP:          sourceIP,
+					Host:        "ssh-bastion",
+					Path:        "auth",
+					Decision:    "publickey_denied",
+					SourceScope: sourceScopeFromIP(sourceIP),
+					Summary:     "SSH bastion rejected presented public key",
+				})
 				_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
 					Actor:  "ssh-bastion",
 					Action: "ssh.bastion.auth.denied",
@@ -100,11 +130,26 @@ func (s *Server) Start(ctx context.Context) error {
 				})
 				return nil, fmt.Errorf("unknown key")
 			}
+			traceID := sshTraceID(sourceIP, meta.User(), "auth_ok")
+			_ = s.src.AddTraceEvent(context.Background(), model.TraceEvent{
+				TraceID:     traceID,
+				Kind:        "flow",
+				Actor:       "ssh-bastion",
+				Action:      "auth.ok",
+				Target:      auth.Key.Name,
+				SourceIP:    sourceIP,
+				IP:          sourceIP,
+				Host:        "ssh-bastion",
+				Path:        "auth",
+				Decision:    "publickey_ok",
+				SourceScope: sourceScopeFromIP(sourceIP),
+				Summary:     "SSH bastion accepted public key",
+			})
 			_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
 				Actor:  "ssh-bastion",
 				Action: "ssh.bastion.auth.ok",
 				Target: auth.Key.Name,
-				Meta:   "fingerprint=" + fp + ";user=" + meta.User() + ";source=" + addrIP(meta.RemoteAddr()),
+				Meta:   "fingerprint=" + fp + ";user=" + meta.User() + ";source=" + addrIP(meta.RemoteAddr()) + ";trace=" + traceID,
 			})
 			return &ssh.Permissions{Extensions: map[string]string{
 				"key_fingerprint": fp,
@@ -189,6 +234,20 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
 				Signals:     []string{"behavior.auth_failed", "protocol.ssh.forward_denied"},
 				Mode:        "auto_mode",
 			})
+			_ = s.src.AddTraceEvent(context.Background(), model.TraceEvent{
+				TraceID:     traceID,
+				Kind:        "flow",
+				Actor:       auth.Key.Name,
+				Action:      "forward.denied",
+				Target:      fmt.Sprintf("%s:%d", targetHost, targetPort),
+				SourceIP:    sourceIP,
+				IP:          sourceIP,
+				Host:        "ssh-bastion",
+				Path:        "forward",
+				Decision:    "target_not_allowed",
+				SourceScope: sourceScopeFromIP(sourceIP),
+				Summary:     "SSH bastion denied forwarding target",
+			})
 			_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
 				Actor:  auth.Key.Name,
 				Action: "ssh.bastion.forward.denied",
@@ -200,11 +259,27 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
 		}
 		upstream, err := net.DialTimeout("tcp", net.JoinHostPort(targetHost, fmt.Sprintf("%d", targetPort)), 8*time.Second)
 		if err != nil {
+			traceID := sshTraceID(addrIP(serverConn.RemoteAddr()), auth.Key.Name, "forward_error")
+			_ = s.src.AddTraceEvent(context.Background(), model.TraceEvent{
+				TraceID:     traceID,
+				Kind:        "flow",
+				Actor:       auth.Key.Name,
+				Action:      "forward.error",
+				Target:      fmt.Sprintf("%s:%d", targetHost, targetPort),
+				SourceIP:    addrIP(serverConn.RemoteAddr()),
+				IP:          addrIP(serverConn.RemoteAddr()),
+				Host:        "ssh-bastion",
+				Path:        "forward",
+				Decision:    "target_unreachable",
+				SourceScope: sourceScopeFromIP(addrIP(serverConn.RemoteAddr())),
+				Summary:     "SSH bastion could not reach configured target",
+				Meta:        "err=" + err.Error(),
+			})
 			_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
 				Actor:  auth.Key.Name,
 				Action: "ssh.bastion.forward.error",
 				Target: fmt.Sprintf("%s:%d", targetHost, targetPort),
-				Meta:   "source=" + addrIP(serverConn.RemoteAddr()) + ";err=" + err.Error(),
+				Meta:   "source=" + addrIP(serverConn.RemoteAddr()) + ";err=" + err.Error() + ";trace=" + traceID,
 			})
 			_ = ch.Reject(ssh.ConnectionFailed, "target unreachable")
 			continue
@@ -215,11 +290,26 @@ func (s *Server) handleConn(nc net.Conn, cfg *ssh.ServerConfig) {
 			continue
 		}
 		go ssh.DiscardRequests(requests)
+		traceID := sshTraceID(addrIP(serverConn.RemoteAddr()), auth.Key.Name, "forward_ok")
+		_ = s.src.AddTraceEvent(context.Background(), model.TraceEvent{
+			TraceID:     traceID,
+			Kind:        "flow",
+			Actor:       auth.Key.Name,
+			Action:      "forward.ok",
+			Target:      fmt.Sprintf("%s:%d", targetHost, targetPort),
+			SourceIP:    addrIP(serverConn.RemoteAddr()),
+			IP:          addrIP(serverConn.RemoteAddr()),
+			Host:        "ssh-bastion",
+			Path:        "forward",
+			Decision:    "forward_opened",
+			SourceScope: sourceScopeFromIP(addrIP(serverConn.RemoteAddr())),
+			Summary:     "SSH bastion opened forwarding channel",
+		})
 		_ = s.src.AddAuditEvent(context.Background(), model.AuditEvent{
 			Actor:  auth.Key.Name,
 			Action: "ssh.bastion.forward.ok",
 			Target: fmt.Sprintf("%s:%d", targetHost, targetPort),
-			Meta:   "source=" + addrIP(serverConn.RemoteAddr()) + ";fingerprint=" + fp,
+			Meta:   "source=" + addrIP(serverConn.RemoteAddr()) + ";fingerprint=" + fp + ";trace=" + traceID,
 		})
 		pipeConn(channel, upstream)
 	}

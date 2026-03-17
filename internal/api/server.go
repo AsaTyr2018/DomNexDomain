@@ -101,6 +101,7 @@ func (s *Server) Router() http.Handler {
 		pr.Get("/api/v1/threat-intel/feeds", s.handleThreatIntelFeedsList)
 		pr.Get("/api/v1/threat-intel/matches", s.handleThreatIntelMatchesList)
 		pr.Get("/api/v1/threat-intel/matches/{ip}/targets", s.handleThreatIntelTargetsByIP)
+		pr.Get("/api/v1/threat-intel/traces/{trace}", s.handleThreatIntelTraceTimeline)
 		pr.Get("/api/v1/threat-intel/offenders", s.handleThreatIntelOffendersList)
 		pr.Get("/api/v1/threat-intel/blocked", s.handleThreatIntelBlockedList)
 		pr.Get("/api/v1/threat-intel/meta", s.handleThreatIntelMeta)
@@ -2694,6 +2695,21 @@ func (s *Server) handleThreatIntelTargetsByIP(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleThreatIntelTraceTimeline(w http.ResponseWriter, r *http.Request) {
+	id := identityFrom(r.Context())
+	if !requireTokenScope(w, id, "audit:read") {
+		return
+	}
+	traceID := strings.TrimSpace(chi.URLParam(r, "trace"))
+	limit, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit")))
+	items, err := s.app.GetThreatTraceTimeline(r.Context(), traceID, limit)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (s *Server) handleThreatIntelAllowlistList(w http.ResponseWriter, r *http.Request) {
