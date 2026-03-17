@@ -241,6 +241,7 @@ type Tab = 'dashboard' | 'strategicIntel' | 'threatIntel' | 'domains' | 'hosts' 
 type StrategicIntelTab = 'overview' | 'events' | 'telemetry' | 'geo' | 'investigations' | 'notifications';
 type SettingsTab = 'general' | 'security' | 'threatintel' | 'idp' | 'mfa' | 'logservers' | 'geoip' | 'appearance' | 'advanced';
 type IdentityTab = 'users' | 'groups' | 'matrix';
+type AccessControlTab = 'users' | 'groups' | 'matrix' | 'api';
 type DomainProvider = 'cloudflare' | 'strato' | 'manual';
 type StyleProfile = 'monolith' | 'cybermonolith' | 'custom';
 type PublicStyle = { styleProfile?: string; styleCustom?: string };
@@ -269,6 +270,7 @@ const TAB_VALUES: readonly Tab[] = ['dashboard', 'strategicIntel', 'threatIntel'
 const STRATEGIC_TAB_VALUES: readonly StrategicIntelTab[] = ['overview', 'events', 'telemetry', 'geo', 'investigations', 'notifications'];
 const SETTINGS_TAB_VALUES: readonly SettingsTab[] = ['general', 'security', 'threatintel', 'idp', 'mfa', 'logservers', 'geoip', 'appearance', 'advanced'];
 const IDENTITY_TAB_VALUES: readonly IdentityTab[] = ['users', 'groups', 'matrix'];
+const ACCESS_CONTROL_TAB_VALUES: readonly AccessControlTab[] = ['users', 'groups', 'matrix', 'api'];
 const BACKUP_TAB_VALUES: readonly BackupTab[] = ['general', 'browser', 'settings', 'manual'];
 
 type UIRouteState = {
@@ -276,6 +278,7 @@ type UIRouteState = {
   strategicIntelTab: StrategicIntelTab;
   settingsTab: SettingsTab;
   identityTab: IdentityTab;
+  accessControlTab: AccessControlTab;
   backupTab: BackupTab;
 };
 
@@ -285,6 +288,7 @@ function parseUIRouteState(): UIRouteState {
     strategicIntelTab: 'overview',
     settingsTab: 'general',
     identityTab: 'users',
+    accessControlTab: 'users',
     backupTab: 'general',
   };
   if (typeof window === 'undefined') return defaults;
@@ -295,12 +299,23 @@ function parseUIRouteState(): UIRouteState {
   const strategic = params.get('si') as StrategicIntelTab | null;
   const settings = params.get('st') as SettingsTab | null;
   const identity = params.get('idtab') as IdentityTab | null;
+  const accessControl = params.get('actab') as AccessControlTab | null;
   const backup = params.get('bt') as BackupTab | null;
+  const normalizedTab = (() => {
+    if (tab === 'users' || tab === 'api') return 'accessControl';
+    return tab;
+  })() as Tab | null;
+  const normalizedAccessTab = (() => {
+    if (tab === 'api') return 'api';
+    if (tab === 'users' && identity && IDENTITY_TAB_VALUES.includes(identity)) return identity;
+    return accessControl;
+  })() as AccessControlTab | null;
   return {
-    tab: tab && TAB_VALUES.includes(tab) ? tab : defaults.tab,
+    tab: normalizedTab && TAB_VALUES.includes(normalizedTab) ? normalizedTab : defaults.tab,
     strategicIntelTab: strategic && STRATEGIC_TAB_VALUES.includes(strategic) ? strategic : defaults.strategicIntelTab,
     settingsTab: settings && SETTINGS_TAB_VALUES.includes(settings) ? settings : defaults.settingsTab,
     identityTab: identity && IDENTITY_TAB_VALUES.includes(identity) ? identity : defaults.identityTab,
+    accessControlTab: normalizedAccessTab && ACCESS_CONTROL_TAB_VALUES.includes(normalizedAccessTab) ? normalizedAccessTab : defaults.accessControlTab,
     backupTab: backup && BACKUP_TAB_VALUES.includes(backup) ? backup : defaults.backupTab,
   };
 }
@@ -716,6 +731,7 @@ function App() {
   const [identityPermCatalog, setIdentityPermCatalog] = useState<PermissionCatalogItem[]>([]);
   const [identityMatrix, setIdentityMatrix] = useState<PermissionMatrixRow[]>([]);
   const [identityTab, setIdentityTab] = useState<IdentityTab>(initialRoute.identityTab);
+  const [accessControlTab, setAccessControlTab] = useState<AccessControlTab>(initialRoute.accessControlTab);
   const [domainChecks, setDomainChecks] = useState<Record<number, DomainLiveCheck>>({});
   const [trafficOverview, setTrafficOverview] = useState<TrafficOverview | null>(null);
   const [selectedHostTraffic, setSelectedHostTraffic] = useState<HostTrafficDetails | null>(null);
@@ -1352,13 +1368,13 @@ function App() {
     params.set('tab', tab);
     if (tab === 'strategicIntel') params.set('si', strategicIntelTab);
     if (tab === 'settings') params.set('st', settingsTab);
-    if (tab === 'users') params.set('idtab', identityTab);
+    if (tab === 'accessControl') params.set('actab', accessControlTab);
     if (tab === 'backup') params.set('bt', backupTab);
     const nextHash = params.toString();
     const currentHash = String(window.location.hash || '').replace(/^#/, '').replace(/^\?/, '');
     if (currentHash === nextHash) return;
     window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${nextHash}`);
-  }, [tab, strategicIntelTab, settingsTab, identityTab, backupTab]);
+  }, [tab, strategicIntelTab, settingsTab, accessControlTab, backupTab]);
 
   useEffect(() => {
     const onHashChange = () => {
@@ -1367,6 +1383,7 @@ function App() {
       setStrategicIntelTab(r.strategicIntelTab);
       setSettingsTab(r.settingsTab);
       setIdentityTab(r.identityTab);
+      setAccessControlTab(r.accessControlTab);
       setBackupTab(r.backupTab);
     };
     window.addEventListener('hashchange', onHashChange);
@@ -4070,8 +4087,8 @@ function App() {
     ssh: 'SSH Bastion',
     backup: 'Backup Center',
     settings: 'Settings',
-    users: 'Identity Management',
-    api: 'API Management',
+    users: 'Access Control',
+    api: 'Access Control',
     account: 'My Account',
     accessControl: 'Access Control',
     integrations: 'Integrations',
@@ -4102,11 +4119,9 @@ function App() {
               <div className="menu-title">Security</div>
               <button className={tab === 'threatIntel' ? 'active' : ''} onClick={() => setTab('threatIntel')}>Threat Intel</button>
               <button className={tab === 'accessControl' ? 'active' : ''} onClick={() => setTab('accessControl')}>Access Control</button>
-              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'api' ? 'active' : ''} onClick={() => setTab('api')}>API Management</button> : null}
             </div>
             <div className="menu-group">
               <div className="menu-title">Identity</div>
-              {(identity?.role === 'admin' || isReadOnlyRole) ? <button className={tab === 'users' ? 'active' : ''} onClick={() => setTab('users')}>Identity Management</button> : null}
               <button className={tab === 'account' ? 'active' : ''} onClick={() => setTab('account')}>My Account</button>
             </div>
             <div className="menu-group">
@@ -6231,18 +6246,22 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
             </section>
           ) : null}
 
-          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'users' ? (
+          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'accessControl' ? (
             <section className="entity-page users-page">
               <div className="entity-main">
                 <section className="card">
-                  <div className="card-head"><h3>Identity Management</h3></div>
+                  <div className="card-head"><h3>Access Control</h3></div>
+                  <div className="muted" style={{ marginBottom: '.7rem' }}>
+                    Centralized governance for user identities, permission groups, permission visibility, and API token access.
+                  </div>
                   <div className="wizard-nav" style={{ marginBottom: '.8rem' }}>
-                    <button className={identityTab === 'users' ? 'wiz active' : 'wiz'} onClick={() => setIdentityTab('users')}>Users</button>
-                    <button className={identityTab === 'groups' ? 'wiz active' : 'wiz'} onClick={() => setIdentityTab('groups')}>Groups</button>
-                    <button className={identityTab === 'matrix' ? 'wiz active' : 'wiz'} onClick={() => setIdentityTab('matrix')}>Permission Matrix</button>
+                    <button className={accessControlTab === 'users' ? 'wiz active' : 'wiz'} onClick={() => { setAccessControlTab('users'); setIdentityTab('users'); }}>Users</button>
+                    <button className={accessControlTab === 'groups' ? 'wiz active' : 'wiz'} onClick={() => { setAccessControlTab('groups'); setIdentityTab('groups'); }}>Groups</button>
+                    <button className={accessControlTab === 'matrix' ? 'wiz active' : 'wiz'} onClick={() => { setAccessControlTab('matrix'); setIdentityTab('matrix'); }}>Permission Matrix</button>
+                    <button className={accessControlTab === 'api' ? 'wiz active' : 'wiz'} onClick={() => setAccessControlTab('api')}>API Tokens</button>
                   </div>
 
-                  {identityTab === 'users' ? (
+                  {accessControlTab === 'users' ? (
                     <>
                       <div className="log-filter-grid user-ops-filters">
                         <select value={usersRoleFilter} onChange={(e) => setUsersRoleFilter(e.target.value as 'all' | 'admin' | 'domain-admin' | 'read-only')}>
@@ -6351,7 +6370,7 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                     </>
                   ) : null}
 
-                  {identityTab === 'groups' ? (
+                  {accessControlTab === 'groups' ? (
                     <>
                       <div className="row" style={{ marginBottom: '.6rem' }}>
                         <button className="btn" onClick={openCreateGroupDialog} disabled={loading || isReadOnlyRole}>Create Group</button>
@@ -6396,7 +6415,7 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                     </>
                   ) : null}
 
-                  {identityTab === 'matrix' ? (
+                  {accessControlTab === 'matrix' ? (
                     <div className="log-table-wrap" style={{ maxHeight: '62vh' }}>
                       <table className="log-table user-table-compact">
                         <thead>
@@ -6432,177 +6451,178 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                       </table>
                     </div>
                   ) : null}
+                  {accessControlTab === 'api' ? (
+                    <>
+                      <div className="card" style={{ marginBottom: '.8rem' }}>
+                        <div className="card-head"><h3>API Token Issuance</h3></div>
+                        <div className="field-grid api-token-grid">
+                          <div className="field">
+                            <label>Token Name</label>
+                            <input value={newTokenName} onChange={(e) => setNewTokenName(e.target.value)} placeholder="token name" />
+                            <div className="field-hint-spacer" aria-hidden="true">.</div>
+                          </div>
+                          <div className="field">
+                            <label>Role</label>
+                            <select value={newTokenRole} onChange={(e) => setNewTokenRole(e.target.value)}>
+                              <option value="operator">operator</option>
+                              <option value="admin">admin</option>
+                              <option value="read-only">read-only</option>
+                            </select>
+                            <div className="field-hint-spacer" aria-hidden="true">.</div>
+                          </div>
+                          <div className="field">
+                            <label>TTL</label>
+                            <select value={newTokenTTL} onChange={(e) => setNewTokenTTL(e.target.value)} className={`ttl-select ${tokenTTLClass}`}>
+                              <option value="120h">5 days</option>
+                              <option value="168h">1 week</option>
+                              <option value="720h">1 month</option>
+                              <option value="unlimited">Unlimited (high risk)</option>
+                            </select>
+                            <div className={`field-hint ttl-hint ${tokenTTLClass}`}>{tokenTTLPreview}</div>
+                          </div>
+                        </div>
+                        <div className="muted" style={{ marginBottom: '.3rem' }}>Permissions</div>
+                        <div className="domain-pills">
+                          <label className="pill"><input type="checkbox" checked={newTokenGlobalRead} onChange={(e) => setNewTokenGlobalRead(e.target.checked)} /> global read</label>
+                          <label className="pill"><input type="checkbox" checked={newTokenGlobalWrite} onChange={(e) => setNewTokenGlobalWrite(e.target.checked)} /> global write</label>
+                          <label className="pill"><input type="checkbox" checked={newTokenDomainRead} onChange={(e) => setNewTokenDomainRead(e.target.checked)} /> domain read</label>
+                          <label className="pill"><input type="checkbox" checked={newTokenDomainWrite} onChange={(e) => setNewTokenDomainWrite(e.target.checked)} /> domain write</label>
+                          <label className="pill"><input type="checkbox" checked={newTokenSystemRead} onChange={(e) => setNewTokenSystemRead(e.target.checked)} /> system read</label>
+                          <label className="pill danger"><input type="checkbox" checked={newTokenSystemWrite} onChange={(e) => setNewTokenSystemWrite(e.target.checked)} /> system write <span className="badge err" style={{ marginLeft: '.3rem' }}>high impact</span></label>
+                        </div>
+                        {newTokenTTL === 'unlimited' ? (
+                          <div className="card" style={{ marginBottom: '.8rem', borderColor: '#6b2222' }}>
+                            <div className="muted" style={{ marginBottom: '.4rem' }}>Unlimited token requires double confirmation.</div>
+                            <label className="pill" style={{ marginBottom: '.45rem' }}>
+                              <input type="checkbox" checked={newTokenConfirmUnlimited} onChange={(e) => setNewTokenConfirmUnlimited(e.target.checked)} />
+                              I understand the risk of an unlimited API token
+                            </label>
+                            <input
+                              type="password"
+                              value={newTokenConfirmPassword}
+                              onChange={(e) => setNewTokenConfirmPassword(e.target.value)}
+                              placeholder="Confirm with current admin password"
+                            />
+                          </div>
+                        ) : null}
+                        <div className="muted" style={{ marginBottom: '.3rem' }}>Domain scope (only when not global)</div>
+                        <div className="domain-pills">
+                          {domains.map((d) => (
+                            <label key={d.id} className="pill">
+                              <input type="checkbox" checked={newTokenDomainIDs.includes(d.id)} onChange={() => toggleNewTokenDomain(d.id)} disabled={newTokenGlobalRead || newTokenGlobalWrite} />
+                              {d.name}
+                            </label>
+                          ))}
+                        </div>
+                        <div className="row">
+                          <input value={newTokenScopes} onChange={(e) => setNewTokenScopes(e.target.value)} placeholder="additional scopes comma-separated (optional)" />
+                          <button
+                            className="btn"
+                            onClick={createToken}
+                            disabled={
+                              loading
+                              || !newTokenName
+                              || isReadOnlyRole
+                              || (newTokenTTL === 'unlimited' && (!newTokenConfirmUnlimited || !newTokenConfirmPassword.trim()))
+                            }
+                          >
+                            Create Token
+                          </button>
+                        </div>
+                        {createdToken ? (
+                          <div className="card" style={{ marginBottom: 0 }}>
+                            <div className="muted">Generated token (shown once):</div>
+                            <pre>{createdToken}</pre>
+                          </div>
+                        ) : null}
+                      </div>
+                      <div className="row" style={{ alignItems: 'center', marginBottom: '.35rem' }}>
+                        <strong>Token Inventory</strong>
+                        <input value={apiTokenQuery} onChange={(e) => setApiTokenQuery(e.target.value)} placeholder="Filter by name, prefix, role, scope" />
+                      </div>
+                      <div className="row" style={{ alignItems: 'center', gap: '.45rem', marginBottom: '.45rem' }}>
+                        <span className="muted">Legend</span>
+                        <span className="scope-badge read">Read</span>
+                        <span className="scope-badge write">Write</span>
+                        <span className="scope-badge rw">Read + Write</span>
+                      </div>
+                      <div className="log-table-wrap" style={{ maxHeight: '44vh' }}>
+                        <table className="log-table user-table-compact">
+                          <thead>
+                            <tr>
+                              <th>ID</th>
+                              <th>Description</th>
+                              <th>Prefix</th>
+                              <th>Rights</th>
+                              <th>Domain Scope</th>
+                              <th>Last Used</th>
+                              <th>Expires</th>
+                              <th>Created</th>
+                              <th>Action</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {tokens
+                              .filter((t) => {
+                                const q = apiTokenQuery.trim().toLowerCase();
+                                if (!q) return true;
+                                return `${t.name} ${t.tokenPrefix} ${t.scopes} ${t.role}`.toLowerCase().includes(q);
+                              })
+                              .map((t) => (
+                                <tr key={`token-${t.id}`}>
+                                  <td><code>{t.id}</code></td>
+                                  <td>{t.name}</td>
+                                  <td><code>{t.tokenPrefix}</code></td>
+                                  <td style={{ maxWidth: '20rem' }}>
+                                    {(() => {
+                                      const scopes = parseTokenScopes(t.scopes || '');
+                                      const globalAccess = tokenScopeAccess(scopes, 'global');
+                                      const domainAccess = tokenScopeAccess(scopes, 'domain');
+                                      const systemAccess = tokenScopeAccess(scopes, 'system');
+                                      return (
+                                        <div className="token-scope-grid">
+                                          <span className="muted token-scope-label">Global</span>
+                                          <span className={`scope-badge ${globalAccess}`}>{scopeBadgeLabel(globalAccess)}</span>
+                                          <span className="muted token-scope-label">Domain</span>
+                                          <span className={`scope-badge ${domainAccess}`}>{scopeBadgeLabel(domainAccess)}</span>
+                                          <span className="muted token-scope-label">System</span>
+                                          <span className={`scope-badge ${systemAccess}`}>{scopeBadgeLabel(systemAccess)}</span>
+                                        </div>
+                                      );
+                                    })()}
+                                  </td>
+                                  <td>
+                                    {((t.domainIds || []).length === 0)
+                                      ? <span className="badge ok">global</span>
+                                      : (
+                                        <div className="muted" style={{ whiteSpace: 'normal' }}>
+                                          {(t.domainIds || [])
+                                            .map((id) => domains.find((d) => d.id === id)?.name || `#${id}`)
+                                            .join(', ')}
+                                        </div>
+                                      )}
+                                  </td>
+                                  <td>{t.lastUsedAt ? formatDateTime(t.lastUsedAt) : <span className="muted">never</span>}</td>
+                                  <td>{t.expiresAt ? formatDateTime(t.expiresAt) : '-'}</td>
+                                  <td>{formatDateTime(t.createdAt || '')}</td>
+                                  <td><button className="btn danger" onClick={() => setApiRevokePending(t)} disabled={isReadOnlyRole || loading}>Revoke</button></td>
+                                </tr>
+                              ))}
+                            {tokens.filter((t) => {
+                              const q = apiTokenQuery.trim().toLowerCase();
+                              if (!q) return true;
+                              return `${t.name} ${t.tokenPrefix} ${t.scopes} ${t.role}`.toLowerCase().includes(q);
+                            }).length === 0 ? (
+                              <tr><td colSpan={9} className="muted" style={{ padding: '.9rem' }}>No tokens match your filter.</td></tr>
+                            ) : null}
+                          </tbody>
+                        </table>
+                      </div>
+                      {apiTokensLoadError ? <div className="muted danger" style={{ marginTop: '.5rem' }}>Token inventory load failed: {apiTokensLoadError}</div> : null}
+                    </>
+                  ) : null}
                 </section>
               </div>
-            </section>
-          ) : null}
-
-          {(identity?.role === 'admin' || isReadOnlyRole) && tab === 'api' ? (
-            <section className="card">
-              <div className="card-head"><h3>API Management</h3></div>
-              <div className="field-grid api-token-grid">
-                <div className="field">
-                  <label>Token Name</label>
-                  <input value={newTokenName} onChange={(e) => setNewTokenName(e.target.value)} placeholder="token name" />
-                  <div className="field-hint-spacer" aria-hidden="true">.</div>
-                </div>
-                <div className="field">
-                  <label>Role</label>
-                  <select value={newTokenRole} onChange={(e) => setNewTokenRole(e.target.value)}>
-                    <option value="operator">operator</option>
-                    <option value="admin">admin</option>
-                    <option value="read-only">read-only</option>
-                  </select>
-                  <div className="field-hint-spacer" aria-hidden="true">.</div>
-                </div>
-                <div className="field">
-                  <label>TTL</label>
-                  <select value={newTokenTTL} onChange={(e) => setNewTokenTTL(e.target.value)} className={`ttl-select ${tokenTTLClass}`}>
-                    <option value="120h">5 days</option>
-                    <option value="168h">1 week</option>
-                    <option value="720h">1 month</option>
-                    <option value="unlimited">Unlimited (high risk)</option>
-                  </select>
-                  <div className={`field-hint ttl-hint ${tokenTTLClass}`}>{tokenTTLPreview}</div>
-                </div>
-              </div>
-              <div className="muted" style={{ marginBottom: '.3rem' }}>Permissions</div>
-              <div className="domain-pills">
-                <label className="pill"><input type="checkbox" checked={newTokenGlobalRead} onChange={(e) => setNewTokenGlobalRead(e.target.checked)} /> global read</label>
-                <label className="pill"><input type="checkbox" checked={newTokenGlobalWrite} onChange={(e) => setNewTokenGlobalWrite(e.target.checked)} /> global write</label>
-                <label className="pill"><input type="checkbox" checked={newTokenDomainRead} onChange={(e) => setNewTokenDomainRead(e.target.checked)} /> domain read</label>
-                <label className="pill"><input type="checkbox" checked={newTokenDomainWrite} onChange={(e) => setNewTokenDomainWrite(e.target.checked)} /> domain write</label>
-                <label className="pill"><input type="checkbox" checked={newTokenSystemRead} onChange={(e) => setNewTokenSystemRead(e.target.checked)} /> system read</label>
-                <label className="pill danger"><input type="checkbox" checked={newTokenSystemWrite} onChange={(e) => setNewTokenSystemWrite(e.target.checked)} /> system write <span className="badge err" style={{ marginLeft: '.3rem' }}>high impact</span></label>
-              </div>
-              {newTokenTTL === 'unlimited' ? (
-                <div className="card" style={{ marginBottom: '.8rem', borderColor: '#6b2222' }}>
-                  <div className="muted" style={{ marginBottom: '.4rem' }}>Unlimited token requires double confirmation.</div>
-                  <label className="pill" style={{ marginBottom: '.45rem' }}>
-                    <input type="checkbox" checked={newTokenConfirmUnlimited} onChange={(e) => setNewTokenConfirmUnlimited(e.target.checked)} />
-                    I understand the risk of an unlimited API token
-                  </label>
-                  <input
-                    type="password"
-                    value={newTokenConfirmPassword}
-                    onChange={(e) => setNewTokenConfirmPassword(e.target.value)}
-                    placeholder="Confirm with current admin password"
-                  />
-                </div>
-              ) : null}
-              <div className="muted" style={{ marginBottom: '.3rem' }}>Domain scope (only when not global)</div>
-              <div className="domain-pills">
-                {domains.map((d) => (
-                  <label key={d.id} className="pill">
-                    <input type="checkbox" checked={newTokenDomainIDs.includes(d.id)} onChange={() => toggleNewTokenDomain(d.id)} disabled={newTokenGlobalRead || newTokenGlobalWrite} />
-                    {d.name}
-                  </label>
-                ))}
-              </div>
-              <div className="row">
-                <input value={newTokenScopes} onChange={(e) => setNewTokenScopes(e.target.value)} placeholder="additional scopes comma-separated (optional)" />
-                <button
-                  className="btn"
-                  onClick={createToken}
-                  disabled={
-                    loading
-                    || !newTokenName
-                    || isReadOnlyRole
-                    || (newTokenTTL === 'unlimited' && (!newTokenConfirmUnlimited || !newTokenConfirmPassword.trim()))
-                  }
-                >
-                  Create Token
-                </button>
-              </div>
-              {createdToken ? (
-                <div className="card" style={{ marginBottom: '.8rem' }}>
-                  <div className="muted">Generated token (shown once):</div>
-                  <pre>{createdToken}</pre>
-                </div>
-              ) : null}
-              <div className="row" style={{ alignItems: 'center', marginBottom: '.35rem' }}>
-                <strong>Token Inventory</strong>
-                <input value={apiTokenQuery} onChange={(e) => setApiTokenQuery(e.target.value)} placeholder="Filter by name, prefix, role, scope" />
-              </div>
-              <div className="row" style={{ alignItems: 'center', gap: '.45rem', marginBottom: '.45rem' }}>
-                <span className="muted">Legend</span>
-                <span className="scope-badge read">Read</span>
-                <span className="scope-badge write">Write</span>
-                <span className="scope-badge rw">Read + Write</span>
-              </div>
-              <div className="log-table-wrap" style={{ maxHeight: '44vh' }}>
-                <table className="log-table user-table-compact">
-                  <thead>
-                    <tr>
-                      <th>ID</th>
-                      <th>Description</th>
-                      <th>Prefix</th>
-                      <th>Rights</th>
-                      <th>Domain Scope</th>
-                      <th>Last Used</th>
-                      <th>Expires</th>
-                      <th>Created</th>
-                      <th>Action</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tokens
-                      .filter((t) => {
-                        const q = apiTokenQuery.trim().toLowerCase();
-                        if (!q) return true;
-                        return `${t.name} ${t.tokenPrefix} ${t.scopes} ${t.role}`.toLowerCase().includes(q);
-                      })
-                      .map((t) => (
-                        <tr key={`token-${t.id}`}>
-                          <td><code>{t.id}</code></td>
-                          <td>{t.name}</td>
-                          <td><code>{t.tokenPrefix}</code></td>
-                          <td style={{ maxWidth: '20rem' }}>
-                            {(() => {
-                              const scopes = parseTokenScopes(t.scopes || '');
-                              const globalAccess = tokenScopeAccess(scopes, 'global');
-                              const domainAccess = tokenScopeAccess(scopes, 'domain');
-                              const systemAccess = tokenScopeAccess(scopes, 'system');
-                              return (
-                                <div className="token-scope-grid">
-                                  <span className="muted token-scope-label">Global</span>
-                                  <span className={`scope-badge ${globalAccess}`}>{scopeBadgeLabel(globalAccess)}</span>
-                                  <span className="muted token-scope-label">Domain</span>
-                                  <span className={`scope-badge ${domainAccess}`}>{scopeBadgeLabel(domainAccess)}</span>
-                                  <span className="muted token-scope-label">System</span>
-                                  <span className={`scope-badge ${systemAccess}`}>{scopeBadgeLabel(systemAccess)}</span>
-                                </div>
-                              );
-                            })()}
-                          </td>
-                          <td>
-                            {((t.domainIds || []).length === 0)
-                              ? <span className="badge ok">global</span>
-                              : (
-                                <div className="muted" style={{ whiteSpace: 'normal' }}>
-                                  {(t.domainIds || [])
-                                    .map((id) => domains.find((d) => d.id === id)?.name || `#${id}`)
-                                    .join(', ')}
-                                </div>
-                              )}
-                          </td>
-                          <td>{t.lastUsedAt ? formatDateTime(t.lastUsedAt) : <span className="muted">never</span>}</td>
-                          <td>{t.expiresAt ? formatDateTime(t.expiresAt) : '-'}</td>
-                          <td>{formatDateTime(t.createdAt || '')}</td>
-                          <td><button className="btn danger" onClick={() => setApiRevokePending(t)} disabled={isReadOnlyRole || loading}>Revoke</button></td>
-                        </tr>
-                      ))}
-                    {tokens.filter((t) => {
-                      const q = apiTokenQuery.trim().toLowerCase();
-                      if (!q) return true;
-                      return `${t.name} ${t.tokenPrefix} ${t.scopes} ${t.role}`.toLowerCase().includes(q);
-                    }).length === 0 ? (
-                      <tr><td colSpan={9} className="muted" style={{ padding: '.9rem' }}>No tokens match your filter.</td></tr>
-                    ) : null}
-                  </tbody>
-                </table>
-              </div>
-              {apiTokensLoadError ? <div className="muted danger" style={{ marginTop: '.5rem' }}>Token inventory load failed: {apiTokensLoadError}</div> : null}
             </section>
           ) : null}
 
@@ -6758,14 +6778,6 @@ Issues: ${postRestoreCheck.issues.length}`}</pre>
                   <div className="muted">Notification email is stored for upcoming alerting features and does not trigger outbound notifications yet.</div>
                 </section>
               </aside>
-            </section>
-          ) : null}
-
-          {tab === 'accessControl' ? (
-            <section className="card">
-              <div className="card-head"><h3>Access Control</h3></div>
-              <div className="badge warn">Coming soon</div>
-              <p className="muted">Centralized policy controls for admin/API access hardening, scoped by environment and integration targets.</p>
             </section>
           ) : null}
 
