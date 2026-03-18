@@ -3162,6 +3162,72 @@ LIMIT ?`, traceID, limit)
 	return out, rows.Err()
 }
 
+func (s *Store) GetThreatTraceSubject(ctx context.Context, traceID string) (model.ThreatTraceChainEntry, error) {
+	traceID = strings.ToLower(strings.TrimSpace(traceID))
+	if traceID == "" {
+		return model.ThreatTraceChainEntry{}, fmt.Errorf("trace id required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+SELECT ip, host, path, feed, decision, source_scope, country, hits, xp_after, level_after, tier_after, last_seen_at, last_trace_id
+FROM threat_intel_matches
+WHERE last_trace_id=?
+ORDER BY last_seen_at DESC, id DESC
+LIMIT 1`, traceID)
+	var out model.ThreatTraceChainEntry
+	var ts string
+	if err := row.Scan(&out.IP, &out.Host, &out.Path, &out.Feed, &out.Decision, &out.SourceScope, &out.Country, &out.Hits, &out.XP, &out.Level, &out.Tier, &ts, &out.TraceID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			row = s.db.QueryRowContext(ctx, `
+SELECT COALESCE(source_ip, ip, ''), COALESCE(host, target, ''), COALESCE(path, ''), COALESCE(feed, ''), COALESCE(decision, ''), COALESCE(source_scope, ''), COALESCE(country, ''), COALESCE(hits, 0), COALESCE(xp, 0), COALESCE(level, 0), COALESCE(tier, ''), event_at, trace_id
+FROM trace_events
+WHERE trace_id=?
+ORDER BY event_at DESC, id DESC
+LIMIT 1`, traceID)
+			if err2 := row.Scan(&out.IP, &out.Host, &out.Path, &out.Feed, &out.Decision, &out.SourceScope, &out.Country, &out.Hits, &out.XP, &out.Level, &out.Tier, &ts, &out.TraceID); err2 != nil {
+				return model.ThreatTraceChainEntry{}, err2
+			}
+		} else {
+			return model.ThreatTraceChainEntry{}, err
+		}
+	}
+	out.Timestamp = parseTimeOrZero(ts)
+	out.IsCurrentTrace = true
+	return out, nil
+}
+
+func (s *Store) ListThreatTraceChain(ctx context.Context, ip string, from, to time.Time, limit int) ([]model.ThreatTraceChainEntry, error) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return nil, fmt.Errorf("ip required")
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 250
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT last_seen_at, last_trace_id, ip, host, path, feed, decision, source_scope, country, hits, xp_after, level_after, tier_after
+FROM threat_intel_matches
+WHERE ip=?
+  AND last_seen_at>=?
+  AND last_seen_at<=?
+ORDER BY last_seen_at ASC, id ASC
+LIMIT ?`, ip, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.ThreatTraceChainEntry{}
+	for rows.Next() {
+		var it model.ThreatTraceChainEntry
+		var ts string
+		if err := rows.Scan(&ts, &it.TraceID, &it.IP, &it.Host, &it.Path, &it.Feed, &it.Decision, &it.SourceScope, &it.Country, &it.Hits, &it.XP, &it.Level, &it.Tier); err != nil {
+			return nil, err
+		}
+		it.Timestamp = parseTimeOrZero(ts)
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListThreatIntelOffenders(ctx context.Context, since time.Time, offenderMinHits, limit, offset int) ([]model.ThreatIntelOffender, int64, error) {
 	if limit <= 0 || limit > 2000 {
 		limit = 200

@@ -197,8 +197,9 @@ type ThreatIntelMetaDashboard = {
 type ThreatIntelMatchesPage = { items: ThreatIntelMatch[]; total: number; page: number; pageSize: number };
 type ThreatIntelOffendersPage = { items: ThreatIntelOffender[]; total: number; page: number; pageSize: number };
 type ThreatIntelBlockedPage = { items: ThreatIntelBlocked[]; total: number; page: number; pageSize: number };
-type ThreatTraceTimelineEntry = { timestamp: string; kind: 'evidence' | 'action'; traceId: string; ip?: string; actor?: string; action?: string; target?: string; sourceIp?: string; decision?: string; feed?: string; host?: string; path?: string; country?: string; mode?: string; sourceScope?: string; hits?: number; xp?: number; level?: number; tier?: string; summary?: string; meta?: string };
-type ThreatTraceTimeline = { traceId: string; items: ThreatTraceTimelineEntry[] };
+type ThreatTraceTimelineEntry = { timestamp: string; kind: 'evidence' | 'action' | 'flow'; traceId: string; ip?: string; actor?: string; action?: string; target?: string; sourceIp?: string; decision?: string; feed?: string; host?: string; path?: string; country?: string; mode?: string; sourceScope?: string; hits?: number; xp?: number; level?: number; tier?: string; summary?: string; meta?: string };
+type ThreatTraceChainEntry = { timestamp: string; traceId: string; ip: string; host: string; path: string; feed: string; decision: string; sourceScope?: string; country?: string; hits?: number; xp?: number; level?: number; tier?: string; isCurrentTrace?: boolean };
+type ThreatTraceTimeline = { traceId: string; items: ThreatTraceTimelineEntry[]; sourceIp?: string; host?: string; path?: string; currentDecision?: string; currentLevel?: number; currentXp?: number; currentTier?: string; chainWindowStart?: string; chainWindowEnd?: string; chainContactCount?: number; chainDurationSec?: number; chain?: ThreatTraceChainEntry[] };
 type ThreatIntelStatusFilter = 'all' | 'watch' | 'softblock' | 'hardblock' | 'monitoring';
 type ThreatIntelSourceFilter = 'all' | 'signature' | 'feed' | 'behavior';
 type DashboardWidgetType =
@@ -707,6 +708,8 @@ function App() {
   const [traceTimeline, setTraceTimeline] = useState<ThreatTraceTimelineEntry[]>([]);
   const [traceTimelineID, setTraceTimelineID] = useState('');
   const [traceTimelineError, setTraceTimelineError] = useState('');
+  const [traceChain, setTraceChain] = useState<ThreatTraceChainEntry[]>([]);
+  const [traceSubject, setTraceSubject] = useState<{ sourceIp?: string; host?: string; path?: string; currentDecision?: string; currentLevel?: number; currentXp?: number; currentTier?: string; chainWindowStart?: string; chainWindowEnd?: string; chainContactCount?: number; chainDurationSec?: number }>({});
   const [tiMeta, setTiMeta] = useState<ThreatIntelMetaDashboard | null>(null);
   const [tiPage, setTiPage] = useState(1);
   const [tiPageSize, setTiPageSize] = useState(100);
@@ -4048,6 +4051,8 @@ function App() {
     if (!traceID) {
       setTraceTimelineID('');
       setTraceTimeline([]);
+      setTraceChain([]);
+      setTraceSubject({});
       setTraceTimelineError('');
       return;
     }
@@ -4055,10 +4060,26 @@ function App() {
       const out = await api<ThreatTraceTimeline>(`/api/v1/threat-intel/traces/${encodeURIComponent(traceID)}?limit=500`);
       setTraceTimelineID(out.traceId || traceID);
       setTraceTimeline(out.items || []);
+      setTraceChain(out.chain || []);
+      setTraceSubject({
+        sourceIp: out.sourceIp,
+        host: out.host,
+        path: out.path,
+        currentDecision: out.currentDecision,
+        currentLevel: out.currentLevel,
+        currentXp: out.currentXp,
+        currentTier: out.currentTier,
+        chainWindowStart: out.chainWindowStart,
+        chainWindowEnd: out.chainWindowEnd,
+        chainContactCount: out.chainContactCount,
+        chainDurationSec: out.chainDurationSec,
+      });
       setTraceTimelineError('');
     } catch (e) {
       setTraceTimelineID(traceID);
       setTraceTimeline([]);
+      setTraceChain([]);
+      setTraceSubject({});
       setTraceTimelineError((e as Error).message || String(e));
     }
   };
@@ -4342,6 +4363,62 @@ function App() {
                     <button className="btn" onClick={loadTraceTimeline}>Refresh Pivot</button>
                   </div>
                   {traceTimelineError ? <div className="error" style={{ marginBottom: '.55rem' }}>Trace timeline issue: {traceTimelineError}</div> : null}
+                  {traceTimelineID ? (
+                    <div className="field-grid" style={{ marginBottom: '.7rem' }}>
+                      <div className="field">
+                        <label>Source IP</label>
+                        <div><code>{traceSubject.sourceIp || '-'}</code></div>
+                      </div>
+                      <div className="field">
+                        <label>Request</label>
+                        <div><strong>{traceSubject.host || '-'}</strong>{traceSubject.path || ''}</div>
+                      </div>
+                      <div className="field">
+                        <label>Current State</label>
+                        <div>
+                          {traceSubject.currentDecision ? <span className={`badge ${threatDecisionBadge(traceSubject.currentDecision || '').cls}`}>{threatDecisionBadge(traceSubject.currentDecision || '').label}</span> : <span className="muted">-</span>}
+                          <span className="muted" style={{ marginLeft: '.45rem' }}>L{traceSubject.currentLevel || 0} · XP {traceSubject.currentXp || 0} · {traceSubject.currentTier || '-'}</span>
+                        </div>
+                      </div>
+                      <div className="field">
+                        <label>Escalation Chain</label>
+                        <div>{traceSubject.chainContactCount || 0} contacts{traceSubject.chainDurationSec ? ` in ${formatDurationShort(traceSubject.chainDurationSec)}` : ''}</div>
+                      </div>
+                    </div>
+                  ) : null}
+                  {traceChain.length > 0 ? (
+                    <>
+                      <div className="muted">Related prior contacts from the same source within the investigation window:</div>
+                      <div className="log-table-wrap" style={{ marginTop: '.4rem', marginBottom: '.75rem' }}>
+                        <table className="log-table">
+                          <thead>
+                            <tr>
+                              <th>Time</th>
+                              <th>Trace</th>
+                              <th>Request</th>
+                              <th>Signals</th>
+                              <th>Decision</th>
+                              <th>State</th>
+                              <th>Source</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {traceChain.map((e, idx) => (
+                              <tr key={`trace-chain-${idx}-${e.traceId}-${e.timestamp}`} className={e.isCurrentTrace ? 'log-row-focus' : ''}>
+                                <td>{formatDateTime(e.timestamp)}</td>
+                                <td><code>{e.traceId || '-'}</code>{e.isCurrentTrace ? <span className="muted" style={{ marginLeft: '.35rem' }}>(current)</span> : null}</td>
+                                <td><strong>{e.host || '-'}</strong>{e.path || ''}</td>
+                                <td>{e.feed || '-'}</td>
+                                <td><span className={`badge ${threatDecisionBadge(e.decision || '').cls}`}>{threatDecisionBadge(e.decision || '').label}</span></td>
+                                <td>L{e.level || 0} · XP {e.xp || 0} · {e.tier || '-'}</td>
+                                <td>{e.country || e.sourceScope || '-'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  ) : null}
                   <div className="muted">Chronological trace timeline:</div>
                   <div className="log-table-wrap" style={{ marginTop: '.4rem' }}>
                     <table className="log-table">
@@ -7748,6 +7825,7 @@ Backup: ${setupBackupMeta ? `${setupBackupMeta.fileName} (${setupBackupMeta.form
         .log-table th, .log-table td { border-bottom:1px solid var(--border); padding:.48rem .55rem; text-align:left; vertical-align:top; }
         .log-table th { position:sticky; top:0; z-index:1; background:var(--surface); color:var(--text-dim); font-size:.73rem; text-transform:uppercase; letter-spacing:.06em; }
         .log-table tbody tr:hover { background:var(--panel-hover); }
+        .log-table tbody tr.log-row-focus { background:rgba(124,58,237,.12); }
         .log-src-cell { display:flex; align-items:center; gap:.35rem; flex-wrap:wrap; }
         .log-mini-btn { padding:.2rem .45rem; border-radius:8px; font-size:.72rem; }
         .log-meta { max-width:320px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }

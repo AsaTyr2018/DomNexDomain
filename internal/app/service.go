@@ -550,8 +550,20 @@ type ThreatIntelBlockedPage struct {
 }
 
 type ThreatTraceTimeline struct {
-	TraceID string                           `json:"traceId"`
-	Items   []model.ThreatTraceTimelineEntry `json:"items"`
+	TraceID           string                           `json:"traceId"`
+	Items             []model.ThreatTraceTimelineEntry `json:"items"`
+	SourceIP          string                           `json:"sourceIp"`
+	Host              string                           `json:"host"`
+	Path              string                           `json:"path"`
+	CurrentDecision   string                           `json:"currentDecision"`
+	CurrentLevel      int                              `json:"currentLevel"`
+	CurrentXP         int                              `json:"currentXp"`
+	CurrentTier       string                           `json:"currentTier"`
+	ChainWindowStart  time.Time                        `json:"chainWindowStart"`
+	ChainWindowEnd    time.Time                        `json:"chainWindowEnd"`
+	ChainContactCount int                              `json:"chainContactCount"`
+	ChainDurationSec  int64                            `json:"chainDurationSec"`
+	Chain             []model.ThreatTraceChainEntry    `json:"chain"`
 }
 
 func normalizeRequestClass(class string) string {
@@ -4523,7 +4535,39 @@ func (s *Service) GetThreatTraceTimeline(ctx context.Context, traceID string, li
 	if err != nil {
 		return ThreatTraceTimeline{}, err
 	}
-	return ThreatTraceTimeline{TraceID: traceID, Items: items}, nil
+	out := ThreatTraceTimeline{TraceID: traceID, Items: items}
+	subject, err := s.store.GetThreatTraceSubject(ctx, traceID)
+	if err == nil {
+		out.SourceIP = subject.IP
+		out.Host = subject.Host
+		out.Path = subject.Path
+		out.CurrentDecision = subject.Decision
+		out.CurrentLevel = subject.Level
+		out.CurrentXP = subject.XP
+		out.CurrentTier = subject.Tier
+		end := subject.Timestamp
+		if end.IsZero() && len(items) > 0 {
+			end = items[len(items)-1].Timestamp
+		}
+		if end.IsZero() {
+			end = time.Now().UTC()
+		}
+		start := end.Add(-10 * time.Second)
+		chain, chainErr := s.store.ListThreatTraceChain(ctx, subject.IP, start, end, 100)
+		if chainErr == nil {
+			for i := range chain {
+				chain[i].IsCurrentTrace = strings.EqualFold(chain[i].TraceID, traceID)
+			}
+			out.Chain = chain
+			out.ChainWindowStart = start
+			out.ChainWindowEnd = end
+			out.ChainContactCount = len(chain)
+			if len(chain) > 1 {
+				out.ChainDurationSec = int64(chain[len(chain)-1].Timestamp.Sub(chain[0].Timestamp).Seconds())
+			}
+		}
+	}
+	return out, nil
 }
 
 func (s *Service) ListThreatIntelAllowlist(ctx context.Context) ([]model.BlockedIP, error) {

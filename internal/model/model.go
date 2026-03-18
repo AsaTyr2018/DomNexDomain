@@ -259,7 +259,7 @@ type ThreatTraceEvidence struct {
 
 type ThreatTraceTimelineEntry struct {
 	Timestamp   time.Time `json:"timestamp"`
-	Kind        string    `json:"kind"` // evidence | action
+	Kind        string    `json:"kind"` // evidence | action | flow
 	TraceID     string    `json:"traceId"`
 	IP          string    `json:"ip,omitempty"`
 	Actor       string    `json:"actor,omitempty"`
@@ -279,6 +279,23 @@ type ThreatTraceTimelineEntry struct {
 	Tier        string    `json:"tier,omitempty"`
 	Summary     string    `json:"summary,omitempty"`
 	Meta        string    `json:"meta,omitempty"`
+}
+
+type ThreatTraceChainEntry struct {
+	Timestamp      time.Time `json:"timestamp"`
+	TraceID        string    `json:"traceId"`
+	IP             string    `json:"ip"`
+	Host           string    `json:"host"`
+	Path           string    `json:"path"`
+	Feed           string    `json:"feed"`
+	Decision       string    `json:"decision"`
+	SourceScope    string    `json:"sourceScope"`
+	Country        string    `json:"country"`
+	Hits           int64     `json:"hits"`
+	XP             int       `json:"xp"`
+	Level          int       `json:"level"`
+	Tier           string    `json:"tier"`
+	IsCurrentTrace bool      `json:"isCurrentTrace"`
 }
 
 type TraceEvent struct {
